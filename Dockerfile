@@ -71,17 +71,17 @@ ARG BACKEND_EXTRAS=
 ARG INCLUDE_STOCKSDK=0
 WORKDIR /app
 
-# Node.js 运行时: 仅在启用 stock-sdk 插件时安装(供 node bridge.mjs 使用)。
+# Node.js/npm: 仅在启用 stock-sdk 时安装, 供桥接运行及页面安装/重装依赖使用。
 # Codex CLI 从官方 npm 包提取原生二进制，不依赖运行时 Node.js。
-# bookworm 自带 nodejs 18.19, 满足插件 engines>=18; --no-install-recommends 精简,
+# 系统源提供 Node.js >=18; --no-install-recommends 精简,
 # 自带 libnode/libc-ares 等全部动态依赖, 无需手动补库。
 # 国内构建走 apt mirror 已在 debian 镜像sources.list 配好, 无需额外换源。
-# tesseract-ocr: 自选截图导入（始终安装）; nodejs: 仅 INCLUDE_STOCKSDK=1 时安装
+# tesseract-ocr: 自选截图导入（始终安装）; nodejs/npm: 仅 INCLUDE_STOCKSDK=1 时安装
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
     && if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
-         apt-get install -y --no-install-recommends nodejs \
-         && node --version; \
+         apt-get install -y --no-install-recommends nodejs npm \
+         && node --version && npm --version; \
        fi \
     && rm -rf /var/lib/apt/lists/* \
     && tesseract --version
@@ -103,9 +103,11 @@ COPY README.md /README.md
 COPY backend/pyproject.toml backend/uv.lock* ./
 # uv 原生支持同时挂多个 index(主源 + 备用源),会自动在两源中查找,
 # 比逐个重试更稳健 —— 任一源缺包时另一源补位。
-RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
+RUN --mount=type=cache,id=tickflow-stock-panel-uv,target=/root/.cache/uv \
+    if [ "$USE_CN_MIRROR" = "1" ]; then \
       export UV_DEFAULT_INDEX="$PYPI_INDEX" UV_EXTRA_INDEX_URL="$PYPI_FALLBACK"; \
     fi; \
+    export UV_HTTP_TIMEOUT=300; \
     set -- --no-dev; \
     for extra in $BACKEND_EXTRAS; do \
       set -- "$@" --extra "$extra"; \
@@ -140,4 +142,5 @@ ENV PYTHONPATH=/app
 # 此处让日志时间戳等其余 naive 时间也对齐北京时间。
 ENV TZ=Asia/Shanghai
 EXPOSE 3018
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]
+# Dependencies are installed during the image build; startup must not reinstall them.
+CMD ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3018"]

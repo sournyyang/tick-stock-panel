@@ -1073,19 +1073,41 @@ def refresh_views(request: Request):
     return {"status": "ok"}
 
 
+def _resolve_manual_minute_universe(repo, scope: str) -> list[str]:
+    """Resolve the requested manual-sync pool without mixing other asset types."""
+    from app.tickflow.pools import get_pool
+
+    if scope == "watchlist":
+        universe = set(get_pool("watchlist"))
+    elif scope == "all":
+        universe = set(get_pool("watchlist")) | set(get_pool("CN_Equity_A"))
+        inst_path = repo.store.data_dir / "instruments" / "instruments.parquet"
+        if inst_path.exists():
+            try:
+                import polars as pl
+
+                inst = pl.read_parquet(inst_path, columns=["symbol"])
+                universe.update(inst["symbol"].to_list())
+            except Exception as exc:
+                logger.warning("minute sync instruments supplement failed: %s", exc)
+    else:
+        raise ValueError("scope 仅支持 all 或 watchlist")
+
+    excluded = set(repo.get_index_symbol_set()) | set(repo.get_etf_symbol_set())
+    return sorted(str(symbol) for symbol in universe if symbol and symbol not in excluded)
+
+
 @router.post("/sync_minute")
 async def sync_minute(request: Request):
     """手动触发分钟 K 同步(全市场)。返回 pipeline job_id 可轮询进度。
 
-    body 可选: { "days": int } — 指定拉取天数 (不传则用偏好设置)。
+    body 可选: days、extend、scope (all/watchlist) 和 calendar_days。
     """
     import asyncio
 
     from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
     from app.api.data import invalidate_storage_cache
     from app.services.preferences import get_minute_sync_days
-    from app.tickflow.capabilities import Cap
-    from app.tickflow.pools import get_pool
 
     repo = request.app.state.repo
     capset = request.app.state.capabilities
@@ -1102,6 +1124,19 @@ async def sync_minute(request: Request):
         pass
     override_days = body.get("days")
     extend_flag = body.get("extend")
+    scope = str(body.get("scope") or "all").strip().lower()
+    if scope not in {"all", "watchlist"}:
+        raise HTTPException(status_code=400, detail="scope 仅支持 all 或 watchlist")
+    if override_days is not None:
+        if isinstance(override_days, bool):
+            raise HTTPException(status_code=400, detail="days 必须是整数")
+        try:
+            override_days = int(override_days)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="days 必须是整数") from exc
+        if not 1 <= override_days <= 5000:
+            raise HTTPException(status_code=400, detail="days 必须在 1~5000 之间")
+    days_are_calendar = bool(body.get("calendar_days"))
 
     # 分钟K全市场同步是长任务(数据量是日K的 ~240 倍),用更宽松的卡死阈值
     job_id, is_new = job_store.create(long_running=True)
@@ -1120,20 +1155,11 @@ async def sync_minute(request: Request):
         try:
             job_store.start(job_id)
             progress("sync_minute", 5, "解析标的池…")
-            universe = sorted(set(get_pool("watchlist")) | set(get_pool("CN_Equity_A")))
-            # 补充 instruments 全量标的，覆盖北交所、新股等
-            inst_path = repo.store.data_dir / "instruments" / "instruments.parquet"
-            if inst_path.exists():
-                try:
-                    import polars as pl
-                    inst = pl.read_parquet(inst_path, columns=["symbol"])
-                    universe = sorted(set(universe) | set(inst["symbol"].to_list()))
-                except Exception:  # noqa: BLE001
-                    pass
-            # 剔除指数 symbol: 指数分钟K无本地存储, 落库会污染 kline_minute
-            index_set = repo.get_index_symbol_set()
-            universe = [s for s in universe if s not in index_set]
-            progress("sync_minute", 10, f"标的池 {len(universe)} 只")
+            universe = _resolve_manual_minute_universe(repo, scope)
+            if not universe:
+                raise ValueError("当前同步范围没有 A 股标的")
+            scope_label = "自选股" if scope == "watchlist" else "全 A 股"
+            progress("sync_minute", 10, f"{scope_label} {len(universe)} 只")
 
             days = override_days if override_days else get_minute_sync_days()
             # extend=1 → 向前扩展; days>=365 也自动向前扩展
@@ -1148,6 +1174,7 @@ async def sync_minute(request: Request):
                 return kline_sync.sync_and_persist_minute(
                     universe, repo, capset, days=days,
                     extend_backward=extend_backward,
+                    days_are_calendar=days_are_calendar,
                     on_chunk_done=_on_chunk,
                 )
 
@@ -1158,7 +1185,11 @@ async def sync_minute(request: Request):
             _refresh_single_view(repo, "kline_minute")
 
             progress("done", 100, f"分钟 K 同步完成,{written} 行")
-            job_store.succeed(job_id, {"minute_rows": written, "universe_size": len(universe)})
+            job_store.succeed(job_id, {
+                "minute_rows": written,
+                "universe_size": len(universe),
+                "scope": scope,
+            })
             invalidate_storage_cache()
         except JobCancelledError:
             # 已由 terminate() 标记失败, 拉取线程在分块回调处自行退出

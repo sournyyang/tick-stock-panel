@@ -1328,6 +1328,7 @@ def sync_and_persist_minute(
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
     force_full_days: bool = False,
+    days_are_calendar: bool = False,
 ) -> int:
     """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
 
@@ -1363,7 +1364,7 @@ def sync_and_persist_minute(
         earliest_dt = _earliest_minute_datetime(repo)
         # 按交易日换算自然日 (7/5 系数)。>41 交易日时 +10 天余量覆盖节假日。
         # (分段由 sync_minute_batch 的 segment_trading_days 控制, 与此处的区间天数独立。)
-        calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
+        calendar_days = days if days_are_calendar else int(days * 7 / 5) + (10 if days > 41 else 0)
         if earliest_dt:
             end_time = earliest_dt
             start_time = end_time - timedelta(days=calendar_days)

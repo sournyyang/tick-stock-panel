@@ -710,7 +710,10 @@ export interface StrategyDetail {
   execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'minute_filter'
   asset_types: string[]
   timeframes: string[]
+  default_entry_fill?: 'close_t' | 'open_t+1' | null
+  default_exit_fill?: 'close_t' | 'open_t+1' | 'signal_next_minute' | null
   version: string
+  code_hash?: string
   basic_filter: Record<string, any>
   params: StrategyParamDef[]
   params_defaults: Record<string, any>
@@ -1419,11 +1422,35 @@ export interface StrategyBacktestResult {
     max_hold_days: number | null
     source: string
     execution_backend?: string
+    version?: string
+    code_hash?: string
     // 叠加策略回测: 子策略构成与权重归因
     composite_children?: { id: string; weight: number }[]
   }
   elapsed_ms: number
   error: string | null
+}
+
+export interface StrategyBacktestHistoryItem {
+  schema_version: number
+  run_id: string
+  created_at: string
+  strategy_id: string
+  strategy_name: string
+  strategy_version: string
+  code_hash: string
+  asset_type: string
+  mode: string
+  start: string
+  end: string
+  trade_count: number
+  stats: Record<string, number>
+}
+
+export interface StrategyBacktestHistoryResult {
+  schema_version: number
+  created_at: string
+  result: StrategyBacktestResult
 }
 
 // ===== Settings =====
@@ -2186,10 +2213,20 @@ export const api = {
       `/api/kline/sync?symbol=${encodeURIComponent(symbol)}&days=${days}`,
       { method: 'POST' },
     ),
-  syncMinute: (days?: number, extend?: boolean) =>
+  syncMinute: (
+    days?: number,
+    extend?: boolean,
+    scope: 'all' | 'watchlist' = 'all',
+    calendarDays = false,
+  ) =>
     request<{ status: string; job_id: string }>('/api/kline/sync_minute', {
       method: 'POST',
-      body: JSON.stringify({ ...(days ? { days } : {}), ...(extend ? { extend: true } : {}) }),
+      body: JSON.stringify({
+        ...(days ? { days } : {}),
+        ...(extend ? { extend: true } : {}),
+        scope,
+        ...(calendarDays ? { calendar_days: true } : {}),
+      }),
     }),
   syncMinuteSingle: (symbol: string, days?: number) =>
     request<{ status: string; symbol: string; rows: number }>('/api/kline/sync_minute_single', {
@@ -2576,6 +2613,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  strategyBacktestHistory: (strategyId?: string, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (strategyId) params.set('strategy_id', strategyId)
+    return request<{ items: StrategyBacktestHistoryItem[] }>(
+      `/api/backtest/strategy/history?${params.toString()}`,
+    )
+  },
+
+  strategyBacktestHistoryResult: (runId: string) =>
+    request<StrategyBacktestHistoryResult>(`/api/backtest/strategy/history/${encodeURIComponent(runId)}`),
 
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
     '/api/pipeline/run', { method: 'POST' },

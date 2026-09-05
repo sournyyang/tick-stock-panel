@@ -1181,3 +1181,46 @@ def test_preferences_parallel_saves_do_not_lose_each_other(tmp_path, monkeypatch
     final = prefs.load()
     assert final["minute_batch_compress"] is False
     assert final["daily_batch_compress"] is False
+
+
+def test_manual_minute_watchlist_scope_filters_non_stocks(monkeypatch, tmp_path):
+    from app.api import kline as kline_api
+    from app.tickflow import pools
+
+    monkeypatch.setattr(
+        pools,
+        "get_pool",
+        lambda _name: ["600519.SH", "510300.SH", "000001.SH"],
+    )
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo.get_etf_symbol_set.return_value = {"510300.SH"}
+    repo.get_index_symbol_set.return_value = {"000001.SH"}
+
+    assert kline_api._resolve_manual_minute_universe(repo, "watchlist") == ["600519.SH"]
+
+
+def test_manual_minute_all_scope_includes_local_instruments(monkeypatch, tmp_path):
+    from app.api import kline as kline_api
+    from app.tickflow import pools
+
+    monkeypatch.setattr(
+        pools,
+        "get_pool",
+        lambda name: ["600000.SH"] if name == "watchlist" else ["000001.SZ"],
+    )
+    inst_dir = tmp_path / "instruments"
+    inst_dir.mkdir()
+    pl.DataFrame({"symbol": ["920001.BJ"]}).write_parquet(
+        inst_dir / "instruments.parquet",
+    )
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo.get_etf_symbol_set.return_value = set()
+    repo.get_index_symbol_set.return_value = set()
+
+    assert kline_api._resolve_manual_minute_universe(repo, "all") == [
+        "000001.SZ",
+        "600000.SH",
+        "920001.BJ",
+    ]

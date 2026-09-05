@@ -274,6 +274,8 @@ class StrategyDependencyResolver:
             "signal_limit_up",
             "signal_limit_down",
         }
+        # Generated matrix fields are not part of the enriched parquet schema.
+        matrix_columns.update(required_features & {"price_limit_pct"})
         return ResolvedFeaturePlan(
             base_columns=base_columns,
             intermediate_columns=frozenset(),
@@ -1628,10 +1630,18 @@ class StrategyBacktestService:
         )
 
         # 构建策略信息
+        code_hash = ""
+        if s.file_path is not None:
+            try:
+                code_hash = hashlib.sha256(s.file_path.read_bytes()).hexdigest()[:12]
+            except OSError:
+                code_hash = ""
         strategy_info = {
             "id": s.meta.get("id", config.strategy_id),
             "name": s.meta.get("name", config.strategy_id),
             "description": s.meta.get("description", ""),
+            "version": str(s.meta.get("version") or "1.0.0"),
+            "code_hash": code_hash,
             "entry_signals": entry_signals,
             "exit_signals": exit_signals,
             "stop_loss": stop_loss,
@@ -1664,9 +1674,12 @@ class StrategyBacktestService:
 
         elapsed = (time.perf_counter() - t0) * 1000
 
+        result_config = self._config_to_dict(config)
+        result_config["params"] = params
+        result_config["overrides"] = overrides
         return StrategyBacktestResult(
             run_id=run_id,
-            config=self._config_to_dict(config),
+            config=result_config,
             stats=selected_stats,
             equity_curve=result.equity_curve if result_policy.include_curves else [],
             drawdown_curve=result.drawdown_curve if result_policy.include_curves else [],
@@ -2455,6 +2468,7 @@ class StrategyBacktestService:
             "position_sizing": c.position_sizing,
             "mode": c.mode,
             "holding_days": c.holding_days,
+            "asset_type": c.asset_type,
             "minute_fill": c.minute_fill,
             "regime_filter": c.regime_filter,
         }
