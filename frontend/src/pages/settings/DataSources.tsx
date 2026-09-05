@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Check, Database, Plus, RefreshCw, Zap, FileWarning } from 'lucide-react'
-import { api, type DataSourceItem, type PluginDataSourceItem } from '@/lib/api'
+import { api, type DataSourceItem, type PluginDataSourceItem, type Preferences } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { toast } from '@/components/Toast'
@@ -13,7 +13,30 @@ const DATASET_LABEL: Record<string, string> = {
   adj_factor: '除权',
   realtime: '实时',
   minute: '分钟',
+  financial: '财务',
 }
+
+type ProviderPreferenceKey = keyof Pick<
+  Preferences,
+  | 'daily_data_provider'
+  | 'adj_factor_provider'
+  | 'minute_data_provider'
+  | 'realtime_data_provider'
+  | 'financial_data_provider'
+>
+
+const DATASET_ROUTES: Array<{
+  dataset: string
+  field: ProviderPreferenceKey
+  label: string
+  defaultProvider: string
+}> = [
+  { dataset: 'daily', field: 'daily_data_provider', label: '日 K', defaultProvider: 'tickflow' },
+  { dataset: 'adj_factor', field: 'adj_factor_provider', label: '除权因子', defaultProvider: 'same_as_daily' },
+  { dataset: 'minute', field: 'minute_data_provider', label: '分钟 K', defaultProvider: 'tickflow' },
+  { dataset: 'realtime', field: 'realtime_data_provider', label: '实时行情', defaultProvider: 'tickflow' },
+  { dataset: 'financial', field: 'financial_data_provider', label: '财务数据', defaultProvider: 'tickflow' },
+]
 
 export function SettingsDataSourcesPanel() {
   const qc = useQueryClient()
@@ -70,7 +93,8 @@ export function SettingsDataSourcesPanel() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: QK.preferences })
-      toast('数据源已切换', 'success')
+      qc.invalidateQueries({ queryKey: QK.capabilities })
+      toast('该数据源支持的项目已全部切换', 'success')
     },
   })
 
@@ -125,6 +149,29 @@ export function SettingsDataSourcesPanel() {
     ...pluginItems,
     ...customList,
   ]
+
+  const switchDataset = useMutation({
+    mutationFn: ({ field, provider }: { field: ProviderPreferenceKey; provider: string }) =>
+      api.updateDataProviders({ [field]: provider }),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: QK.preferences })
+      qc.invalidateQueries({ queryKey: QK.capabilities })
+      const route = DATASET_ROUTES.find(item => item.field === variables.field)
+      toast(`${route?.label || '数据'}数据源已切换`, 'success')
+    },
+    onError: (e: Error) => toast(`切换失败: ${e.message}`, 'error'),
+  })
+
+  const providerLabel = (name: string) => {
+    if (name === 'tickflow') return 'TickFlow'
+    return allItems.find(item => item.name === name)?.display_name || name
+  }
+
+  const providersForDataset = (dataset: string) => allItems.filter(item => {
+    if (item.name === 'tickflow') return true
+    const plugin = pluginMap.get(item.name)
+    return item.datasets.includes(dataset) && (!plugin || plugin.available)
+  })
 
   const selectedCustom = customList.find(s => s.name === selected)
 
@@ -230,7 +277,7 @@ export function SettingsDataSourcesPanel() {
                         disabled={switchProvider.isPending}
                         className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 transition-colors disabled:opacity-50"
                       >
-                        使用
+                        全部使用
                       </button>
                       {uninstalling ? (
                         <RefreshCw className="h-2.5 w-2.5 animate-spin text-muted" />
@@ -251,7 +298,7 @@ export function SettingsDataSourcesPanel() {
                       disabled={switchProvider.isPending}
                       className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 transition-colors disabled:opacity-50"
                     >
-                      使用
+                      全部使用
                     </button>
                   )}
                 </div>
@@ -306,9 +353,40 @@ export function SettingsDataSourcesPanel() {
         <div className="mt-3 flex items-center gap-3 text-[10px] text-muted/50">
           <span>单击编辑</span>
           <span className="text-muted/30">·</span>
-          <span>点「使用」切换为当前数据源</span>
+          <span>点「全部使用」批量切换该源支持的项目</span>
           <span className="text-muted/30">·</span>
           <span>未启用的数据集自动回退 TickFlow</span>
+        </div>
+
+        <div className="mt-5 pt-4 border-t border-border">
+          <div className="mb-3">
+            <h3 className="text-xs font-medium text-foreground">按数据类型选择</h3>
+            <p className="text-[10px] text-muted mt-1">每一项独立保存。例如只把分钟 K 切换到 stock-sdk，不影响日 K 和实时行情。</p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+            {DATASET_ROUTES.map(route => {
+              const current = String(prefs.data?.[route.field] || route.defaultProvider)
+              const options = providersForDataset(route.dataset)
+              return (
+                <label key={route.field} className="rounded-lg border border-border/60 bg-elevated/20 px-3 py-2.5">
+                  <span className="block text-[10px] text-muted mb-1.5">{route.label}</span>
+                  <select
+                    value={current}
+                    disabled={switchDataset.isPending || prefs.isLoading}
+                    onChange={e => switchDataset.mutate({ field: route.field, provider: e.target.value })}
+                    className="w-full rounded-btn border border-border bg-base px-2 py-1.5 text-xs text-foreground outline-none focus:border-accent/60 disabled:opacity-50"
+                  >
+                    {route.dataset === 'adj_factor' && (
+                      <option value="same_as_daily">跟随日 K</option>
+                    )}
+                    {options.map(item => (
+                      <option key={item.name} value={item.name}>{providerLabel(item.name)}</option>
+                    ))}
+                  </select>
+                </label>
+              )
+            })}
+          </div>
         </div>
       </section>
 
@@ -421,7 +499,7 @@ function PluginDetail({ plugin, isActive, onSwitch, switching }: {
             disabled={switching}
             className="px-3 py-1.5 rounded-btn bg-accent/10 text-accent hover:bg-accent/20 text-xs font-medium transition-colors disabled:opacity-50"
           >
-            切换为当前数据源
+            将支持项全部切换到此源
           </button>
         )}
       </div>
@@ -473,7 +551,7 @@ function TickFlowDetail({ active, onSwitch, switching }: { active: boolean; onSw
           className="inline-flex items-center gap-1.5 px-4 py-2 rounded-btn bg-accent text-white text-sm font-medium hover:bg-accent/90 disabled:opacity-50 transition-colors"
         >
           <Zap className="h-3.5 w-3.5" />
-          切换为当前数据源
+          将全部项目切换到 TickFlow
         </button>
       )}
     </section>

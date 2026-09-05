@@ -29,8 +29,14 @@ interface Props {
 function fmtTime(dt: string): string {
   const match = dt.match(/(\d{2}):(\d{2})/)
   if (!match) return dt.slice(11, 16)
-  const h = (parseInt(match[1]) + 8) % 24
-  return `${String(h).padStart(2, '0')}:${match[2]}`
+  const rawHour = parseInt(match[1])
+  const minute = parseInt(match[2])
+  const rawMinutes = rawHour * 60 + minute
+  // 当前 provider 契约返回北京时间墙钟；兼容历史 TickFlow 数据中保留的 UTC 墙钟。
+  const isCnTradingTime = (rawMinutes >= 9 * 60 + 30 && rawMinutes <= 11 * 60 + 30)
+    || (rawMinutes >= 13 * 60 && rawMinutes <= 15 * 60)
+  const hour = isCnTradingTime ? rawHour : (rawHour + 8) % 24
+  return `${String(hour).padStart(2, '0')}:${match[2]}`
 }
 
 function computeAvgPrice(data: MinuteKlineRow[]): number[] {

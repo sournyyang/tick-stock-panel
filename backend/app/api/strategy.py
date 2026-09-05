@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import math
@@ -152,6 +153,11 @@ def _strategy_detail(
     name = overrides.get("name", s.meta.get("name", "")) if overrides else s.meta.get("name", "")
     description = overrides.get("description", s.meta.get("description", "")) if overrides else s.meta.get("description", "")
 
+    try:
+        code_hash = hashlib.sha256(s.file_path.read_bytes()).hexdigest()[:12]
+    except (AttributeError, OSError):
+        code_hash = ""
+
     return {
         "id": s.meta["id"],
         "name": name or s.meta.get("name", ""),
@@ -161,7 +167,10 @@ def _strategy_detail(
         "execution_backend": s.execution_backend,
         "asset_types": s.meta.get("asset_types", ["stock"]),
         "timeframes": s.meta.get("timeframes", ["1d"]),
+        "default_entry_fill": s.meta.get("default_entry_fill"),
+        "default_exit_fill": s.meta.get("default_exit_fill"),
         "version": s.meta.get("version", "1.0.0"),
+        "code_hash": code_hash,
         "basic_filter": bf,
         "params": s.meta.get("params", []),
         "params_defaults": params_defaults,

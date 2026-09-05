@@ -56,12 +56,13 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
 
   // 手动获取 (两个独立按钮, 各自指定天数, 不影响自动同步偏好)
   const [fetchingMode, setFetchingMode] = useState<'' | '40d' | '1y'>('')
+  const [manualScope, setManualScope] = useState<'watchlist' | 'all'>('watchlist')
   const handleFetch = (mode: '40d' | '1y') => {
     if (!hasMinuteCap) return
     // 单次获取 = 按「分段大小」拉一段 (向前扩展); 1年 = 拉365天按分段切多段
     const fetchDays = mode === '40d' ? localSegment : 365
     setFetchingMode(mode)
-    api.syncMinute(fetchDays, true).then((res) => {
+    api.syncMinute(fetchDays, true, manualScope, mode === '1y').then((res) => {
       qc.invalidateQueries({ queryKey: QK.pipelineJobs })
       qc.invalidateQueries({ queryKey: QK.dataStatus })
       // 通知主页面跟踪 job 进度 (ActiveJobCard 会显示实时进度+日志)
@@ -153,6 +154,26 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
           <span className="text-[11px] text-secondary font-medium">手动获取</span>
           <span className="text-[10px] text-muted">不受自动同步开关影响</span>
         </div>
+        <div className="grid grid-cols-2 gap-1 rounded-btn bg-elevated p-1">
+          {([
+            ['watchlist', '自选股（推荐）'],
+            ['all', '全 A 股'],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              disabled={fetchingMode !== ''}
+              onClick={() => setManualScope(value)}
+              className={`rounded px-2 py-1 text-[10px] transition-colors disabled:opacity-40 ${
+                manualScope === value
+                  ? 'bg-base text-foreground shadow-sm'
+                  : 'text-muted hover:text-secondary'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="grid grid-cols-2 gap-2">
         <button
           onClick={() => handleFetch('40d')}
@@ -178,8 +199,13 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
         </button>
         </div>
         <div className="text-[10px] text-muted leading-relaxed">
-          A股标的 · 前复权价格 · 从本地最早数据向前叠加 ·{' '}
-          均按上方「分段大小」分段拉取、每段即落盘
+          {manualScope === 'watchlist' ? '自选股' : '全 A 股'} · 按数据源价格口径 ·
+          从本地最早数据向前叠加 · 分段拉取并逐段落盘
+          {manualScope === 'all' && (
+            <span className="block mt-1 text-warning/80">
+              全市场一年约 3 亿行，免费源可能需要很长时间或触发限流。
+            </span>
+          )}
         </div>
       </div>
 

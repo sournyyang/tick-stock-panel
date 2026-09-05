@@ -592,23 +592,74 @@ def _try_custom_minute(
                            provider_name, err)
         return (None, True)
 
-    # 包装 on_chunk_done: provider 调 2 参 → 补 seg_label="custom" → 转发上层 3 参
-    wrapped_cb: Callable[[int, int], None] | None = None
-    if on_chunk_done is not None:
-        def _wrapped_cb(cur: int, total: int) -> None:
-            on_chunk_done(cur, total, "custom")
-        wrapped_cb = _wrapped_cb
-
     try:
-        df = provider.get_minute(
-            symbols, start_time=start_time, end_time=end_time,
-            asset_type=asset_type, freq=freq, on_chunk_done=wrapped_cb,
+        df = _call_custom_minute(
+            provider, symbols, start_time=start_time, end_time=end_time,
+            asset_type=asset_type, freq=freq, on_chunk_done=on_chunk_done,
         )
         return (df, False)
     except Exception as e:  # noqa: BLE001
         logger.warning("custom minute provider %s call failed, falling back to TickFlow: %s",
                        provider_name, e)
         return (None, True)
+
+
+def _call_custom_minute(
+    provider: object,
+    symbols: list[str],
+    *,
+    start_time: datetime | None,
+    end_time: datetime | None,
+    asset_type: AssetType,
+    freq: str,
+    on_chunk_done: Callable[[int, int, str], None] | None = None,
+    seg_label: str = "custom",
+    completed_segments: int = 0,
+    segment_count: int = 1,
+) -> pl.DataFrame:
+    """Call one custom-minute segment and adapt provider progress to the job contract."""
+    wrapped_cb: Callable[[int, int], None] | None = None
+    if on_chunk_done is not None:
+        def _wrapped_cb(cur: int, total: int) -> None:
+            per_segment = max(1, total)
+            on_chunk_done(
+                completed_segments * per_segment + cur,
+                segment_count * per_segment,
+                seg_label,
+            )
+        wrapped_cb = _wrapped_cb
+
+    df = provider.get_minute(
+        symbols,
+        start_time=start_time,
+        end_time=end_time,
+        asset_type=asset_type,
+        freq=freq,
+        on_chunk_done=wrapped_cb,
+    )
+    return df if isinstance(df, pl.DataFrame) else pl.DataFrame()
+
+
+def _minute_time_segments(
+    start_time: datetime | None,
+    end_time: datetime | None,
+    segment_trading_days: int,
+) -> list[tuple[datetime | None, datetime | None]]:
+    """Split a minute range into bounded calendar windows for every provider."""
+    if not start_time or not end_time:
+        return [(None, None)]
+    if start_time >= end_time:
+        return []
+
+    seg_calendar_days = max(1, int(segment_trading_days * 7 / 5))
+    segment_delta = timedelta(days=seg_calendar_days)
+    segments: list[tuple[datetime | None, datetime | None]] = []
+    seg_start = start_time
+    while seg_start < end_time:
+        seg_end = min(seg_start + segment_delta, end_time)
+        segments.append((seg_start, seg_end))
+        seg_start = seg_end
+    return segments
 
 
 def sync_minute_batch(
@@ -639,36 +690,76 @@ def sync_minute_batch(
         不进入全局 out → 内存峰值从「全量」降到「单段」。适用于 sync_and_persist_minute。
         不传时 (如 get_minute_batch 的实时补拉) 保持原契约: 累积进 out 末尾一次性返回。
     """
-    df, fallback = _try_custom_minute(
-        symbols, start_time=start_time, end_time=end_time,
-        asset_type=asset_type, freq="1m", on_chunk_done=on_chunk_done,
-    )
-    if not fallback:
-        # 自定义源成功: 遵守与 TickFlow 路径一致的 on_segment 契约。
-        # 传了 on_segment (如 sync_and_persist_minute 流式落盘) → 调 on_segment, 返回空 df;
-        # 未传 on_segment (如 fetch_minute_single 实时补拉) 或空 df → 原样返回 df。
-        df = df if df is not None else pl.DataFrame()
-        if on_segment and not df.is_empty():
-            # 空 df 不调 on_segment, 与 TickFlow 路径 `if seg_out:` (L684) 对称
-            on_segment(df)
-            return pl.DataFrame()
-        return df
+    time_segments = _minute_time_segments(start_time, end_time, segment_trading_days)
+    if not time_segments:
+        return pl.DataFrame()
+
+    provider_name = preferences.get_minute_data_provider()
+    provider, fallback, resolve_err = _resolve_minute_provider(provider_name)
+    if not fallback and provider is not None:
+        custom_out: list[pl.DataFrame] = []
+        custom_failed = False
+        for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
+            seg_label = (
+                f"{cur_start.strftime('%m-%d')}~{cur_end.strftime('%m-%d')}"
+                if cur_start and cur_end else "最新"
+            )
+            try:
+                df = _call_custom_minute(
+                    provider,
+                    symbols,
+                    start_time=cur_start,
+                    end_time=cur_end,
+                    asset_type=asset_type,
+                    freq="1m",
+                    on_chunk_done=on_chunk_done,
+                    seg_label=seg_label,
+                    completed_segments=seg_idx,
+                    segment_count=len(time_segments),
+                )
+            except Exception as e:  # noqa: BLE001
+                if on_segment is not None:
+                    # 已逐段落盘后不能切换 TickFlow, 否则同一任务会静默混源。
+                    logger.warning(
+                        "custom minute provider %s failed at persisted segment %s: %s",
+                        provider_name,
+                        seg_label,
+                        e,
+                    )
+                    raise RuntimeError(
+                        f"自定义分钟数据源在时间段 {seg_label} 拉取失败，已写入的前序分段保留"
+                    ) from e
+                # 尚未落盘时可丢弃内存中的自定义源结果，再由 TickFlow 完整重拉。
+                logger.warning(
+                    "custom minute provider %s failed at segment %s, falling back to TickFlow: %s",
+                    provider_name,
+                    seg_label,
+                    e,
+                )
+                custom_failed = True
+                break
+            if df.is_empty():
+                continue
+            if on_segment:
+                on_segment(df)
+            else:
+                custom_out.append(df)
+
+        if not custom_failed:
+            if on_segment or not custom_out:
+                return pl.DataFrame()
+            if len(custom_out) == 1:
+                return custom_out[0]
+            return pl.concat(custom_out, how="diagonal_relaxed")
+
+    if resolve_err is not None:
+        logger.warning(
+            "custom minute provider %s resolution failed, falling back to TickFlow: %s",
+            provider_name,
+            resolve_err,
+        )
 
     tf = get_client()
-
-    # TickFlow count 上限 10000 根/股, 1 天 240 根 → 单次最多约 41 个交易日。
-    # 按 segment_trading_days 交易日分段 (交易日→自然日 ×7/5 换算, 含节假日余量)。
-    seg_calendar_days = max(1, int(segment_trading_days * 7 / 5))
-    SEG_CHUNK = timedelta(days=seg_calendar_days)
-    time_segments: list[tuple[datetime | None, datetime | None]] = []
-    if start_time and end_time:
-        seg_start = start_time
-        while seg_start < end_time:
-            seg_end = min(seg_start + SEG_CHUNK, end_time)
-            time_segments.append((seg_start, seg_end))
-            seg_start = seg_end
-    else:
-        time_segments = [(None, None)]  # fallback: 用 count 模式
 
     total_steps = len(time_segments) * len(chunked(symbols, batch_size))
     step = 0
@@ -677,15 +768,14 @@ def sync_minute_batch(
     # 段内累积: 每段拉完即 flush, 避免全量攒内存 (OOM 根因)
     seg_out: list[pl.DataFrame] = []
 
-    for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
+    for cur_start, cur_end in time_segments:
         # 当前的日期段描述 (供进度展示)
         if cur_start and cur_end:
             seg_label = f"{cur_start.strftime('%m-%d')}~{cur_end.strftime('%m-%d')}"
         else:
             seg_label = "最新"
-        seg_total = len(time_segments)
         chunks = chunked(symbols, batch_size)
-        for i, chunk in enumerate(chunks):
+        for chunk in chunks:
             sleep_between_batches(step, rpm)
             step += 1
             try:
@@ -868,6 +958,34 @@ def fetch_minute_single(
     return pl.DataFrame()
 
 
+def fetch_minute_single_with_fallback(
+    symbol: str,
+    trade_date: date,
+    asset_type: AssetType = "stock",
+) -> tuple[pl.DataFrame, str, bool]:
+    """拉取单日分钟数据；stock-sdk 的 1m 窗口外自动尝试 5m 历史 K。
+
+    返回 ``(dataframe, period, fallback_attempted)``。其他 provider 保持原有
+    1m 语义，避免擅自改变自定义数据源的数据粒度。
+    """
+    df = fetch_minute_single(symbol, trade_date, asset_type=asset_type)
+    if not df.is_empty() or preferences.get_minute_data_provider() != "stocksdk":
+        return df, "1m", False
+
+    start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0)
+    end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0)
+    coarse_df, coarse_fallback = _try_custom_minute(
+        [symbol],
+        start_time=start_time,
+        end_time=end_time,
+        asset_type=asset_type,
+        freq="5m",
+    )
+    if coarse_fallback or coarse_df is None or coarse_df.is_empty():
+        return pl.DataFrame(), "1m", True
+    return coarse_df, "5m", True
+
+
 def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
     """从 TickFlow 实时拉取单股除权因子(不写入本地), 用于单股 K 线即时前复权。
 
@@ -998,8 +1116,11 @@ def sync_and_persist_minute(
     days: int = 5,
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
+    days_are_calendar: bool = False,
 ) -> int:
-    """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
+    """同步分钟 K 并存到 Parquet。TickFlow 使用前复权，自定义源遵循其自身价格口径。
+
+    返回写入行数。
 
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
@@ -1030,9 +1151,12 @@ def sync_and_persist_minute(
     if extend_backward:
         # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
         earliest_dt = _earliest_minute_datetime(repo)
-        # 按交易日换算自然日 (7/5 系数)。>41 交易日时 +10 天余量覆盖节假日。
-        # (分段由 sync_minute_batch 的 segment_trading_days 控制, 与此处的区间天数独立。)
-        calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
+        # 自动同步的 days 沿用交易日语义; 手动“最近 1 年”显式使用自然日,
+        # 避免 365 被二次换算为约 1.4 年。
+        calendar_days = (
+            days if days_are_calendar
+            else int(days * 7 / 5) + (10 if days > 41 else 0)
+        )
         if earliest_dt:
             end_time = earliest_dt
             start_time = end_time - timedelta(days=calendar_days)

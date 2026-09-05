@@ -9,6 +9,7 @@ import polars as pl
 from app.backtest.engine import BacktestEngine, SimResult
 from app.backtest.matrix import build_market_data_matrix, make_signal_matrix, rolling_mean
 from app.backtest.strategy import StrategyBacktestConfig, StrategyBacktestService
+from app.strategy.builtin.near_limit_up import MATRIX_STRATEGY, META
 from app.strategy.engine import StrategyDef
 
 
@@ -310,6 +311,58 @@ def test_matrix_native_strategy_uses_shared_orchestrator_path():
         "entry_trigger_filtered": 0,
         "entry_trigger_enabled": False,
     }
+
+
+def test_near_limit_up_backtest_preserves_generated_fields_with_shared_preparation():
+    start = date(2024, 1, 2)
+    panel = pl.DataFrame([
+        {
+            "symbol": symbol,
+            "name": "普通股",
+            "date": trade_date,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1000.0,
+            "amount": close * 1000.0,
+        }
+        for symbol in ("600001.SH", "300001.SZ")
+        for trade_date, close in ((start, 10.0), (start + timedelta(days=1), 10.8))
+    ])
+    strategy = _strategy(
+        meta=META,
+        basic_filter={"enabled": False},
+        filter_fn=None,
+        execution_backend="matrix_native",
+        matrix_strategy=MATRIX_STRATEGY,
+    )
+    engine = _EngineStub(panel)
+    service = StrategyBacktestService(engine=engine, strategy_engine=_StrategyEngineStub(strategy))
+    config = StrategyBacktestConfig(
+        strategy_id="near_limit_up",
+        symbols=None,
+        start=start,
+        end=start + timedelta(days=1),
+        matching="close_t",
+    )
+
+    result = service.run(config)
+    assert result.error is None
+    # The same 8% rise is near the main-board limit, but not the ChiNext limit.
+    entries = dict(zip(engine.sim_matrix.symbols, engine.sim_matrix.entry[-1], strict=True))
+    assert entries == {"600001.SH": 1, "300001.SZ": 0}
+
+    prepared = service.prepare_matrix_optimization([config])
+    try:
+        cached = service.run(config, prepared=prepared)
+        assert cached.error is None
+        cached_entries = dict(
+            zip(engine.sim_matrix.symbols, engine.sim_matrix.entry[-1], strict=True)
+        )
+        assert cached_entries == entries
+    finally:
+        prepared.compute_cache.close()
 
 
 def test_matrix_native_accepts_legacy_default_signal_overrides_but_rejects_replacements():

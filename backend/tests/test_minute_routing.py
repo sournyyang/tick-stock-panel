@@ -11,11 +11,12 @@ mock 范式沿用 test_stocksdk_provider.py (monkeypatch 模块属性)。
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
 import httpx
 import polars as pl
+import pytest
 
 from app.plugins.stocksdk import provider as sp
 from app.plugins.stocksdk.provider import StockSDKProvider
@@ -113,8 +114,10 @@ def test_stocksdk_get_minute_receives_freq_1m(monkeypatch):
 # ---------- 测试 3: 自定义源异常 + TickFlow 也失败 → 返回空 (非 500) ----------
 
 def test_custom_provider_exception_no_500(monkeypatch):
-    """§4 测试 3: 自定义源抛异常 + TickFlow 也失败,
-    fetch_minute_single / sync_minute_batch 返回空 df。
+    """§4 测试 3: 自定义源抛异常时返回空 df, 不向 API 穿透 500。
+
+    未落盘的单股/批量请求可以丢弃自定义源结果后整次回退 TickFlow；
+    已逐段落盘的持久化任务不在中途混源。
     """
     # 自定义源抛异常
     mock_provider = MagicMock()
@@ -142,6 +145,7 @@ def test_custom_provider_exception_no_500(monkeypatch):
     )
     assert isinstance(df_batch, pl.DataFrame)
     assert df_batch.is_empty()
+    assert mock_tf.klines.batch.call_count == 2
 
 
 # ---------- 测试 4: 未配 minute dataset → 回退 TickFlow ----------
@@ -202,6 +206,65 @@ def test_custom_success_skips_tickflow(monkeypatch):
     assert df is expected_df
     # TickFlow 路径未进入
     get_client_spy.assert_not_called()
+
+
+def test_stocksdk_single_falls_back_to_5m_when_1m_is_empty(monkeypatch):
+    """stock-sdk 的滚动 1m 窗口外，应按同一日期尝试 5m 历史 K。"""
+    coarse_df = _mock_minute_df()
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "stocksdk",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: pl.DataFrame())
+    coarse_spy = MagicMock(return_value=(coarse_df, False))
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result is coarse_df
+    assert period == "5m"
+    assert attempted is True
+    assert coarse_spy.call_args.kwargs["freq"] == "5m"
+
+
+def test_stocksdk_single_keeps_1m_without_coarse_request(monkeypatch):
+    """1m 已有数据时不得额外请求 5m。"""
+    minute_df = _mock_minute_df()
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "stocksdk",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: minute_df)
+    coarse_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result is minute_df
+    assert period == "1m"
+    assert attempted is False
+    coarse_spy.assert_not_called()
+
+
+def test_non_stocksdk_single_does_not_change_granularity(monkeypatch):
+    """其他 provider 的空 1m 结果保持原语义，不擅自请求 5m。"""
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "custom_src",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: pl.DataFrame())
+    coarse_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result.is_empty()
+    assert period == "1m"
+    assert attempted is False
+    coarse_spy.assert_not_called()
 
 
 # ---------- 测试 7: sync_minute_batch 自定义源成功直接返回 ----------
@@ -367,6 +430,62 @@ def test_sync_minute_batch_custom_empty_df_skips_on_segment(monkeypatch):
     assert df.is_empty()
 
 
+def test_sync_minute_batch_custom_streams_each_time_segment(monkeypatch):
+    """长区间自定义分钟源必须按段调用并逐段落盘。"""
+    calls: list[tuple[datetime, datetime]] = []
+
+    def fetch(symbols, *, start_time, end_time, asset_type, freq, on_chunk_done):
+        calls.append((start_time, end_time))
+        return _mock_minute_df()
+
+    mock_provider = MagicMock()
+    mock_provider.get_minute.side_effect = fetch
+    _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
+
+    on_segment_spy = MagicMock()
+    get_client_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "get_client", get_client_spy)
+
+    result = kline_sync.sync_minute_batch(
+        ["600519.SH"],
+        start_time=datetime(2026, 1, 1, 9, 25),
+        end_time=datetime(2026, 1, 25, 15, 5),
+        segment_trading_days=5,
+        on_segment=on_segment_spy,
+        asset_type="stock",
+    )
+
+    assert len(calls) == 4
+    assert all((end - start).days <= 7 for start, end in calls)
+    assert on_segment_spy.call_count == 4
+    assert result.is_empty()
+    get_client_spy.assert_not_called()
+
+
+def test_sync_minute_batch_custom_segment_failure_stops_without_mixing(monkeypatch):
+    """已逐段落盘后自定义源失败, 应保留已完成段并明确失败, 不切 TickFlow。"""
+    mock_provider = MagicMock()
+    mock_provider.get_minute.side_effect = [_mock_minute_df(), httpx.TimeoutException("timeout")]
+    _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
+
+    on_segment_spy = MagicMock()
+    get_client_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "get_client", get_client_spy)
+
+    with pytest.raises(RuntimeError, match="自定义分钟数据源.*拉取失败"):
+        kline_sync.sync_minute_batch(
+            ["600519.SH"],
+            start_time=datetime(2026, 1, 1, 9, 25),
+            end_time=datetime(2026, 1, 20, 15, 5),
+            segment_trading_days=5,
+            on_segment=on_segment_spy,
+            asset_type="stock",
+        )
+
+    on_segment_spy.assert_called_once()
+    get_client_spy.assert_not_called()
+
+
 # ---------- 测试 12: sync_and_persist_minute + custom provider 端到端落盘 (Issue 1) ----------
 
 def test_sync_and_persist_minute_custom_persists(monkeypatch, tmp_path):
@@ -409,6 +528,41 @@ def test_sync_and_persist_minute_custom_persists(monkeypatch, tmp_path):
     assert written == expected_df.height
     assert written > 0
     get_client_spy.assert_not_called()
+
+
+def test_sync_and_persist_minute_calendar_year_is_not_expanded(monkeypatch, tmp_path):
+    """手动“最近 1 年”的 365 天按自然日解释, 不再扩成约 1.4 年。"""
+    mock_provider = MagicMock()
+    _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda repo: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda repo: None)
+    earliest = datetime(2026, 9, 5, 15, 0)
+    monkeypatch.setattr(kline_sync, "_earliest_minute_datetime", lambda repo: earliest)
+    monkeypatch.setattr(kline_sync, "resolve_limit", lambda *a, **kw: MagicMock(batch=100, rpm=30))
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+
+    captured: dict = {}
+
+    def fake_sync(symbols, **kwargs):
+        captured.update(kwargs)
+        return pl.DataFrame()
+
+    monkeypatch.setattr(kline_sync, "sync_minute_batch", fake_sync)
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+
+    written = kline_sync.sync_and_persist_minute(
+        ["600519.SH"],
+        repo,
+        MagicMock(),
+        days=365,
+        extend_backward=True,
+        days_are_calendar=True,
+    )
+
+    assert written == 0
+    assert captured["end_time"] == earliest
+    assert captured["start_time"] == earliest - timedelta(days=365)
 
 
 # ---------- 测试 13: get_provider 异常时 fall through TickFlow (Issue 2) ----------
@@ -702,3 +856,47 @@ def test_sync_minute_single_rejects_index_symbol():
         asyncio.run(kline_api.sync_minute_single(mock_request, {"symbol": "000001.SH"}))
     assert exc_info.value.status_code == 400
     assert "指数" in str(exc_info.value.detail)
+
+
+def test_manual_minute_watchlist_scope_filters_non_stocks(monkeypatch, tmp_path):
+    """自选股手动同步不得把 ETF/指数写入股票分钟表。"""
+    from app.api import kline as kline_api
+    from app.tickflow import pools
+
+    monkeypatch.setattr(
+        pools,
+        "get_pool",
+        lambda name: ["600519.SH", "510300.SH", "000001.SH"],
+    )
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo.get_etf_symbol_set.return_value = {"510300.SH"}
+    repo.get_index_symbol_set.return_value = {"000001.SH"}
+
+    assert kline_api._resolve_manual_minute_universe(repo, "watchlist") == ["600519.SH"]
+
+
+def test_manual_minute_all_scope_includes_local_instruments(monkeypatch, tmp_path):
+    """全 A 股范围保留原有池, 并用本地维表补齐标的。"""
+    from app.api import kline as kline_api
+    from app.tickflow import pools
+
+    monkeypatch.setattr(
+        pools,
+        "get_pool",
+        lambda name: ["600000.SH"] if name == "watchlist" else ["000001.SZ"],
+    )
+    inst_dir = tmp_path / "instruments"
+    inst_dir.mkdir()
+    pl.DataFrame({"symbol": ["920001.BJ"]}).write_parquet(inst_dir / "instruments.parquet")
+
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo.get_etf_symbol_set.return_value = set()
+    repo.get_index_symbol_set.return_value = set()
+
+    assert kline_api._resolve_manual_minute_universe(repo, "all") == [
+        "000001.SZ",
+        "600000.SH",
+        "920001.BJ",
+    ]

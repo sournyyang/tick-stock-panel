@@ -3,6 +3,7 @@ from __future__ import annotations
 import polars as pl
 
 from app.backtest.strategy import StrategyDependencyResolver
+from app.strategy.builtin.near_limit_up import MATRIX_STRATEGY, META
 from app.strategy.engine import StrategyDef
 
 
@@ -138,3 +139,23 @@ def test_matrix_native_resolves_raw_fields_and_protocol_warmup_without_indicator
     assert {"open", "high", "low", "close", "volume", "amount"} <= set(plan.base_columns)
     assert plan.warmup_bars == 120
     assert plan.full_feature_fallback is False
+
+
+def test_matrix_native_preserves_generated_price_limit_dependency():
+    strategy = _strategy(
+        meta=META,
+        filter_fn=None,
+        execution_backend="matrix_native",
+        matrix_strategy=MATRIX_STRATEGY,
+    )
+    plan = StrategyDependencyResolver().resolve(
+        strategy,
+        params={},
+        basic_filter={"enabled": False},
+        entry_signals=[],
+        exit_signals=[],
+    )
+
+    assert "price_limit_pct" in plan.matrix_columns
+    # The matrix loader generates this field; it is not a stored parquet column.
+    assert "price_limit_pct" not in plan.base_columns

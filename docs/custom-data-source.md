@@ -4,15 +4,16 @@
 
 ## 支持范围
 
-当前自定义源支持三类数据:
+当前自定义源支持四类数据:
 
 | 数据集 | 配置名 | 说明 |
 | --- | --- | --- |
 | 日K | `daily` | 批量返回一组股票在指定区间内的日K |
 | 除权因子 | `adj_factor` | 批量返回一组股票的复权因子 |
+| 分钟K | `minute` | 按标的和时间区间返回 1 分钟 K，支持分段拉取与逐段落盘 |
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 
-分钟K、财务、深度盘口暂时仍走 TickFlow。
+深度盘口暂时仍走 TickFlow。
 
 ## 配置位置
 
@@ -125,9 +126,23 @@ datasets:
 
 `change_pct` 和 `amplitude` 使用小数制,例如 `0.0366` 表示 `3.66%`。
 
+### minute 必填
+
+| 内部字段 | 含义 |
+| --- | --- |
+| `symbol` | 标准代码，如 `000001.SZ` |
+| `datetime` | 北京时间的 K 线结束时间 |
+| `open` / `high` / `low` / `close` | OHLC |
+| `volume` | 成交量 |
+| `amount` | 成交额 |
+
+分钟源必须正确处理时区、停牌空数据以及“手/股”的成交量单位。
+对一年等长区间，后端会按“分段大小”多次调用数据源并逐段落盘；
+数据源不应忽略 `start_time` / `end_time` 后每次返回全部历史。
+
 ## 请求约定
 
-- `daily` / `adj_factor` 会按 `batch` 切分 symbols。
+- `daily` / `adj_factor` / `minute` 会按 `batch` 切分 symbols。
 - POST 请求会发送 JSON body: `symbols`、`start_time`、`end_time`。
 - GET 请求会发送 query 参数: `symbols=000001.SZ,600000.SH`。
 - `realtime` 必须是全市场快照接口,不支持逐个 symbol 拉实时行情。
@@ -148,6 +163,9 @@ freq_param: period
 ```
 
 配置后，分钟请求会分别传入 `stock` / `etf` / `index` 和 `1m`；留空时不向上游发送这两个参数，以兼容已有数据源。
+
+数据页手动获取分钟 K 时可选“自选股”或“全 A 股”。免费网页数据源建议使用自选股范围；
+全 A 股一年 1 分钟数据约为 3 亿行，即使流式落盘也可能触发上游限流。
 
 ### 请求超时
 

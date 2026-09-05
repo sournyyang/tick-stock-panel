@@ -62,6 +62,16 @@ def _guard_server_backtest_range(start: date, end: date):
         raise HTTPException(status_code=400, detail=BACKTEST_SERVER_GUARD_MESSAGE)
 
 
+def _persist_strategy_history(data_dir, result: dict) -> None:
+    """历史落盘失败不得把已经成功的回测变成失败。"""
+    try:
+        from app.backtest.history import persist_strategy_backtest_result
+
+        persist_strategy_backtest_result(data_dir, result)
+    except Exception:
+        logger.exception("strategy backtest history persistence failed")
+
+
 # ================================================================
 # 状态
 # ================================================================
@@ -245,7 +255,37 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         regime_filter=req.regime_filter,
     )
     task = make_worker_task("backtest", settings.data_dir, cfg)
-    return run_worker_task(task)
+    result = run_worker_task(task)
+    _persist_strategy_history(request.app.state.repo.store.data_dir, result)
+    return result
+
+
+@router.get("/strategy/history")
+def strategy_history(request: Request, strategy_id: str | None = None, limit: int = 50):
+    from app.backtest.history import list_strategy_backtest_history
+
+    items = list_strategy_backtest_history(
+        request.app.state.repo.store.data_dir,
+        strategy_id=strategy_id,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@router.get("/strategy/history/{run_id}")
+def strategy_history_result(run_id: str, request: Request):
+    from app.backtest.history import get_strategy_backtest_history
+
+    try:
+        wrapper = get_strategy_backtest_history(
+            request.app.state.repo.store.data_dir,
+            run_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if wrapper is None:
+        raise HTTPException(status_code=404, detail="回测历史不存在")
+    return wrapper
 
 
 # ── SSE 流式回测 (实时进度 + 可取消 + 支持重连) ───────────────────
@@ -391,6 +431,7 @@ async def strategy_stream(
     )
 
     _cleanup_stale_jobs()
+    history_data_dir = request.app.state.repo.store.data_dir
 
     # 获取或创建任务
     with _jobs_lock:
@@ -462,6 +503,7 @@ async def strategy_stream(
                         lambda d: job.progress.append(d),
                         job.cancel_event,
                     )
+                    _persist_strategy_history(history_data_dir, result)
                     _finish_job(job, result=result)
                 except Exception as e:
                     _finish_job(job, error=str(e))

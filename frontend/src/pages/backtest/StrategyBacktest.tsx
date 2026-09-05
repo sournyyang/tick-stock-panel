@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Play, FlaskConical, Clock, Loader2, Square, Search, Plus, X, SlidersHorizontal, BarChart3, Gauge, Zap, ListPlus, HelpCircle, ChevronRight, AlertTriangle, Layers } from 'lucide-react'
+import { Play, FlaskConical, Clock, Loader2, Square, Search, Plus, X, SlidersHorizontal, BarChart3, Gauge, Zap, ListPlus, HelpCircle, ChevronRight, AlertTriangle, Layers, History, RotateCcw } from 'lucide-react'
 import {
   api,
   type StrategyBacktestResult,
@@ -153,6 +153,7 @@ function FillRuleHint() {
 }
 
 const SRC_MAP: Record<string, string> = { builtin: '内置', custom: '自定义', ai: 'AI', composite: '叠加' }
+const DAILY_PAGE_SIZE_OPTIONS = [10, 30, 60]
 const TRADE_PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
 const BADGE_CLS_MAP: Record<string, string> = {
   builtin: 'bg-secondary/10 text-muted border-border',
@@ -300,6 +301,8 @@ const strategyBacktestConfigSignature = (detail: StrategyDetail) => JSON.stringi
   scoring: detail.scoring,
   entry_signals: detail.entry_signals,
   exit_signals: detail.exit_signals,
+  default_entry_fill: detail.default_entry_fill,
+  default_exit_fill: detail.default_exit_fill,
   stop_loss: detail.stop_loss,
   take_profit: detail.take_profit,
   trailing_stop: detail.trailing_stop,
@@ -904,6 +907,7 @@ function StockPoolPicker({ value, onChange, assetType = 'stock' }: { value: stri
 }
 
 export function StrategyBacktest() {
+  const queryClient = useQueryClient()
   const signalNames = useSignalNames()
   const [saved] = useState(() => storage.strategyBacktestLast.get(null))
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(saved?.selectedStrategy ?? null)
@@ -955,9 +959,12 @@ export function StrategyBacktest() {
   const [result, setResult] = useState<StrategyBacktestResult | null>(null)
   const [resultTab, setResultTab] = useState<'daily' | 'trades' | 'picks'>('daily')
   const [dailyPage, setDailyPage] = useState(0)
+  const [dailyPageSize, setDailyPageSize] = useState(10)
   const [tradePage, setTradePage] = useState(0)
   const [tradePageSize, setTradePageSize] = useState(10)
   const [selectedTrade, setSelectedTrade] = useState<StrategyBacktestTrade | null>(null)
+  const [historyRunId, setHistoryRunId] = useState('')
+  const [historyLoading, setHistoryLoading] = useState(false)
   const loadedStrategyRef = useRef<string | null>(null)
 
   const strategies = useQuery({
@@ -990,6 +997,16 @@ export function StrategyBacktest() {
     enabled: !!selectedStrategy,
   })
 
+  const strategyHistory = useQuery({
+    queryKey: QK.strategyBacktestHistory(selectedStrategy ?? ''),
+    queryFn: () => api.strategyBacktestHistory(selectedStrategy!, 50),
+    enabled: !!selectedStrategy,
+  })
+
+  useEffect(() => {
+    setHistoryRunId('')
+  }, [selectedStrategy])
+
   const backtestTask = useBacktestTask()
   const isPending = backtestTask?.isPending ?? false
 
@@ -1004,6 +1021,8 @@ export function StrategyBacktest() {
   const resetConfigFromDetail = (detail: StrategyDetail) => {
     setStrategyParams(strategyDefaultParams(detail))
     setOverrides(buildDefaultOverrides(detail))
+    if (detail.default_entry_fill) setEntryFill(detail.default_entry_fill)
+    if (detail.default_exit_fill) setExitFill(detail.default_exit_fill)
   }
 
   // 「应用到策略」: 把弹窗里当前编辑的 overrides + params 持久化为策略定义,
@@ -1086,8 +1105,11 @@ export function StrategyBacktest() {
           : undefined,
         result: backtestTask.result,
       })
+      void queryClient.invalidateQueries({
+        queryKey: QK.strategyBacktestHistory(selectedStrategy ?? ''),
+      })
     }
-  }, [backtestTask])
+  }, [backtestTask, queryClient, selectedStrategy])
 
   const handleRun = () => {
     if (!selectedStrategy || backtestDataUnavailable) return
@@ -1243,7 +1265,6 @@ export function StrategyBacktest() {
   const tradePageCount = sortedTrades.length
     ? Math.ceil(sortedTrades.length / tradePageSize)
     : 0
-  const dailyPageSize = 10
   const dailyPageCount = dailyTradeRows.length
     ? Math.ceil(dailyTradeRows.length / dailyPageSize)
     : 0
@@ -1264,6 +1285,76 @@ export function StrategyBacktest() {
   }, [result?.trades])
 
   const detail = strategyDetail.data
+  const historyItems = strategyHistory.data?.items ?? []
+  const selectedHistory = historyItems.find(item => item.run_id === historyRunId)
+
+  const loadHistoryResult = async (restoreConfig: boolean) => {
+    if (!historyRunId) return
+    setHistoryLoading(true)
+    try {
+      const wrapper = await api.strategyBacktestHistoryResult(historyRunId)
+      const historical = wrapper.result
+      setResult(historical)
+      setResultTab('daily')
+      setDailyPage(0)
+      setTradePage(0)
+
+      if (restoreConfig) {
+        const config = historical.config ?? {}
+        setSymbols(Array.isArray(config.symbols) ? config.symbols.join(',') : '')
+        if (config.asset_type === 'stock' || config.asset_type === 'etf') setAssetType(config.asset_type)
+        if (config.start) setStart(String(config.start).slice(0, 10))
+        if (config.end) setEnd(String(config.end).slice(0, 10))
+        if (config.entry_fill === 'close_t' || config.entry_fill === 'open_t+1') setEntryFill(config.entry_fill)
+        if (config.exit_fill === 'close_t' || config.exit_fill === 'open_t+1' || config.exit_fill === 'signal_next_minute') {
+          setExitFill(config.exit_fill)
+        }
+        const commission = Number(config.commission_pct ?? config.fees_pct)
+        if (Number.isFinite(commission)) setFees(String(commission * 10000))
+        const tax = Number(config.stamp_tax_pct)
+        if (Number.isFinite(tax)) setStampTax(String(tax * 1000))
+        const slip = Number(config.slippage_bps)
+        if (Number.isFinite(slip)) setSlippage(String(slip))
+        const positions = Number(config.max_positions)
+        if (Number.isFinite(positions)) setMaxPositions(String(positions))
+        const exposure = Number(config.max_exposure_pct)
+        if (Number.isFinite(exposure)) setMaxExposure(String(exposure * 100))
+        const capital = Number(config.initial_capital)
+        if (Number.isFinite(capital)) setInitialCapital(String(capital))
+        if (config.position_sizing === 'equal' || config.position_sizing === 'score_weight') {
+          setPositionSizing(config.position_sizing)
+        }
+        if (config.mode === 'position' || config.mode === 'full') setSimMode(config.mode)
+        const maxHoldingDays = Number(config.holding_days)
+        if (Number.isFinite(maxHoldingDays)) setHoldingDays(String(maxHoldingDays))
+        setHighGranularity(Boolean(config.minute_fill))
+        const historicalParams = config.params && typeof config.params === 'object' ? config.params : {}
+        const historicalOverrides = config.overrides && typeof config.overrides === 'object' ? config.overrides : {}
+        setStrategyParams(detail ? mergeStrategyParams(detail, historicalParams) : historicalParams)
+        setOverrides(detail ? normalizeStrategyOverrides(detail, historicalOverrides) : historicalOverrides)
+        const regime = config.regime_filter && typeof config.regime_filter === 'object'
+          ? config.regime_filter as Record<string, any>
+          : {}
+        setRegimeStates(Array.isArray(regime.states) ? regime.states.map(String) : [])
+        const minScore = Number(regime.min_score)
+        setRegimeMinScore(Number.isFinite(minScore) ? minScore : '')
+
+        const historicalHash = historical.strategy_info?.code_hash
+        if (historicalHash && detail?.code_hash && historicalHash !== detail.code_hash) {
+          toast('已恢复当时参数；该记录使用旧策略代码，精确复现需切换对应 Git 版本', 'success')
+        } else {
+          toast('已恢复该次回测的全部参数，可直接重新运行', 'success')
+        }
+      } else {
+        toast('已打开历史回测结果', 'success')
+      }
+    } catch (e) {
+      toast(`读取历史失败 · ${String((e as Error)?.message || e)}`, 'error')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
   const matrixStrategy = detail?.execution_backend === 'matrix_native'
   const compositeStrategy = detail?.source === 'composite'
   const visibleAdvancedTabs = useMemo(
@@ -1789,6 +1880,70 @@ export function StrategyBacktest() {
           )}
         </div>
 
+        {/* 每次成功回测自动落盘。历史结果可查看，也可把当时参数恢复到当前表单。 */}
+        <div className="rounded-btn border border-border bg-surface/50 px-3 py-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <History className="h-3.5 w-3.5 shrink-0 text-accent" />
+            <span className="text-xs font-medium text-foreground">版本历史</span>
+            <select
+              value={historyRunId}
+              onChange={event => setHistoryRunId(event.target.value)}
+              disabled={!selectedStrategy || strategyHistory.isLoading || historyItems.length === 0}
+              className="min-w-0 flex-1 rounded-btn border border-border bg-base px-2 py-1.5 text-[11px] text-foreground focus:border-accent/50 focus:outline-none disabled:opacity-50"
+            >
+              <option value="">
+                {strategyHistory.isLoading
+                  ? '正在读取历史…'
+                  : historyItems.length > 0
+                    ? `选择历史回测（共 ${historyItems.length} 次）`
+                    : '暂无历史回测，运行一次后自动保存'}
+              </option>
+              {historyItems.map(item => {
+                const created = new Date(item.created_at).toLocaleString('zh-CN', {
+                  month: '2-digit',
+                  day: '2-digit',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: false,
+                })
+                const totalReturn = typeof item.stats?.total_return === 'number'
+                  ? `${(item.stats.total_return * 100).toFixed(2)}%`
+                  : '—'
+                const version = `v${item.strategy_version || '1.0.0'}`
+                const hash = item.code_hash ? `+${item.code_hash.slice(0, 7)}` : ''
+                return (
+                  <option key={item.run_id} value={item.run_id}>
+                    {created} · {version}{hash} · 收益 {totalReturn} · {item.trade_count} 笔
+                  </option>
+                )
+              })}
+            </select>
+            <button
+              type="button"
+              disabled={!historyRunId || historyLoading}
+              onClick={() => void loadHistoryResult(false)}
+              className="rounded-btn border border-border px-2 py-1.5 text-[11px] text-secondary transition-colors hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              查看结果
+            </button>
+            <button
+              type="button"
+              disabled={!historyRunId || historyLoading}
+              onClick={() => void loadHistoryResult(true)}
+              className="inline-flex items-center gap-1 rounded-btn border border-accent/30 bg-accent/10 px-2 py-1.5 text-[11px] text-accent transition-colors hover:bg-accent/15 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {historyLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+              恢复参数
+            </button>
+          </div>
+          {selectedHistory?.code_hash && detail?.code_hash && selectedHistory.code_hash !== detail.code_hash && (
+            <div className="mt-1.5 flex items-center gap-1 text-[10px] text-warning">
+              <AlertTriangle className="h-3 w-3" />
+              这次记录来自旧策略代码。参数可以恢复，精确复现需切换对应 Git 版本。
+            </div>
+          )}
+        </div>
+
         {/* 市场环境过滤: 只在指定环境的交易日入场(强制 T-1, 用前一日环境判定) */}
         <div className="rounded-btn border border-border bg-surface/50 px-3 py-2 space-y-1.5">
           <div className="flex items-center gap-2">
@@ -1907,6 +2062,11 @@ export function StrategyBacktest() {
             <div className="flex items-center gap-3">
               <span className="text-sm font-medium text-foreground">{result.strategy_info?.name ?? '策略'}</span>
               <span className="text-[10px] px-1 py-px rounded border border-accent/30 bg-accent/10 text-accent">全量模拟</span>
+              {result.strategy_info?.version && (
+                <span className="rounded border border-border bg-surface px-1 py-px font-mono text-[9px] text-muted">
+                  v{result.strategy_info.version}{result.strategy_info.code_hash ? `+${result.strategy_info.code_hash.slice(0, 7)}` : ''}
+                </span>
+              )}
               <span className="text-[10px] text-secondary">持有 {result.config?.holding_days ?? 5} 天</span>
               <span className="ml-auto text-[11px] text-muted font-mono">
                 {String(result.config?.start).slice(0,10)} ~ {String(result.config?.end).slice(0,10)}
@@ -1975,6 +2135,11 @@ export function StrategyBacktest() {
                   {result.strategy_info.source && (
                     <span className={`text-[9px] px-1 py-px rounded border ${BADGE_CLS_MAP[result.strategy_info.source] ?? ''}`}>
                       {SRC_MAP[result.strategy_info.source] ?? ''}
+                    </span>
+                  )}
+                  {result.strategy_info.version && (
+                    <span className="rounded border border-border bg-surface px-1 py-px font-mono text-[9px] text-muted">
+                      v{result.strategy_info.version}{result.strategy_info.code_hash ? `+${result.strategy_info.code_hash.slice(0, 7)}` : ''}
                     </span>
                   )}
                 </div>
@@ -2174,9 +2339,25 @@ export function StrategyBacktest() {
                     {dailyTradeRows.length > 0 && (
                       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-2 text-xs text-muted">
                         <span>
-                          显示 {dailyStart + 1}-{dailyEnd} 天 / 共 {dailyTradeRows.length} 天，每页 10 天
+                          显示 {dailyStart + 1}-{dailyEnd} 天 / 共 {dailyTradeRows.length} 天
                         </span>
                         <div className="flex flex-wrap items-center gap-2">
+                          <label className="flex items-center gap-1.5">
+                            <span>每页</span>
+                            <select
+                              value={dailyPageSize}
+                              onChange={e => {
+                                setDailyPageSize(Number(e.target.value))
+                                setDailyPage(0)
+                              }}
+                              className="rounded-btn border border-border bg-surface px-2 py-1 text-xs text-secondary focus:outline-none focus:border-accent"
+                            >
+                              {DAILY_PAGE_SIZE_OPTIONS.map(size => (
+                                <option key={size} value={size}>{size}</option>
+                              ))}
+                            </select>
+                            <span>天</span>
+                          </label>
                           <button
                             type="button"
                             onClick={() => setDailyPage(p => Math.max(0, p - 1))}

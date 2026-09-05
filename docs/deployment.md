@@ -57,7 +57,8 @@ Docker 采用两阶段构建,前端 dist 拷进后端镜像,**单容器**运行,
 >   docker compose build --build-arg INCLUDE_STOCKSDK=1
 >   docker compose up -d
 >   ```
-> - 启用后镜像会额外内置 Node.js 运行时并预装 stock-sdk 依赖,插件开箱即用。
+> - 要在后续重建时保留插件,在本地 `.env` 中设置 `INCLUDE_STOCKSDK=1`,再运行 `docker compose up -d --build app`。默认值为 `0`。
+> - 启用后镜像会额外内置 Node.js、npm 并预装 stock-sdk 依赖,插件开箱即用,也支持在页面中重新安装依赖。本机的 npm 不会自动提供给 Docker 容器。
 > - **建议优先使用 TickFlow 等正规授权数据源。**
 
 更新到新版本:
