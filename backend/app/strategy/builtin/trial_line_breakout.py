@@ -12,11 +12,11 @@ from app.backtest.matrix import (
 META = {
     "id": "trial_line_breakout",
     "name": "试盘线战法",
-    "description": "三至六倍量上影阳线后缩量并首次有效突破; 过滤弱试盘、弱突破、阶段低位和短期追高信号",
+    "description": "三至六倍量冲高回落试盘后缩量并首次有效突破; 按主板与创业板涨幅限制过滤弱试盘和短期追高信号",
     "tags": ["试盘线", "量价", "突破"],
     "asset_types": ["stock"],
     "timeframes": ["1d"],
-    "version": "1.2.0",
+    "version": "1.3.0",
     "default_entry_fill": "close_t",
     "default_exit_fill": "close_t",
     "basic_filter": {
@@ -64,6 +64,60 @@ META = {
             "min": 0.0,
             "max": 100.0,
             "step": 1.0,
+        },
+        {
+            "id": "main_trial_high_gain_min_pct",
+            "label": "主板试盘最高涨幅下限(%)",
+            "type": "float",
+            "default": 6.0,
+            "min": 0.0,
+            "max": 20.0,
+            "step": 0.5,
+        },
+        {
+            "id": "main_trial_high_gain_max_pct",
+            "label": "主板试盘最高涨幅上限(%)",
+            "type": "float",
+            "default": 9.0,
+            "min": 0.0,
+            "max": 20.0,
+            "step": 0.5,
+        },
+        {
+            "id": "main_trial_pullback_min_pct",
+            "label": "主板最高点回落下限(百分点)",
+            "type": "float",
+            "default": 3.0,
+            "min": 0.0,
+            "max": 20.0,
+            "step": 0.5,
+        },
+        {
+            "id": "chinext_trial_high_gain_min_pct",
+            "label": "创业板试盘最高涨幅下限(%)",
+            "type": "float",
+            "default": 15.0,
+            "min": 0.0,
+            "max": 40.0,
+            "step": 0.5,
+        },
+        {
+            "id": "chinext_trial_high_gain_max_pct",
+            "label": "创业板试盘最高涨幅上限(%)",
+            "type": "float",
+            "default": 19.0,
+            "min": 0.0,
+            "max": 40.0,
+            "step": 0.5,
+        },
+        {
+            "id": "chinext_trial_pullback_min_pct",
+            "label": "创业板最高点回落下限(百分点)",
+            "type": "float",
+            "default": 6.0,
+            "min": 0.0,
+            "max": 40.0,
+            "step": 0.5,
         },
         {
             "id": "min_pretrial_low_distance_pct",
@@ -227,6 +281,26 @@ class TrialLineBreakoutMatrixStrategy:
         min_trial_close_location_ratio = (
             max(float(params.get("min_trial_close_location_pct", 40.0)), 0.0) / 100.0
         )
+        main_trial_high_gain_min_ratio = (
+            max(float(params.get("main_trial_high_gain_min_pct", 6.0)), 0.0) / 100.0
+        )
+        main_trial_high_gain_max_ratio = max(
+            float(params.get("main_trial_high_gain_max_pct", 9.0)) / 100.0,
+            main_trial_high_gain_min_ratio,
+        )
+        main_trial_pullback_min_ratio = (
+            max(float(params.get("main_trial_pullback_min_pct", 3.0)), 0.0) / 100.0
+        )
+        chinext_trial_high_gain_min_ratio = (
+            max(float(params.get("chinext_trial_high_gain_min_pct", 15.0)), 0.0) / 100.0
+        )
+        chinext_trial_high_gain_max_ratio = max(
+            float(params.get("chinext_trial_high_gain_max_pct", 19.0)) / 100.0,
+            chinext_trial_high_gain_min_ratio,
+        )
+        chinext_trial_pullback_min_ratio = (
+            max(float(params.get("chinext_trial_pullback_min_pct", 6.0)), 0.0) / 100.0
+        )
         min_pretrial_low_distance_ratio = (
             max(float(params.get("min_pretrial_low_distance_pct", 3.0)), 0.0) / 100.0
         )
@@ -274,6 +348,39 @@ class TrialLineBreakoutMatrixStrategy:
             candle_range,
             out=np.zeros(market.shape, dtype=np.float32),
             where=candle_range > 0,
+        )
+        trial_high_gain = np.divide(
+            market.high - previous_close,
+            previous_close,
+            out=np.full(market.shape, np.nan, dtype=np.float32),
+            where=previous_close > 0,
+        )
+        # “最高点回落几个点”按昨收为基准计算百分点。例如最高涨 8%、
+        # 收盘涨 4%，回落即 4 个百分点。
+        trial_pullback = np.divide(
+            market.high - market.close,
+            previous_close,
+            out=np.full(market.shape, np.nan, dtype=np.float32),
+            where=previous_close > 0,
+        )
+        chinext_assets = np.asarray(
+            [symbol.startswith(("300", "301")) for symbol in market.symbols],
+            dtype=bool,
+        )[None, :]
+        main_trial_shape = (
+            (trial_high_gain >= main_trial_high_gain_min_ratio)
+            & (trial_high_gain <= main_trial_high_gain_max_ratio)
+            & (trial_pullback >= main_trial_pullback_min_ratio)
+        )
+        chinext_trial_shape = (
+            (trial_high_gain >= chinext_trial_high_gain_min_ratio)
+            & (trial_high_gain <= chinext_trial_high_gain_max_ratio)
+            & (trial_pullback >= chinext_trial_pullback_min_ratio)
+        )
+        board_trial_shape = np.where(
+            chinext_assets,
+            chinext_trial_shape,
+            main_trial_shape,
         )
         valid_close = np.isfinite(market.close)
         limit_up_values = market.limit_up_locked.astype(np.float32)
@@ -345,6 +452,7 @@ class TrialLineBreakoutMatrixStrategy:
             & (upper_shadow > 0)
             & (upper_shadow >= body * upper_shadow_body_ratio)
             & (trial_close_location >= min_trial_close_location_ratio)
+            & board_trial_shape
             & enough_above_recent_low
             & not_pretrial_overextended
             & (recent_limit_up_count <= max_recent_limit_ups)

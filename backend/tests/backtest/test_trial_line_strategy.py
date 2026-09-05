@@ -71,7 +71,7 @@ def test_trial_line_entry_and_both_exit_rules():
 def test_trial_line_defaults_to_same_day_close_fills():
     strategy = StrategyEngine._load_file(STRATEGY_PATH)
 
-    assert strategy.meta["version"] == "1.2.0"
+    assert strategy.meta["version"] == "1.3.0"
     assert strategy.meta["default_entry_fill"] == "close_t"
     assert strategy.meta["default_exit_fill"] == "close_t"
     assert strategy.basic_filter["boards"] == ["沪主板", "深主板", "创业板"]
@@ -79,6 +79,12 @@ def test_trial_line_defaults_to_same_day_close_fills():
     assert params["trial_volume_multiple"] == 3.0
     assert params["max_trial_volume_multiple"] == 6.0
     assert params["min_trial_close_location_pct"] == 40.0
+    assert params["main_trial_high_gain_min_pct"] == 6.0
+    assert params["main_trial_high_gain_max_pct"] == 9.0
+    assert params["main_trial_pullback_min_pct"] == 3.0
+    assert params["chinext_trial_high_gain_min_pct"] == 15.0
+    assert params["chinext_trial_high_gain_max_pct"] == 19.0
+    assert params["chinext_trial_pullback_min_pct"] == 6.0
     assert params["min_pretrial_low_distance_pct"] == 3.0
     assert params["max_pretrial_20d_gain_pct"] == 10.0
     assert params["recent_limit_window_days"] == 10
@@ -92,6 +98,46 @@ def test_trial_line_defaults_to_same_day_close_fills():
     assert params["close_stop_loss_pct"] == 6.0
     assert strategy.stop_loss is None
     assert strategy.max_hold_days == 5
+
+
+def test_trial_line_uses_board_specific_surge_and_pullback_ranges():
+    start = date(2026, 1, 1)
+    rows = []
+    cases = {
+        # 主板最高涨 8%、较最高点回落 4 个百分点，符合 6%~9% / 至少 3 点。
+        "000001.SZ": (10.8, 10.4, True),
+        # 主板虽涨到 8%，但只回落 2 个百分点。
+        "000002.SZ": (10.8, 10.6, False),
+        # 创业板最高涨 17%、回落 7 个百分点，符合 15%~19% / 至少 6 点。
+        "300001.SZ": (11.7, 11.0, True),
+        # 创业板最高涨幅只有 14%，未达到 15%。
+        "300002.SZ": (11.4, 10.7, False),
+    }
+    for symbol, (trial_high, trial_close, _) in cases.items():
+        rows.extend([
+            {
+                "symbol": symbol, "date": start,
+                "open": 9.9, "high": 10.1, "low": 9.8, "close": 10.0, "volume": 100.0,
+            },
+            {
+                "symbol": symbol, "date": start + timedelta(days=1),
+                "open": 10.1, "high": trial_high, "low": 10.0,
+                "close": trial_close, "volume": 300.0,
+            },
+            {
+                "symbol": symbol, "date": start + timedelta(days=2),
+                "open": trial_close, "high": trial_close * 1.02, "low": trial_close * 0.99,
+                "close": trial_close * 1.01, "volume": 100.0,
+            },
+        ])
+
+    signals = _signals(rows)
+    by_symbol = dict(zip(sorted(cases), signals.entry[2].tolist(), strict=True))
+
+    assert by_symbol == {
+        symbol: int(expected)
+        for symbol, (_, _, expected) in cases.items()
+    }
 
 
 def test_stop_loss_requires_close_confirmation():
@@ -164,7 +210,7 @@ def test_internal_benchmark_state_resets_after_max_hold():
         (10.5, 10.7, 10.3, 10.6, 100.0),
         (10.5, 10.7, 10.3, 10.6, 100.0),
         (10.3, 10.5, 10.2, 10.4, 100.0),
-        (10.0, 11.0, 9.9, 10.5, 300.0),
+        (10.0, 11.1, 9.9, 10.5, 300.0),
         (10.3, 10.7, 10.2, 10.6, 100.0),
     ]
     rows = [
