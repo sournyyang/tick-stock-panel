@@ -2211,7 +2211,7 @@ class KlineRepository:
         if instruments.is_empty() or "symbol" not in instruments.columns:
             return df
         metadata_cols = [
-            c for c in ("name", "total_shares", "float_shares")
+            c for c in ("name", "listing_date", "total_shares", "float_shares")
             if c in instruments.columns and c not in df.columns
         ]
         if not metadata_cols:

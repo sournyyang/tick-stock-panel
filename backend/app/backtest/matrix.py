@@ -613,6 +613,9 @@ def build_market_data_matrix(
     for column in sorted(wanted_fields):
         if column == "price_limit_pct":
             continue
+        if column == "listing_date":
+            fields[column] = _date_matrix(panel, column, shape, time_id, asset_id)
+            continue
         if column in panel.columns and panel[column].dtype.is_numeric():
             fields[column] = float_matrix(column)
         elif column == "raw_close":
@@ -909,6 +912,8 @@ def _resolve_matrix_storage_fields(
         and name in instrument_columns
         and name not in parquet_fields
     }
+    if "listing_date" in wanted_fields and "listing_date" in instrument_columns:
+        vector_fields.add("listing_date")
     if "raw_close" in wanted_fields:
         matrix_fields.add("raw_close")
     if "turnover_rate" in wanted_fields:
@@ -918,7 +923,7 @@ def _resolve_matrix_storage_fields(
     if "price_limit_pct" in wanted_fields:
         matrix_fields.add("price_limit_pct")
     resolved = matrix_fields | vector_fields
-    unresolved = wanted_fields - resolved
+    unresolved = wanted_fields - resolved - {"listing_date"}
     if unresolved:
         raise ValueError(f"matrix parquet fields unavailable: {sorted(unresolved)}")
     return parquet_fields, sorted(matrix_fields), sorted(vector_fields)
@@ -1596,7 +1601,15 @@ def _instrument_fingerprint(instruments: pl.DataFrame | None) -> bytes:
         return b"no-instruments"
     columns = [
         name
-        for name in ("symbol", "name", "total_shares", "float_shares", "limit_up", "limit_down")
+        for name in (
+            "symbol",
+            "name",
+            "listing_date",
+            "total_shares",
+            "float_shares",
+            "limit_up",
+            "limit_down",
+        )
         if name in instruments.columns
     ]
     payload = instruments.select(columns).sort("symbol").to_dicts()
@@ -2130,6 +2143,8 @@ def _instrument_axis_values(
         name: np.full(len(symbols), np.nan, dtype=np.float32)
         for name in numeric_fields
     }
+    if "listing_date" in wanted_fields:
+        vectors["listing_date"] = np.full(len(symbols), np.nan, dtype=np.float32)
     for asset_id, symbol in enumerate(symbols):
         row = by_symbol.get(symbol)
         if row is None:
@@ -2138,7 +2153,10 @@ def _instrument_axis_values(
         for name, target in vectors.items():
             value = row.get(name)
             if value is not None:
-                target[asset_id] = np.float32(value)
+                if name == "listing_date":
+                    target[asset_id] = _date_to_epoch_day(value)
+                else:
+                    target[asset_id] = np.float32(value)
         for name, target in limits.items():
             value = row.get(name)
             if value is not None:
@@ -2746,6 +2764,39 @@ def _float_matrix(
     values[~np.isfinite(values)] = np.nan if null_fill is None else null_fill
     out[time_id, asset_id] = values
     return out
+
+
+def _date_matrix(
+    panel: pl.DataFrame,
+    column: str,
+    shape: tuple[int, int],
+    time_id: np.ndarray,
+    asset_id: np.ndarray,
+) -> np.ndarray:
+    out = np.full(shape, np.nan, dtype=np.float32)
+    if column not in panel.columns:
+        return out
+    values = panel[column]
+    if values.dtype == pl.Date:
+        dates = values
+    elif isinstance(values.dtype, pl.Datetime):
+        dates = values.cast(pl.Date)
+    else:
+        dates = values.cast(pl.String).str.strptime(pl.Date, strict=False)
+    epoch_days = np.asarray(
+        dates.cast(pl.Int32).cast(pl.Float32).to_numpy(),
+        dtype=np.float32,
+    )
+    out[time_id, asset_id] = epoch_days
+    return out
+
+
+def _date_to_epoch_day(value: Any) -> np.float32:
+    try:
+        parsed = date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return np.float32(np.nan)
+    return np.float32((parsed - date(1970, 1, 1)).days)
 
 
 def _timestamp_int64(series: pl.Series) -> np.ndarray:
@@ -3655,6 +3706,16 @@ def _build_basic_filter_mask_uncached(market: MarketDataMatrix, config: dict) ->
             dtype=bool,
         )
         mask &= asset_mask[None, :]
+
+    exclude_new_days = int(config.get("exclude_new_days") or 0)
+    if exclude_new_days > 0:
+        listing_dates = market.fields.get("listing_date")
+        if listing_dates is not None and np.isfinite(listing_dates).any():
+            trading_days = (market.timestamps // 86_400_000).astype(np.float32)
+            if listing_dates.ndim == 1:
+                listing_dates = listing_dates[None, :]
+            age_days = trading_days[:, None] - listing_dates
+            mask &= np.isfinite(listing_dates) & (age_days >= exclude_new_days)
 
     boards = config.get("boards")
     if isinstance(boards, list) and boards:

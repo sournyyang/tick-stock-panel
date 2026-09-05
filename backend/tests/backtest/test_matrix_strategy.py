@@ -18,6 +18,7 @@ from app.backtest.matrix import (
     MatrixStrategyPipeline,
     RealtimeMarketDataMatrix,
     apply_time_masks,
+    build_basic_filter_mask,
     build_market_data_matrix,
     build_matrix_score,
     load_market_data_matrix_from_parquet,
@@ -353,6 +354,25 @@ def test_market_matrix_derives_live_raw_close_when_requested():
     np.testing.assert_array_equal(snapshot.field("raw_close")[-1], snapshot.close[-1])
 
 
+def test_basic_filter_excludes_stocks_during_first_thirty_calendar_days():
+    panel = pl.DataFrame({
+        "symbol": ["000001.SZ", "000002.SZ", "000003.SZ"],
+        "name": ["刚满30天", "上市不足30天", "老股"],
+        "listing_date": ["2024-01-01", "2024-01-02", "2020-01-01"],
+        "date": [date(2024, 1, 31)] * 3,
+        "open": [10.0] * 3,
+        "high": [10.2] * 3,
+        "low": [9.8] * 3,
+        "close": [10.1] * 3,
+        "volume": [1_000.0] * 3,
+    })
+    market = build_market_data_matrix(panel, field_columns={"listing_date"})
+
+    mask = build_basic_filter_mask(market, {"exclude_new_days": 30})
+
+    assert mask[0].tolist() == [True, False, True]
+
+
 def test_direct_parquet_matrix_reports_actionable_error_when_enriched_is_empty(tmp_path):
     market_root = tmp_path / "kline_daily_enriched"
     market_root.mkdir()
@@ -402,6 +422,7 @@ def test_direct_parquet_matrix_matches_panel_builder_and_reuses_mmap(tmp_path):
     instruments = pl.DataFrame({
         "symbol": ["000001.SZ", "000002.SZ", "300001.SZ"],
         "name": ["普通", "ST测试", "创业板"],
+        "listing_date": ["2000-01-01", "2024-01-01", "2010-01-01"],
         "total_shares": [1_000_000.0, 2_000_000.0, 3_000_000.0],
         "float_shares": [800_000.0, 1_500_000.0, 2_000_000.0],
         "limit_up": [12.0, 11.0, 13.0],
@@ -412,7 +433,9 @@ def test_direct_parquet_matrix_matches_panel_builder_and_reuses_mmap(tmp_path):
         instruments,
         needed={"signal_limit_up", "signal_limit_down"},
     ).join(
-        instruments.select("symbol", "name", "total_shares", "float_shares"),
+        instruments.select(
+            "symbol", "name", "listing_date", "total_shares", "float_shares"
+        ),
         on="symbol",
         how="left",
     )
@@ -424,6 +447,7 @@ def test_direct_parquet_matrix_matches_panel_builder_and_reuses_mmap(tmp_path):
         "turnover_rate",
         "total_shares",
         "float_shares",
+        "listing_date",
     }
     expected = build_market_data_matrix(enriched, field_columns=field_columns)
     cache_root = tmp_path / "matrix_cache"

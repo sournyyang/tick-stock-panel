@@ -12,11 +12,11 @@ from app.backtest.matrix import (
 META = {
     "id": "trial_line_breakout",
     "name": "试盘线战法",
-    "description": "三至四点五倍量上影阳线后缩量并首次有效突破; 过滤弱试盘、弱突破、阶段低位和短期追高信号",
+    "description": "三至六倍量上影阳线后缩量并首次有效突破; 过滤弱试盘、弱突破、阶段低位和短期追高信号",
     "tags": ["试盘线", "量价", "突破"],
     "asset_types": ["stock"],
     "timeframes": ["1d"],
-    "version": "1.1.0",
+    "version": "1.2.0",
     "default_entry_fill": "close_t",
     "default_exit_fill": "close_t",
     "basic_filter": {
@@ -42,7 +42,7 @@ META = {
             "id": "max_trial_volume_multiple",
             "label": "试盘量/前一日量上限",
             "type": "float",
-            "default": 4.5,
+            "default": 6.0,
             "min": 3.0,
             "max": 30.0,
             "step": 0.5,
@@ -78,7 +78,7 @@ META = {
             "id": "max_pretrial_20d_gain_pct",
             "label": "试盘前20日最大涨幅(%)",
             "type": "float",
-            "default": 7.0,
+            "default": 10.0,
             "min": 0.0,
             "max": 300.0,
             "step": 1.0,
@@ -168,7 +168,7 @@ META = {
             "id": "take_profit_pct",
             "label": "收盘止盈(%)",
             "type": "float",
-            "default": 10.0,
+            "default": 15.0,
             "min": 1.0,
             "max": 100.0,
             "step": 1.0,
@@ -220,7 +220,7 @@ class TrialLineBreakoutMatrixStrategy:
     def compute_signals(self, market: MarketDataMatrix, params: dict) -> SignalMatrix:
         trial_volume_multiple = max(float(params.get("trial_volume_multiple", 3.0)), 0.0)
         max_trial_volume_multiple = max(
-            float(params.get("max_trial_volume_multiple", 4.5)),
+            float(params.get("max_trial_volume_multiple", 6.0)),
             trial_volume_multiple,
         )
         upper_shadow_body_ratio = max(float(params.get("upper_shadow_body_ratio", 0.5)), 0.0)
@@ -231,7 +231,7 @@ class TrialLineBreakoutMatrixStrategy:
             max(float(params.get("min_pretrial_low_distance_pct", 3.0)), 0.0) / 100.0
         )
         max_pretrial_20d_gain_ratio = (
-            max(float(params.get("max_pretrial_20d_gain_pct", 7.0)), 0.0) / 100.0
+            max(float(params.get("max_pretrial_20d_gain_pct", 10.0)), 0.0) / 100.0
         )
         entry_window_days = max(int(params.get("entry_window_days", 5)), 1)
         recent_limit_window_days = max(int(params.get("recent_limit_window_days", 10)), 1)
@@ -250,7 +250,7 @@ class TrialLineBreakoutMatrixStrategy:
             max(float(params.get("min_breakout_margin_pct", 0.5)), 0.0) / 100.0
         )
         exit_volume_multiple = max(float(params.get("exit_volume_multiple", 3.0)), 0.0)
-        take_profit_ratio = max(float(params.get("take_profit_pct", 10.0)), 0.0) / 100.0
+        take_profit_ratio = max(float(params.get("take_profit_pct", 15.0)), 0.0) / 100.0
         close_stop_loss_ratio = (
             max(float(params.get("close_stop_loss_pct", 6.0)), 0.0) / 100.0
         )

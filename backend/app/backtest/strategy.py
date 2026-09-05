@@ -69,7 +69,7 @@ _EXECUTION_COLUMNS = frozenset({
     "name", "score", "signal_limit_up", "signal_limit_down",
 })
 _LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high", "raw_low"})
-_INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares"})
+_INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares", "listing_date"})
 
 
 @dataclass(frozen=True)
@@ -479,6 +479,8 @@ def _basic_filter_dependencies(config: dict) -> set[str]:
         dependencies.add("float_shares")
     if config.get("exclude_st"):
         dependencies.add("name")
+    if int(config.get("exclude_new_days") or 0) > 0:
+        dependencies.add("listing_date")
     return dependencies
 
 

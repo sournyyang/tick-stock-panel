@@ -61,9 +61,13 @@ class ScreenerService:
             # JOIN instruments
             df_i = self.repo.get_instruments_asset(self.asset_type)
             if not df_i.is_empty():
-                inst_cols = [c for c in ["symbol", "name", "total_shares", "float_shares"] if c in df_i.columns]
-                if "name" not in df.columns:
-                    df = df.join(df_i.select(inst_cols), on="symbol", how="left")
+                inst_cols = [
+                    c
+                    for c in ["name", "listing_date", "total_shares", "float_shares"]
+                    if c in df_i.columns and c not in df.columns
+                ]
+                if inst_cols:
+                    df = df.join(df_i.select("symbol", *inst_cols), on="symbol", how="left")
             return df
 
         # 尝试从 repo 级预计算历史缓存中提取目标日期 (仅 stock: 该缓存为股票专用)
@@ -76,9 +80,17 @@ class ScreenerService:
                     # JOIN instruments
                     df_i = self.repo.get_instruments_asset(self.asset_type)
                     if not df_i.is_empty():
-                        inst_cols = [c for c in ["symbol", "name", "total_shares", "float_shares"] if c in df_i.columns]
-                        if "name" not in df.columns:
-                            df = df.join(df_i.select(inst_cols), on="symbol", how="left")
+                        inst_cols = [
+                            c
+                            for c in ["name", "listing_date", "total_shares", "float_shares"]
+                            if c in df_i.columns and c not in df.columns
+                        ]
+                        if inst_cols:
+                            df = df.join(
+                                df_i.select("symbol", *inst_cols),
+                                on="symbol",
+                                how="left",
+                            )
                     return df
 
         # 历史日期: 从 parquet 读取 14 列, 即时计算指标 (慢路径)
@@ -195,9 +207,15 @@ class ScreenerService:
 
         # JOIN instruments (name, total_shares, float_shares)
         if not instruments.is_empty():
-            inst_cols = [c for c in ["symbol", "name", "total_shares", "float_shares"] if c in instruments.columns]
-            if "name" not in df_result.columns:
-                df_result = df_result.join(instruments.select(inst_cols), on="symbol", how="left")
+            inst_cols = [
+                c
+                for c in ["name", "listing_date", "total_shares", "float_shares"]
+                if c in instruments.columns and c not in df_result.columns
+            ]
+            if inst_cols:
+                df_result = df_result.join(
+                    instruments.select("symbol", *inst_cols), on="symbol", how="left"
+                )
 
         return df_result
 
@@ -214,10 +232,18 @@ class ScreenerService:
             if cached is not None and not cached.is_empty():
                 # JOIN instruments (repo 缓存不含 name 等列)
                 instruments = self.repo.get_instruments_asset(self.asset_type)
-                if instruments is not None and not instruments.is_empty() and "name" not in cached.columns:
-                    inst_cols = [c for c in ["symbol", "name", "total_shares", "float_shares"]
-                                 if c in instruments.columns]
-                    cached = cached.join(instruments.select(inst_cols), on="symbol", how="left")
+                if instruments is not None and not instruments.is_empty():
+                    inst_cols = [
+                        c
+                        for c in ["name", "listing_date", "total_shares", "float_shares"]
+                        if c in instruments.columns and c not in cached.columns
+                    ]
+                    if inst_cols:
+                        cached = cached.join(
+                            instruments.select("symbol", *inst_cols),
+                            on="symbol",
+                            how="left",
+                        )
                 elapsed = (time.perf_counter() - t0) * 1000
                 logger.info("_load_enriched_history(%s, %d): repo cache hit, %.1fms, %d rows",
                             target_date, lookback_days, elapsed, len(cached))
@@ -278,9 +304,15 @@ class ScreenerService:
             )
 
         if instruments is not None and not instruments.is_empty():
-            inst_cols = [c for c in ["symbol", "name", "total_shares", "float_shares"] if c in instruments.columns]
-            if "name" not in df_full.columns:
-                df_full = df_full.join(instruments.select(inst_cols), on="symbol", how="left")
+            inst_cols = [
+                c
+                for c in ["name", "listing_date", "total_shares", "float_shares"]
+                if c in instruments.columns and c not in df_full.columns
+            ]
+            if inst_cols:
+                df_full = df_full.join(
+                    instruments.select("symbol", *inst_cols), on="symbol", how="left"
+                )
 
         # 裁剪掉 warmup 部分, 只保留 lookback 范围 (减少 group_by 开销)。
         # 按交易日计数: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日,

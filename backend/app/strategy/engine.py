@@ -1199,6 +1199,8 @@ class StrategyEngine:
                 or basic_filter.get(f"{prefix}_max") is not None
             ):
                 fields.add(field_name)
+        if int(basic_filter.get("exclude_new_days") or 0) > 0:
+            fields.add("listing_date")
         scoring = effective_scoring(strategy.meta.get("scoring"), overrides)
         fields.update(scoring_dependencies(scoring))
         order_by = strategy.meta.get("order_by")
@@ -1513,6 +1515,21 @@ class StrategyEngine:
             exprs.append(pl.col("turnover_rate") <= bf["turnover_max"])
         if bf.get("exclude_st") and "name" in df.columns:
             exprs.append(~pl.col("name").str.contains("(?i)ST|\\*ST|退"))
+        exclude_new_days = int(bf.get("exclude_new_days") or 0)
+        if exclude_new_days > 0 and {"date", "listing_date"} <= set(df.columns):
+            listing_date = pl.col("listing_date")
+            if df.schema["listing_date"] != pl.Date:
+                listing_date = listing_date.cast(pl.String).str.strptime(
+                    pl.Date,
+                    strict=False,
+                )
+            exprs.append(
+                listing_date.is_not_null()
+                & (
+                    (pl.col("date").cast(pl.Date) - listing_date).dt.total_days()
+                    >= exclude_new_days
+                )
+            )
         # 板块过滤
         boards = bf.get("boards")
         if boards and isinstance(boards, list) and len(boards) > 0:
