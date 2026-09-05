@@ -206,6 +206,65 @@ def test_custom_success_skips_tickflow(monkeypatch):
     get_client_spy.assert_not_called()
 
 
+def test_stocksdk_single_falls_back_to_5m_when_1m_is_empty(monkeypatch):
+    """stock-sdk 的滚动 1m 窗口外，应按同一日期尝试 5m 历史 K。"""
+    coarse_df = _mock_minute_df()
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "stocksdk",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: pl.DataFrame())
+    coarse_spy = MagicMock(return_value=(coarse_df, False))
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result is coarse_df
+    assert period == "5m"
+    assert attempted is True
+    assert coarse_spy.call_args.kwargs["freq"] == "5m"
+
+
+def test_stocksdk_single_keeps_1m_without_coarse_request(monkeypatch):
+    """1m 已有数据时不得额外请求 5m。"""
+    minute_df = _mock_minute_df()
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "stocksdk",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: minute_df)
+    coarse_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result is minute_df
+    assert period == "1m"
+    assert attempted is False
+    coarse_spy.assert_not_called()
+
+
+def test_non_stocksdk_single_does_not_change_granularity(monkeypatch):
+    """其他 provider 的空 1m 结果保持原语义，不擅自请求 5m。"""
+    monkeypatch.setattr(
+        kline_sync.preferences, "get_minute_data_provider", lambda: "custom_src",
+    )
+    monkeypatch.setattr(kline_sync, "fetch_minute_single", lambda *a, **kw: pl.DataFrame())
+    coarse_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "_try_custom_minute", coarse_spy)
+
+    result, period, attempted = kline_sync.fetch_minute_single_with_fallback(
+        "600519.SH", date(2026, 1, 15), asset_type="stock",
+    )
+
+    assert result.is_empty()
+    assert period == "1m"
+    assert attempted is False
+    coarse_spy.assert_not_called()
+
+
 # ---------- 测试 7: sync_minute_batch 自定义源成功直接返回 ----------
 
 def test_sync_minute_batch_custom_success_returns_directly(monkeypatch):

@@ -963,7 +963,9 @@ def get_minute(
     if trade_date is None:
         # 本地无任何分钟K，尝试从 TickFlow 拉取当天
         trade_date = cn_today()
-        df = kline_sync.fetch_minute_single(symbol, trade_date, asset_type=asset_type)
+        df, period, fallback_attempted = kline_sync.fetch_minute_single_with_fallback(
+            symbol, trade_date, asset_type=asset_type,
+        )
         price_limit = _get_price_limit_info(
             repo, symbol, trade_date, asset_type, stock_name,
         )
@@ -976,6 +978,8 @@ def get_minute(
             "asset_type": asset_type,
             "price_limit": price_limit,
             "prev_close": prev_close,
+            "period": period,
+            "fallback_attempted": fallback_attempted,
         }
 
     prev_close = _get_previous_closes(
@@ -1025,10 +1029,17 @@ def get_minute(
             "asset_type": asset_type,
             "price_limit": price_limit,
             "prev_close": prev_close,
+            "period": "1m",
+            "fallback_attempted": False,
         }
 
-    # 本地不完整或无数据 → 从 TickFlow 实时拉取
-    live_df = kline_sync.fetch_minute_single(symbol, trade_date, asset_type=asset_type)
+    # 本地不完整或无数据 → 实时拉取；stock-sdk 的 1m 窗口外尝试 5m。
+    live_df, period, fallback_attempted = kline_sync.fetch_minute_single_with_fallback(
+        symbol, trade_date, asset_type=asset_type,
+    )
+    notice = None
+    if live_df.is_empty() and fallback_attempted:
+        notice = "stock-sdk 的 1 分钟数据仅覆盖最近 5 个交易日；已尝试 5 分钟历史 K，该日仍无数据"
     return {
         "symbol": symbol, "name": stock_name, "stock_info": stock_info,
         "date": str(trade_date), "rows": live_df.to_dicts(),
@@ -1036,6 +1047,9 @@ def get_minute(
         "asset_type": asset_type,
         "price_limit": price_limit,
         "prev_close": prev_close,
+        "period": period,
+        "fallback_attempted": fallback_attempted,
+        "notice": notice,
     }
 
 

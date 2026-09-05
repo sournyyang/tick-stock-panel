@@ -1197,6 +1197,34 @@ def fetch_minute_single(
     return _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbol))
 
 
+def fetch_minute_single_with_fallback(
+    symbol: str,
+    trade_date: date,
+    asset_type: AssetType = "stock",
+) -> tuple[pl.DataFrame, str, bool]:
+    """拉取单日分钟数据；stock-sdk 的 1m 窗口外自动尝试 5m 历史 K。
+
+    返回 ``(dataframe, period, fallback_attempted)``。其他 provider 保持原有
+    1m 语义，避免擅自改变自定义数据源的数据粒度。
+    """
+    df = fetch_minute_single(symbol, trade_date, asset_type=asset_type)
+    if not df.is_empty() or preferences.get_minute_data_provider() != "stocksdk":
+        return df, "1m", False
+
+    start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0)
+    end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0)
+    coarse_df, coarse_fallback = _try_custom_minute(
+        [symbol],
+        start_time=start_time,
+        end_time=end_time,
+        asset_type=asset_type,
+        freq="5m",
+    )
+    if coarse_fallback or coarse_df is None or coarse_df.is_empty():
+        return pl.DataFrame(), "1m", True
+    return coarse_df, "5m", True
+
+
 def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
     """从 TickFlow 实时拉取单股除权因子(不写入本地), 用于单股 K 线即时前复权。
 

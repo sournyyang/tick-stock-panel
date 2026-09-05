@@ -56,6 +56,7 @@ export function StockIntradayChart({
   // source=none 表示本地无数据且 TickFlow 也拉不到 (停牌/复牌延迟/非交易日)
   // 此时不弹"是否获取"询问窗, 只做静态提示, 避免误导用户去拉明知拉不到的数据
   const sourceIsNone = minute.data?.source === 'none'
+  const fallbackAttempted = minute.data?.fallback_attempted === true
   // 指数分钟K无本地存储且不支持落库获取 (后端 sync_minute_single 显式拒绝), 不显示获取按钮
   const isIndex = minute.data?.asset_type === 'index'
 
@@ -80,14 +81,16 @@ export function StockIntradayChart({
             // 指数: 分钟K仅支持实时读取, 无落库获取入口
             <div className="flex items-center justify-center h-full text-xs text-muted">指数暂无分钟数据</div>
           ) : sourceIsNone ? (
-            // 数据源确认无此日分钟数据 (停牌/复牌延迟等): 静态提示 + 保留重试
+            // 数据源确认无此日分钟数据: 展示 provider 给出的覆盖范围说明。
             <div className="flex flex-col items-center justify-center h-full gap-3">
-              <div className="text-xs text-muted">该日暂无分钟数据（数据源未提供）</div>
+              <div className="max-w-md text-center text-xs text-muted">
+                {minute.data?.notice ?? '该日暂无分钟数据（数据源未提供）'}
+              </div>
               <button
-                onClick={() => fetchMinute.mutate()}
+                onClick={() => fallbackAttempted ? void minute.refetch() : fetchMinute.mutate()}
                 className="px-4 py-1.5 rounded-btn bg-elevated text-secondary text-xs font-medium hover:bg-elevated/80 transition-colors duration-150"
               >
-                重新获取
+                {fallbackAttempted ? '重新查询' : '重新获取'}
               </button>
             </div>
           ) : minuteDismissed ? (
@@ -122,17 +125,24 @@ export function StockIntradayChart({
         </>
       )}
       {minuteRows.length > 0 && (
-        <EChartsIntraday
-          data={minuteRows}
-          height={height}
-          prevClose={prevClose}
-          date={date}
-          priceLimit={minute.data?.price_limit ?? undefined}
-          onPriceHover={onPriceHover}
-          onPriceDoubleClick={onPriceDoubleClick}
-          currentPrice={currentPrice}
-          priceLines={priceLines}
-        />
+        <div className="relative h-full">
+          {minute.data?.period === '5m' && (
+            <div className="absolute left-2 top-1 z-10 rounded bg-elevated/90 px-2 py-0.5 text-[10px] text-muted">
+              历史降级 · 5分钟
+            </div>
+          )}
+          <EChartsIntraday
+            data={minuteRows}
+            height={height}
+            prevClose={prevClose}
+            date={date}
+            priceLimit={minute.data?.price_limit ?? undefined}
+            onPriceHover={onPriceHover}
+            onPriceDoubleClick={onPriceDoubleClick}
+            currentPrice={currentPrice}
+            priceLines={priceLines}
+          />
+        </div>
       )}
     </div>
   )

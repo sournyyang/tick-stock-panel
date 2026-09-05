@@ -2165,6 +2165,9 @@ export const api = {
       asset_type?: 'stock' | 'etf' | 'index'
       price_limit?: PriceLimitInfo | null
       prev_close?: number | null
+      period?: '1m' | '5m'
+      fallback_attempted?: boolean
+      notice?: string | null
     }>(
       `/api/kline/minute?symbol=${encodeURIComponent(symbol)}${date ? `&date=${date}` : ''}${live ? '&live=1' : ''}`,
     ),
