@@ -503,6 +503,18 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       <RangeField label="流通市值" minVal={basicFilter.float_cap_min != null ? basicFilter.float_cap_min / 1e8 : null} maxVal={basicFilter.float_cap_max != null ? basicFilter.float_cap_max / 1e8 : null} onMinChange={v => setBF('float_cap_min', v != null ? v * 1e8 : null)} onMaxChange={v => setBF('float_cap_max', v != null ? v * 1e8 : null)} unit="亿" step="5" />
                       <RangeField label="成交额" minVal={basicFilter.amount_min != null ? basicFilter.amount_min / 1e8 : null} maxVal={basicFilter.amount_max != null ? basicFilter.amount_max / 1e8 : null} onMinChange={v => setBF('amount_min', v != null ? v * 1e8 : null)} onMaxChange={v => setBF('amount_max', v != null ? v * 1e8 : null)} unit="亿" step="0.5" />
                       <RangeField label="换手率" minVal={basicFilter.turnover_min} maxVal={basicFilter.turnover_max} onMinChange={v => setBF('turnover_min', v)} onMaxChange={v => setBF('turnover_max', v)} unit="%" step="0.5" />
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[11px] text-secondary w-16 shrink-0 text-right">排除新股</span>
+                        <input
+                          type="number"
+                          value={basicFilter.exclude_new_days ?? ''}
+                          onChange={e => setBF('exclude_new_days', e.target.value === '' ? null : Math.max(0, Math.round(Number(e.target.value))))}
+                          min={0}
+                          step={1}
+                          className="w-20 px-1.5 py-0.5 rounded bg-base border border-border text-[11px] font-mono text-foreground text-center focus:outline-none focus:border-accent/50"
+                        />
+                        <span className="text-[10px] text-muted shrink-0">天内</span>
+                      </div>
                       <div className="space-y-1.5">
                         <div className="flex items-start gap-1.5">
                           <span className="text-[11px] text-secondary w-16 shrink-0 text-right pt-0.5">板块</span>

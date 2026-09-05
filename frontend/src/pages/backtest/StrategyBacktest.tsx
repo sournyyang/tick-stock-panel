@@ -181,13 +181,20 @@ Object.assign(FIELD_LABEL, {
   ma20_bias: 'MA20乖离率',
 })
 const BOARD_OPTIONS = ['沪主板', '深主板', '创业板', '科创板', '北交所']
-const BASIC_FILTER_FIELDS = [
+const BASIC_FILTER_FIELDS: Array<{
+  key: string
+  label: string
+  unit: string
+  scale?: number
+  step?: number
+}> = [
   { key: 'price_min', label: '最低价', unit: '元' },
   { key: 'price_max', label: '最高价', unit: '元' },
   { key: 'amount_min', label: '最低成交额', unit: '亿', scale: 1e8 },
   { key: 'market_cap_min', label: '最低总市值', unit: '亿', scale: 1e8 },
   { key: 'turnover_min', label: '最低换手率', unit: '%' },
   { key: 'turnover_max', label: '最高换手率', unit: '%' },
+  { key: 'exclude_new_days', label: '排除上市不足', unit: '天', step: 1 },
 ]
 type AdvancedSettingsTab = 'params' | 'filter' | 'entry' | 'exit' | 'scoring' | 'risk' | 'range'
 type StrategyGroup = 'all' | 'custom' | 'ai' | 'builtin' | 'composite'
@@ -2892,8 +2899,11 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                           <NumberField
                             value={raw == null ? null : Number(raw) / scale}
                             min={0}
-                            step={field.unit === '%' ? 0.1 : 0.01}
-                            onChange={n => updateBasicFilter(field.key, n == null ? null : n * scale)}
+                            step={field.step ?? (field.unit === '%' ? 0.1 : 0.01)}
+                            onChange={n => updateBasicFilter(
+                              field.key,
+                              n == null ? null : field.key === 'exclude_new_days' ? Math.round(n) : n * scale,
+                            )}
                             className={INPUT_CLS}
                           />
                         </label>
@@ -3077,17 +3087,15 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               >
                 恢复默认
               </button>
-              {/* 应用到策略: 把当前配置持久化为策略定义(仅用户自有策略可改) */}
-              {(detail.source === 'custom' || detail.source === 'ai' || detail.source === 'composite') && (
-                <button
-                  type="button"
-                  onClick={handleApplyToStrategy}
-                  disabled={applying}
-                  className="ml-auto rounded-btn border border-emerald-500/30 bg-emerald-500/8 px-3 py-1.5 text-xs font-medium text-emerald-500 transition-colors hover:bg-emerald-500/15 disabled:opacity-50"
-                >
-                  {applying ? '应用中…' : '应用到策略'}
-                </button>
-              )}
+              {/* 所有策略都通过 override 持久化，内置策略源码保持不变。 */}
+              <button
+                type="button"
+                onClick={handleApplyToStrategy}
+                disabled={applying}
+                className="ml-auto rounded-btn border border-emerald-500/30 bg-emerald-500/8 px-3 py-1.5 text-xs font-medium text-emerald-500 transition-colors hover:bg-emerald-500/15 disabled:opacity-50"
+              >
+                {applying ? '应用中…' : '应用到策略'}
+              </button>
               <button
                 type="button"
                 onClick={() => setSettingsOpen(false)}
