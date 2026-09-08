@@ -197,6 +197,7 @@ class StrategyDef:
     filter_history_fn: Callable[[pl.DataFrame, dict], pl.DataFrame] | None
     lookback_days: int
     source: str  # "builtin" | "custom" | "ai" | "composite"
+    take_profit: float | None = None
     required_features: frozenset[str] = field(default_factory=frozenset)
     file_path: Path | None = None
     execution_backend: str = "polars_expr"
@@ -571,6 +572,7 @@ class StrategyEngine:
             trailing_take_profit_activate=getattr(mod, "TRAILING_TAKE_PROFIT_ACTIVATE", None),
             trailing_take_profit_drawdown=getattr(mod, "TRAILING_TAKE_PROFIT_DRAWDOWN", None),
             max_hold_days=getattr(mod, "MAX_HOLD_DAYS", None),
+            take_profit=getattr(mod, "TAKE_PROFIT", None),
             filter_fn=filter_fn,
             filter_history_fn=filter_history_fn,
             required_features=frozenset(meta.get("required_features", []) or [])

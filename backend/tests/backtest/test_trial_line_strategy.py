@@ -23,7 +23,7 @@ def _signals(rows: list[dict], params: dict | None = None):
     return strategy.matrix_strategy.compute_signals(market, params or {})
 
 
-def test_trial_line_entry_and_both_exit_rules():
+def test_trial_line_entry_and_volume_exit_rule():
     start = date(2026, 1, 1)
     values = [
         # 普通阳线, 给下一根试盘线提供前一日量。
@@ -42,9 +42,9 @@ def test_trial_line_entry_and_both_exit_rules():
         (10.5, 11.2, 10.4, 10.8, 2700.0),
         # 第二次买入价 11.0。
         (10.7, 11.1, 10.6, 11.0, 300.0),
-        # 收盘达到买入价的 110%, 未达到新的 15% 止盈线。
+        # 固定止盈已交给成交引擎, 这里不再生成矩阵卖点。
         (11.0, 12.2, 10.9, 12.1, 300.0),
-        # 收盘达到买入价的 115%, 触发收益率卖点。
+        # 即使涨幅达到 15%, 矩阵仍只负责放量阴线卖点。
         (12.1, 12.8, 12.0, 12.65, 300.0),
     ]
     rows = [
@@ -63,17 +63,17 @@ def test_trial_line_entry_and_both_exit_rules():
     signals = _signals(rows)
 
     assert signals.entry[:, 0].tolist() == [0, 0, 0, 1, 0, 0, 0, 1, 0, 0]
-    assert signals.exit[:, 0].tolist() == [0, 0, 0, 0, 0, 1, 0, 0, 0, 1]
+    assert signals.exit[:, 0].tolist() == [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
     assert signals.exit_signal_code[5, 0] == 0
-    assert signals.exit_signal_code[9, 0] == 1
+    assert signals.exit_signal_ids == ("signal_trial_volume_bearish",)
 
 
-def test_trial_line_defaults_to_same_day_close_fills():
+def test_trial_line_defaults_to_next_day_open_and_fill_aware_risk():
     strategy = StrategyEngine._load_file(STRATEGY_PATH)
 
-    assert strategy.meta["version"] == "1.2.0"
-    assert strategy.meta["default_entry_fill"] == "close_t"
-    assert strategy.meta["default_exit_fill"] == "close_t"
+    assert strategy.meta["version"] == "1.3.0"
+    assert strategy.meta["default_entry_fill"] == "open_t+1"
+    assert strategy.meta["default_exit_fill"] == "open_t+1"
     assert strategy.basic_filter["boards"] == ["沪主板", "深主板", "创业板"]
     params = {item["id"]: item["default"] for item in strategy.meta["params"]}
     assert params["trial_volume_multiple"] == 3.0
@@ -88,22 +88,24 @@ def test_trial_line_defaults_to_same_day_close_fills():
     assert params["max_post_trial_volume_pct"] == 50.0
     assert params["max_post_trial_high_pct"] == 10.0
     assert params["min_breakout_margin_pct"] == 0.5
-    assert params["take_profit_pct"] == 15.0
-    assert params["close_stop_loss_pct"] == 6.0
-    assert strategy.stop_loss is None
+    assert "take_profit_pct" not in params
+    assert "close_stop_loss_pct" not in params
+    assert strategy.stop_loss == -0.06
+    assert strategy.take_profit == 0.15
+    assert strategy.exit_signals == ["signal_trial_volume_bearish"]
     assert strategy.max_hold_days == 5
 
 
-def test_stop_loss_requires_close_confirmation():
+def test_price_move_does_not_emit_duplicate_matrix_risk_exit():
     start = date(2026, 1, 1)
     values = [
         (10.0, 10.2, 9.9, 10.1, 100.0),
         (10.0, 11.0, 9.9, 10.5, 300.0),
-        # 以 10.6 收盘买入, 6% 止损线为 9.964。
+        # 发出买入信号, 实际成交和固定风控由成交引擎负责。
         (10.3, 10.7, 10.2, 10.6, 100.0),
-        # 盘中跌破止损线但收盘收回, 不卖。
+        # 价格回落不应再生成一套基于信号收盘价的矩阵止损。
         (10.1, 10.2, 9.8, 10.0, 100.0),
-        # 收盘跌破止损线, 才触发止损卖出。
+        # 成交引擎会用真实成交价独立判断固定止损。
         (10.0, 10.1, 9.8, 9.9, 100.0),
     ]
     rows = [
@@ -121,9 +123,8 @@ def test_stop_loss_requires_close_confirmation():
 
     signals = _signals(rows)
 
-    assert signals.exit[:, 0].tolist() == [0, 0, 0, 0, 1]
-    assert signals.exit_signal_code[4, 0] == 2
-    assert signals.exit_signal_ids[2] == "signal_close_stop_loss"
+    assert not signals.exit.any()
+    assert signals.exit_signal_ids == ("signal_trial_volume_bearish",)
 
 
 def test_trial_breakout_must_arrive_within_entry_window():
@@ -164,8 +165,11 @@ def test_internal_benchmark_state_resets_after_max_hold():
         (10.5, 10.7, 10.3, 10.6, 100.0),
         (10.5, 10.7, 10.3, 10.6, 100.0),
         (10.3, 10.5, 10.2, 10.4, 100.0),
+        # 次日开盘成交口径下, 这一日才达到最长持仓; 同日试盘不能重入。
         (10.0, 11.0, 9.9, 10.5, 300.0),
-        (10.3, 10.7, 10.2, 10.6, 100.0),
+        # 状态已重置; 重新形成试盘线(前一日量 300 的 3 倍)。
+        (10.4, 11.4, 10.3, 10.8, 900.0),
+        (10.7, 11.0, 10.6, 10.9, 100.0),
     ]
     rows = [
         {
@@ -182,7 +186,7 @@ def test_internal_benchmark_state_resets_after_max_hold():
 
     signals = _signals(rows)
 
-    assert signals.entry[:, 0].tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 0, 1]
+    assert signals.entry[:, 0].tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]
 
 
 def test_trial_line_is_rejected_after_two_limit_ups_in_five_days():

@@ -32,6 +32,7 @@ def _make_strategy(
         filter_history_fn=None,
         lookback_days=60,
         source="builtin",
+        take_profit=0.15,
     )
 
 
@@ -82,3 +83,10 @@ def test_partial_override_keeps_other_default():
     detail = _strategy_detail(s, overrides={"entry_signals": ["signal_x"]})
     assert detail["entry_signals"] == ["signal_x"]
     assert detail["exit_signals"] == ["signal_ma20_breakdown"]
+
+
+def test_take_profit_override_is_reflected():
+    s = _make_strategy(entry_signals=[], exit_signals=[])
+
+    assert _strategy_detail(s, overrides=None)["take_profit"] == 0.15
+    assert _strategy_detail(s, overrides={"take_profit": 0.2})["take_profit"] == 0.2

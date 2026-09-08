@@ -12,13 +12,13 @@ from app.backtest.matrix import (
 META = {
     "id": "trial_line_breakout",
     "name": "试盘线战法",
-    "description": "三至六倍量上影阳线后缩量并首次有效突破; 过滤弱试盘、弱突破、阶段低位和短期追高信号",
+    "description": "三至六倍量上影阳线后缩量并首次有效突破; 次日开盘成交并按真实成交价执行风控",
     "tags": ["试盘线", "量价", "突破"],
     "asset_types": ["stock"],
     "timeframes": ["1d"],
-    "version": "1.2.0",
-    "default_entry_fill": "close_t",
-    "default_exit_fill": "close_t",
+    "version": "1.3.0",
+    "default_entry_fill": "open_t+1",
+    "default_exit_fill": "open_t+1",
     "basic_filter": {
         "price_min": 3,
         "price_max": 300,
@@ -164,24 +164,6 @@ META = {
             "max": 10.0,
             "step": 0.1,
         },
-        {
-            "id": "take_profit_pct",
-            "label": "收盘止盈(%)",
-            "type": "float",
-            "default": 15.0,
-            "min": 1.0,
-            "max": 100.0,
-            "step": 1.0,
-        },
-        {
-            "id": "close_stop_loss_pct",
-            "label": "收盘止损(%)",
-            "type": "float",
-            "default": 6.0,
-            "min": 1.0,
-            "max": 50.0,
-            "step": 1.0,
-        },
     ],
     "scoring": {},
     "order_by": "score",
@@ -191,13 +173,10 @@ META = {
 
 EXECUTION_BACKEND = "matrix_native"
 ENTRY_SIGNALS = ["signal_trial_close_breakout"]
-EXIT_SIGNALS = [
-    "signal_trial_volume_bearish",
-    "signal_profit_target",
-    "signal_close_stop_loss",
-]
-# 本策略在信号矩阵中按收盘价确认止损, 避免通用成交引擎按盘中最低价提前退出。
-STOP_LOSS = None
+EXIT_SIGNALS = ["signal_trial_volume_bearish"]
+# 固定风控交给成交引擎, 基准为实际成交价; 日 K 模式按盘中触价成交。
+STOP_LOSS = -0.06
+TAKE_PROFIT = 0.15
 MAX_HOLD_DAYS = 5
 ALERTS = []
 
@@ -250,11 +229,6 @@ class TrialLineBreakoutMatrixStrategy:
             max(float(params.get("min_breakout_margin_pct", 0.5)), 0.0) / 100.0
         )
         exit_volume_multiple = max(float(params.get("exit_volume_multiple", 3.0)), 0.0)
-        take_profit_ratio = max(float(params.get("take_profit_pct", 15.0)), 0.0) / 100.0
-        close_stop_loss_ratio = (
-            max(float(params.get("close_stop_loss_pct", 6.0)), 0.0) / 100.0
-        )
-
         previous_volume = valid_shift(
             market.volume,
             1,
@@ -366,7 +340,6 @@ class TrialLineBreakoutMatrixStrategy:
         pullback_volume_sum = np.zeros(asset_count, dtype=np.float64)
         pullback_bar_count = np.zeros(asset_count, dtype=np.int16)
         holding = np.zeros(asset_count, dtype=bool)
-        entry_price = np.full(asset_count, np.nan, dtype=np.float32)
         benchmark_volume = np.full(asset_count, np.nan, dtype=np.float32)
         holding_age = np.zeros(asset_count, dtype=np.int16)
 
@@ -380,31 +353,20 @@ class TrialLineBreakoutMatrixStrategy:
 
             active = holding & valid
             holding_age[active] += 1
-            profit_exit = active & (
-                market.close[time_id] / entry_price - 1.0
-                >= take_profit_ratio - 1e-6
-            )
             volume_exit = (
                 active
                 & (market.close[time_id] < market.open[time_id])
                 & (market.volume[time_id] >= benchmark_volume * exit_volume_multiple)
             )
-            close_stop_exit = active & (
-                market.close[time_id]
-                <= entry_price * (1.0 - close_stop_loss_ratio) + 1e-6
-            )
             max_hold_exit = active & (holding_age >= MAX_HOLD_DAYS)
-            signal_exit = profit_exit | volume_exit | close_stop_exit
+            signal_exit = volume_exit
             should_reset = signal_exit | max_hold_exit
             if np.any(signal_exit):
                 exit_[time_id, signal_exit] = 1
                 exit_code[time_id, volume_exit] = 0
-                exit_code[time_id, profit_exit] = 1
-                exit_code[time_id, close_stop_exit] = 2
             if np.any(should_reset):
                 holding[should_reset] = False
                 holding_age[should_reset] = 0
-                entry_price[should_reset] = np.nan
                 benchmark_volume[should_reset] = np.nan
 
             can_scan = valid & ~holding & ~should_reset
@@ -477,8 +439,8 @@ class TrialLineBreakoutMatrixStrategy:
                 entry_code[time_id, should_enter] = 0
                 score[time_id, should_enter] = trial_score[should_enter]
                 holding[should_enter] = True
-                holding_age[should_enter] = 0
-                entry_price[should_enter] = market.close[time_id, should_enter]
+                # 默认次日开盘成交; -1 让内部最长持仓计数与成交引擎对齐。
+                holding_age[should_enter] = -1
                 benchmark_volume[should_enter] = trial_volume[should_enter]
                 waiting[should_enter] = False
                 pullback_volume_sum[should_enter] = 0.0
@@ -498,11 +460,7 @@ class TrialLineBreakoutMatrixStrategy:
             entry_signal_code=entry_code,
             exit_signal_code=exit_code,
             entry_signal_ids=("signal_trial_close_breakout",),
-            exit_signal_ids=(
-                "signal_trial_volume_bearish",
-                "signal_profit_target",
-                "signal_close_stop_loss",
-            ),
+            exit_signal_ids=("signal_trial_volume_bearish",),
         )
 
 

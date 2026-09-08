@@ -214,7 +214,11 @@ def _strategy_detail(
         "exit_signals": overrides.get("exit_signals", s.exit_signals) if overrides else s.exit_signals,
         "minute_exit_trigger_supported_signals": sorted(MINUTE_EXIT_TRIGGER_SIGNALS),
         "stop_loss": overrides.get("stop_loss", s.stop_loss) if overrides else s.stop_loss,
-        "take_profit": getattr(s, "take_profit", None),
+        "take_profit": (
+            overrides.get("take_profit", s.take_profit)
+            if overrides
+            else s.take_profit
+        ),
         "trailing_stop": getattr(s, "trailing_stop", None),
         "trailing_take_profit_activate": getattr(s, "trailing_take_profit_activate", None),
         "trailing_take_profit_drawdown": getattr(s, "trailing_take_profit_drawdown", None),
