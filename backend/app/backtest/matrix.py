@@ -26,6 +26,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pads
 
+from app.backtest.chip_peak import (
+    compute_chip_peak_entries as compute_chip_peak_entries,
+)
+from app.backtest.chip_peak import (
+    compute_market_breadth_mask as compute_market_breadth_mask,
+)
 from app.backtest.minute_trigger import build_minute_exit_reference
 from app.backtest.numba_runtime import run_numba_parallel
 from app.price_limits import (
@@ -912,7 +918,11 @@ def _resolve_matrix_storage_fields(
         and name in instrument_columns
         and name not in parquet_fields
     }
-    if "listing_date" in wanted_fields and "listing_date" in instrument_columns:
+    # Keep the optional listing-date slot writable even when the instrument
+    # snapshot does not provide the column.  The cache builder masks staging
+    # fields in place before publishing the mmap; a broadcast all-NaN fallback
+    # would be read-only and make otherwise valid backtests fail to prepare.
+    if "listing_date" in wanted_fields:
         vector_fields.add("listing_date")
     if "raw_close" in wanted_fields:
         matrix_fields.add("raw_close")
