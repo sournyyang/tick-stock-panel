@@ -65,7 +65,7 @@ def _get_custom_signal_exprs() -> dict[str, pl.Expr]:
         try:
             sigs = custom_signals.load_all(settings.data_dir)
             _custom_signal_exprs = custom_signals.build_expressions(sigs)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("custom signals load failed: %s", e)
             _custom_signal_exprs = {}
     return _custom_signal_exprs
@@ -88,7 +88,7 @@ def _get_custom_signal_exprs_today() -> dict[str, pl.Expr]:
             _custom_signal_exprs_today = custom_signals.build_expressions_prev(
                 sigs, prev_fields
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("custom signals load failed (today): %s", e)
             _custom_signal_exprs_today = {}
             _custom_prev_fields_cache = set()
@@ -852,7 +852,7 @@ def compute_limit_signals(
 
     # 生效涨跌停价: 维表日期与行情日期一致时使用权威值, 否则使用理论价。
     # 旧版维表没有 as_of, 保持仅在最新行情日使用权威值的兼容行为。
-    _SENTINEL = 10000.0
+    _sentinel = 10000.0
     if "_instrument_as_of" in df.columns:
         authoritative_date = (
             pl.col("_instrument_as_of") == pl.col("date").cast(pl.Date, strict=False)
@@ -867,7 +867,7 @@ def compute_limit_signals(
             authoritative_date
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") > 0)
-            & (pl.col("limit_up") < _SENTINEL)
+            & (pl.col("limit_up") < _sentinel)
         ).then(pl.col("limit_up")).otherwise(pl.col("_theoretical_limit_up"))
     else:
         effective_limit_up = pl.col("_theoretical_limit_up")
@@ -876,7 +876,7 @@ def compute_limit_signals(
             authoritative_date
             & pl.col("limit_down").is_not_null()
             & (pl.col("limit_down") > 0)
-            & (pl.col("limit_down") < _SENTINEL)
+            & (pl.col("limit_down") < _sentinel)
         ).then(pl.col("limit_down")).otherwise(pl.col("_theoretical_limit_down"))
     else:
         effective_limit_down = pl.col("_theoretical_limit_down")
@@ -887,7 +887,7 @@ def compute_limit_signals(
         no_price_limit = (
             authoritative_date
             & pl.col("limit_up").is_not_null()
-            & (pl.col("limit_up") >= _SENTINEL)
+            & (pl.col("limit_up") >= _sentinel)
         )
     # listing_date 窗口兜底: 哨兵只在「维表 as_of == 行情日」那一天生效, 窗口内其余
     # 交易日 (以及 as_of 漂移后的历史重算) 由 listing_date 判定补齐。精确性用
@@ -1414,7 +1414,8 @@ def _total_ram_bytes() -> int | None:
     try:
         from app.services.memory_budget import memory_budget
         return memory_budget().total_bytes
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_total_ram_bytes: fallback (%s)", type(fallback_error).__name__)
         return None
 
 
@@ -1827,10 +1828,10 @@ def _run_pipeline_impl(data_dir: Path | None = None,
     # 小内存机器自动收缩, 大内存机器保持用户设置
     total_rows = lf_all.select(pl.len()).collect(streaming=True).item()
     rows_per_sym = max(1, -(-int(total_rows) // total_syms))
-    SYM_BATCH = _adaptive_sym_batch(prefs_mod.get_enriched_batch_size(), rows_per_sym)
-    total_batches = (total_syms + SYM_BATCH - 1) // SYM_BATCH
+    sym_batch = _adaptive_sym_batch(prefs_mod.get_enriched_batch_size(), rows_per_sym)
+    total_batches = (total_syms + sym_batch - 1) // sym_batch
     logger.info("全量计算: %d 只标的 (%d 行, ~%d 行/只), symbol 分批 %d 只/批, %d 批 [%s]",
-                total_syms, total_rows, rows_per_sym, SYM_BATCH, total_batches, mode)
+                total_syms, total_rows, rows_per_sym, sym_batch, total_batches, mode)
 
     # 全量模式: 流式暂存发布 (#208) —— 每批落盘暂存文件, 不再内存累积;
     # 暂存目录在 enriched 树外, 不会被任何 **/*.parquet 业务 glob 扫到
@@ -1842,8 +1843,8 @@ def _run_pipeline_impl(data_dir: Path | None = None,
         staging_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        for batch_start in range(0, total_syms, SYM_BATCH):
-            batch_end = min(batch_start + SYM_BATCH, total_syms)
+        for batch_start in range(0, total_syms, sym_batch):
+            batch_end = min(batch_start + sym_batch, total_syms)
             batch_syms = all_symbols[batch_start:batch_end]
 
             # 只读取本批 symbol 的数据
@@ -1895,7 +1896,7 @@ def _run_pipeline_impl(data_dir: Path | None = None,
                 else:
                     # 全量模式: 写单批暂存文件 (按 date,symbol 排序 →
                     # 合并期 parquet 行组统计可按日期裁剪), 随即释放本批内存
-                    out = staging_dir / f"batch-{batch_start // SYM_BATCH:04d}.parquet"
+                    out = staging_dir / f"batch-{batch_start // sym_batch:04d}.parquet"
                     _select_storage_cols(enriched).sort(["date", "symbol"]).write_parquet(out)
                     staging_files.append(str(out))
                     written += enriched.height
@@ -1904,13 +1905,13 @@ def _run_pipeline_impl(data_dir: Path | None = None,
             gc.collect()
 
             logger.info("symbol 批次 %d/%d (%s ~ %s), 已处理 %d 行",
-                         batch_start // SYM_BATCH + 1,
+                         batch_start // sym_batch + 1,
                          total_batches,
                          batch_syms[0], batch_syms[-1], written)
 
             # 通知进度
             if on_batch_done:
-                on_batch_done(batch_start // SYM_BATCH + 1, total_batches)
+                on_batch_done(batch_start // sym_batch + 1, total_batches)
 
             # 续期发布心跳: 计算阶段可能长时间不写分区, 不续期会被别的进程
             # 判为心跳超时并接管, 导致两个写入方同时改 enriched。
@@ -2225,10 +2226,8 @@ def compute_enriched_today(
     # _vol_ma5_prev_sum 是前5个交易日成交量之和(tail(5)), 不含当天
     # 盘中 volume 是部分量, 按 elapsed_minutes 折算到全天量级
     vol_ma5_prev = pl.col("_vol_ma5_prev_sum") / 5  # 前5日均量(不含当天)
-    if elapsed_minutes and elapsed_minutes > 0:
-        time_factor = 240.0 / elapsed_minutes  # 盘中折算: 部分量 → 全天量级
-    else:
-        time_factor = 1.0  # 盘后/无效时间: 不折算(此时 volume 已是全天量)
+    # 盘中折算: 部分量 → 全天量级。
+    time_factor = 240.0 / elapsed_minutes if elapsed_minutes and elapsed_minutes > 0 else 1.0  # 盘后/无效时间: 不折算(此时 volume 已是全天量)
     df = df.with_columns([
         vol_ma5.alias("vol_ma5"),
         vol_ma10.alias("vol_ma10"),
@@ -2391,14 +2390,13 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     df = df.join(inst_subset, on="symbol", how="left", suffix="_inst")
 
     # 换手率: API 有则直接用, 无则从 float_shares 计算
-    if "turnover_rate" not in df.columns:
-        if "float_shares" in df.columns and "volume" in df.columns:
-            df = df.with_columns(
-                pl.when(pl.col("float_shares") > 0)
-                  .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
-                  .otherwise(None)
-                  .alias("turnover_rate")
-            )
+    if ('turnover_rate' not in df.columns) and ('float_shares' in df.columns and 'volume' in df.columns):
+        df = df.with_columns(
+            pl.when(pl.col("float_shares") > 0)
+              .then(pl.col("volume") * 10000.0 / pl.col("float_shares"))
+              .otherwise(None)
+              .alias("turnover_rate")
+        )
 
     # 涨跌停 (用 raw_close / raw_high 和前一日原始收盘价)
     # 优先用 API 原始前收盘价, 回退到 close_right, 最后回退到 raw_close
@@ -2425,7 +2423,7 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
     # 生效涨跌停价: 维表日期与行情日期一致时优先使用交易所权威值;
     # 维表过期或价格缺失时回退自算理论价。旧版无 as_of 维表保持兼容。
     # 哨兵阈值 10000 用于识别 "新股无涨跌停限制" 的占位值 (实际涨停价不可能上万)。
-    _SENTINEL = 10000.0
+    _sentinel = 10000.0
     authoritative_date = (
         pl.col("_instrument_as_of") == trade_date.cast(pl.Date, strict=False)
         if "_instrument_as_of" in df.columns
@@ -2439,12 +2437,12 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
             authoritative_date
             & pl.col("limit_up").is_not_null()
             & (pl.col("limit_up") > 0)
-            & (pl.col("limit_up") < _SENTINEL)
+            & (pl.col("limit_up") < _sentinel)
         )
         no_price_limit = (
             authoritative_date
             & pl.col("limit_up").is_not_null()
-            & (pl.col("limit_up") >= _SENTINEL)
+            & (pl.col("limit_up") >= _sentinel)
         )
         effective_limit_up = pl.when(
             has_authoritative_up
@@ -2456,7 +2454,7 @@ def _compute_limit_signals_today(df: pl.DataFrame, instruments: pl.DataFrame) ->
             authoritative_date
             & pl.col("limit_down").is_not_null()
             & (pl.col("limit_down") > 0)
-            & (pl.col("limit_down") < _SENTINEL)
+            & (pl.col("limit_down") < _sentinel)
         )
         effective_limit_down = pl.when(
             has_authoritative_down

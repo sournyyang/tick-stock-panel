@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import date as _date
 from pathlib import Path
 
 import polars as pl
@@ -64,7 +65,7 @@ def _prune_partial_enriched_partitions(daily_dir: Path, enriched_dir: Path) -> l
             actual: set[str] = set()
             for path in part.glob("*.parquet"):
                 actual.update(pl.read_parquet(path, columns=["symbol"])["symbol"].drop_nulls().to_list())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("enriched 覆盖检查跳过 %s, 保留分区: %s", part.name, e)
             continue
         if expected - actual:
@@ -103,7 +104,8 @@ def _prune_stale_price_partitions(
             enr = pl.read_parquet(
                 enriched_dir / f"date={ds}" / "*.parquet", columns=["symbol", "raw_close"]
             )
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_prune_stale_price_partitions: fallback (%s)", type(fallback_error).__name__)
             continue  # 列缺失/不可读 → 交给既有完整性检查兜底
         joined = enr.join(daily, on="symbol", how="inner").drop_nulls()
         if joined.is_empty():
@@ -128,7 +130,7 @@ class PipelineStageError(RuntimeError):
         super().__init__("盘后管道部分阶段失败: " + "; ".join(errors))
 
 
-def _noop(stage: str, pct: int, msg: str, **kwargs) -> None:  # noqa: ARG001
+def _noop(stage: str, pct: int, msg: str, **kwargs) -> None:
     pass
 
 
@@ -406,7 +408,6 @@ def run_now(
     #     首次会覆盖整个日K区间内的历史除权事件; 补缺口天然只增量(起点=latest_daily≈昨天)
     #   日K实时增量/跳过(分支2/分支1) → 除权兜底拉最近 30 天, 补可能遗漏的新除权
     #     (这两类分支不拉历史日K, 除权不能用日K范围, 只能兜底最近几日)
-    written_adj = 0
     affected_symbols: list[str] = []
     adj_provider = _prefs.get_adj_factor_provider()
     can_sync_adj = capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow"
@@ -427,7 +428,7 @@ def run_now(
         def _adj_chunk_progress(cur: int, tot: int) -> None:
             emit("sync_adj", 50 + int(10 * cur / tot),
                  f"除权因子批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
-        written_adj, affected_symbols = kline_sync.sync_adj_factor(
+        _written_adj, affected_symbols = kline_sync.sync_adj_factor(
             universe, repo, capset,
             start_time=adj_start, end_time=adj_end,
             on_chunk_done=_adj_chunk_progress,
@@ -712,7 +713,7 @@ def run_now(
             if regime_days:
                 try:
                     _push_phase_change_alert(repo.store.data_dir)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                     logger.warning("phase change alert failed (soft): %s", e)
         except Exception as e:  # noqa: BLE001
             logger.warning("compute_regime failed (soft): %s", e)
@@ -736,7 +737,7 @@ def run_now(
             if mainline_rows:
                 logger.info("compute_mainline: %d rows", mainline_rows)
             emit("compute_mainline", 94, f"市场主线 {mainline_rows} 行")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("compute_mainline failed (soft): %s", e)
             stage_errors.append(f"compute_mainline: {e}")
             skipped.append("mainline")
@@ -773,10 +774,10 @@ def run_now(
                         repo.store.data_dir, today.isoformat(), account_id=acc_id))
                 if settle_events:
                     alert_store.append_many(repo.store.data_dir, settle_events)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                 logger.warning("模拟盘结算成交留痕失败: %s", e)
         emit("paper_settle", 94, "模拟盘结算完成")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper_settle failed (soft): %s", e)
         stage_errors.append(f"paper_settle: {e}")
 
@@ -1153,7 +1154,7 @@ async def _run_scheduled_review(repo) -> None:
         # 失败静默降级, 不影响已归档的报告。
         if _prefs.get_review_push_mode() == "auto":
             _maybe_push_review(content, meta)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("scheduled review failed: %s", e)
         # 兜底: 异常时通知前端停止「生成中」状态, 避免页面卡在 streaming
         try:

@@ -62,7 +62,7 @@ def _resolve_asset_type(request: Request, symbol: str) -> str:
     repo = getattr(request.app.state, "repo", None)
     try:
         return repo.resolve_asset_type(symbol) if repo is not None else "stock"
-    except Exception:
+    except Exception:  # noqa: BLE001 -- logged fallback keeps independent work running
         logging.getLogger(__name__).warning(
             "resolve_asset_type failed for %s, falling back to stock", symbol, exc_info=True
         )
@@ -83,7 +83,8 @@ def _last_close(data_dir: Path, symbol: str, asset_type: str) -> float | None:
             .select(pl.col("close").last())
             .collect()
         )
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_last_close: fallback (%s)", type(fallback_error).__name__)
         return None
     if df.is_empty() or df["close"][0] is None:
         return None
@@ -158,7 +159,7 @@ def overview(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
                 live = paper.overview(data_dir, snapshot, account_id=acc_id)
                 live["fees"] = ov["fees"]
                 return live
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("paper overview 实时估算失败, 降级日线口径: %s", e)
     return ov
 

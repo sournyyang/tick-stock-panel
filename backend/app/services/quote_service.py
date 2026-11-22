@@ -33,6 +33,7 @@ from contextlib import contextmanager, suppress
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
+from typing import ClassVar
 
 import polars as pl
 
@@ -282,7 +283,7 @@ class QuoteService:
     """全局实时行情服务 — 单例。"""
 
     # 档位 → 最小轮询间隔 (秒) — TickFlow 档位限速保护, 仅实时源为 tickflow 时适用
-    TIER_MIN_INTERVAL = {
+    TIER_MIN_INTERVAL: ClassVar[dict[str, float]] = {
         "expert": 1.0,
         "pro": 3.0,
         "starter": 6.0,
@@ -1095,7 +1096,6 @@ class QuoteService:
         只更新展示缓存, 不写 daily/enriched、不评估监控 —— 防止收盘后数据源仍
         返回竞价前旧价时把陈旧收盘价固化到当日分区。
         """
-        from app.services import preferences
         all_index_symbols = set(self._repo.get_index_symbol_set()) if self._repo else set()
         core_index_symbols = set(CORE_INDEX_SYMBOLS)
         all_index_symbols.update(core_index_symbols)
@@ -1661,7 +1661,7 @@ class QuoteService:
                             logger.warning("模拟盘成交留痕失败: %s", e)
                         self._maybe_send_system_notifications(paper_events)
                         self._maybe_send_paper_webhook(paper_events)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                     logger.warning("模拟盘钩子失败 (不影响监控): %s", e)
 
         except Exception as e:  # noqa: BLE001
@@ -1694,7 +1694,7 @@ class QuoteService:
                     if not isinstance(message, str):
                         raise TypeError("notification formatter must return str")
                     formatted["message"] = message
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 -- logged fallback keeps independent work running
                     logger.warning(
                         "notification formatter failed %s: %s",
                         registered.implementation_id,
@@ -1770,7 +1770,7 @@ class QuoteService:
             if svc is not None and svc.is_healthy() and self._repo is not None:
                 try:
                     minute_df = self._repo.get_minute_batch(sorted(symbols), cn_today())
-                except Exception as e:  # 本地读异常回落 API
+                except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running; 本地读异常回落 API
                     logger.warning("分时信号本地读失败, 回退 API 路径: %s", e)
                     minute_df = pl.DataFrame()
         if minute_df.is_empty():
@@ -1807,7 +1807,7 @@ class QuoteService:
             from app.strategy import custom_signals
 
             return custom_signals.load_intraday_all(self._repo.store.data_dir)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("load intraday signal defs failed: %s", e)
             return []
 
@@ -2075,10 +2075,7 @@ class QuoteService:
                 message = ev.get("message") or ""
 
                 # 正文: 优先用现成 message, 拼上 symbol/name 让用户一眼定位
-                if symbol:
-                    body = f"{symbol} {name} {message}".strip()
-                else:
-                    body = message or name
+                body = f"{symbol} {name} {message}".strip() if symbol else message or name
                 # 补上触发时的现价/涨跌幅 (日期提醒无行情, 自然为空)
                 body = _body_with_quote(body, ev)
 
@@ -2263,7 +2260,8 @@ class QuoteService:
                 from app.indicators.pipeline import attach_deviation_columns_today
                 try:
                     index_quotes = self.get_index_quotes()
-                except Exception:
+                except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                    logging.getLogger(__name__).debug("_flush_live_enriched: fallback (%s)", type(fallback_error).__name__)
                     index_quotes = None
                 enriched_today = attach_deviation_columns_today(
                     enriched_today, self._repo.store.data_dir, index_quotes

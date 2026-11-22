@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import httpx
 
@@ -225,7 +226,7 @@ class FuyaoClient:
     # ---- 财务 ----
     # 端点均单标的(thscode 不接受逗号)。取数模式二选一: limit=最近N期 或 start/end 区间,
     # 这里只用 limit。period=quarterly 覆盖每个季度末(含年报期), 与项目"各报告期累积"口径一致。
-    _STATEMENT_ENDPOINTS = {
+    _STATEMENT_ENDPOINTS: ClassVar[dict[str, str]] = {
         "income": "income-statements",
         "balance_sheet": "balance-sheets",
         "cash_flow": "cash-flow-statements",

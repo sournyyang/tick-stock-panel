@@ -55,8 +55,8 @@ def run_worker() -> int:
             return
         try:
             progress.write_text(json.dumps({"stage": name, **extra}), encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as cleanup_error:  # noqa: BLE001 -- best-effort cleanup or delivery; failure is diagnosed
+            logging.getLogger(__name__).debug("stage: cleanup skipped (%s)", type(cleanup_error).__name__)
 
     def report(payload: dict) -> None:
         if key and payload.get("reason"):

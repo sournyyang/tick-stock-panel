@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -20,7 +21,8 @@ def load_share_history(data_dir: Path) -> pl.DataFrame:
         if not {"symbol", "period_end", "float_shares"} <= set(shares.columns):
             return pl.DataFrame()
         return shares
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("load_share_history: fallback (%s)", type(fallback_error).__name__)
         return pl.DataFrame()
 
 

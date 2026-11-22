@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import date
@@ -330,7 +331,8 @@ def regime_mainline(
         from app.services import preferences
 
         filter_cfg = preferences.get_mainline_filter_config()
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("regime_mainline: fallback (%s)", type(fallback_error).__name__)
         filter_cfg = {"min_members": 4, "max_members": 600, "blacklist": []}
     df = load_mainline_history(_data_dir(request), kind)
     if df.is_empty():

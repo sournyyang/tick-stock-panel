@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date
 from typing import Protocol
 
+from app.backtest.guards import PRIMARY_OBJECTIVES as VALID_OBJECTIVES
+
 logger = logging.getLogger(__name__)
 
 # 组合数硬上限 — 防止参数网格爆炸 (每组一次回测, 过大直接拒绝)。
@@ -28,7 +30,6 @@ _MINIMIZE_OBJECTIVES = {"avg_holding_days"}
 # 可选优化目标 (须为 stats 中存在且数值可比的字段)。
 # 主目标白名单 (P4 收敛): 与 guards.PRIMARY_OBJECTIVES 同源。退化目标 (胜率/
 # 持仓天数/交易数) 交易少时可被运气推到极端, 不得作排名主目标 —— 见 docs/robust-optimizer-plan.md。
-from app.backtest.guards import PRIMARY_OBJECTIVES as VALID_OBJECTIVES  # noqa: F401
 
 
 def _candidates_for(param_id: str, spec, pmeta: dict) -> list:
@@ -272,7 +273,7 @@ class StrategyOptimizer:
                 run_kwargs["prepared_panel"] = prepared_panel
             try:
                 res = self.service.run(bt_cfg, **run_kwargs)
-            except Exception as e:  # 隔离单组失败, 记录后继续, 不拖垮整批
+            except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running; 隔离单组失败, 记录后继续, 不拖垮整批
                 logger.warning("参数组 %s 回测异常: %r", combo, e)
                 return {"params": combo, "error": repr(e), "objective_raw": None, "_sort": float("-inf")}
             if res.error:

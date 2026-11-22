@@ -335,7 +335,7 @@ class AIStrategyGenerator:
         # 试加载获取 META
         try:
             meta = self._extract_meta(code)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- failure is returned to caller or parent worker
             return {
                 "code": code,
                 "meta": {},

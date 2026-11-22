@@ -11,9 +11,11 @@
 仅源码/桌面部署可发起导入 (需要 frontend/node_modules 里的 esbuild);
 产物是标准页面插件, 全部署形态可用。
 """
+
 from __future__ import annotations
 
 import json
+import platform
 import re
 import shutil
 import subprocess
@@ -24,9 +26,22 @@ from app.config import settings
 
 # 与 frontend/src/extensions/runtime.tsx ICON_ALLOWLIST 的键逐字一致 (大小写敏感)
 _ICON_ALLOWLIST = [
-    "Activity", "BarChart3", "Bell", "BookOpen", "Brain", "Calendar",
-    "Database", "Globe", "LineChart", "PieChart", "Shield", "Sparkles",
-    "Star", "Table", "TrendingUp", "Zap",
+    "Activity",
+    "BarChart3",
+    "Bell",
+    "BookOpen",
+    "Brain",
+    "Calendar",
+    "Database",
+    "Globe",
+    "LineChart",
+    "PieChart",
+    "Shield",
+    "Sparkles",
+    "Star",
+    "Table",
+    "TrendingUp",
+    "Zap",
 ]
 
 _NS_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
@@ -92,23 +107,49 @@ def custom_root() -> Path:
 
 
 def find_esbuild() -> Path | None:
-    """按常见包管理器布局发现 esbuild 二进制; 找不到再退回 PATH。
-
-    pnpm 布局下 esbuild 是 vite 的传递依赖, 不出现在 .bin —— 必须扫
-    .pnpm/@esbuild+<ver>/node_modules/@esbuild/<platform>/bin/esbuild。
-    """
+    """Only probe native packages; a pnpm store can contain foreign binaries."""
     root = frontend_root()
     candidates: list[Path] = [root / "node_modules" / ".bin" / "esbuild"]
-    candidates.extend(sorted((root / "node_modules" / ".pnpm").glob(
-        "@esbuild+*/node_modules/@esbuild/*/bin/esbuild")))
-    candidates.extend(sorted((root / "node_modules" / "@esbuild").glob(
-        "*/bin/esbuild")))
+    system = {
+        "Darwin": "darwin",
+        "Linux": "linux",
+        "Windows": "win32",
+        "FreeBSD": "freebsd",
+        "OpenBSD": "openbsd",
+        "NetBSD": "netbsd",
+    }.get(platform.system())
+    machine = platform.machine().lower()
+    arch = {
+        "amd64": "x64",
+        "x86_64": "x64",
+        "aarch64": "arm64",
+        "i386": "ia32",
+        "i686": "ia32",
+        "armv7l": "arm",
+    }.get(machine, machine)
+    if system:
+        package = f"{system}-{arch}"
+        executable = "esbuild.exe" if system == "win32" else "bin/esbuild"
+        candidates.extend(
+            sorted(
+                (root / "node_modules/.pnpm").glob(
+                    f"@esbuild+{package}@*/node_modules/@esbuild/{package}/{executable}"
+                )
+            )
+        )
+        candidates.append(root / "node_modules/@esbuild" / package / executable)
+    if executable_path := shutil.which("esbuild"):
+        candidates.append(Path(executable_path))
     for c in candidates:
-        if c.is_file():
+        if not c.is_file():
+            continue
+        try:
+            probe = subprocess.run([str(c), "--version"], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
             return c
-    from shutil import which
-    exe = which("esbuild")
-    return Path(exe) if exe else None
+    return None
 
 
 def namespace_source_path(namespace: str) -> Path:
@@ -128,10 +169,7 @@ def list_namespaces() -> list[str]:
     root = custom_root()
     if not root.is_dir():
         return []
-    return sorted(
-        d.name for d in root.iterdir()
-        if d.is_dir() and (d / "extension.tsx").is_file()
-    )
+    return sorted(d.name for d in root.iterdir() if d.is_dir() and (d / "extension.tsx").is_file())
 
 
 def compile_source(source_path: Path, pack_id_hint: str) -> tuple[bytes, str]:
@@ -148,7 +186,8 @@ def compile_source(source_path: Path, pack_id_hint: str) -> tuple[bytes, str]:
     esbuild = find_esbuild()
     if esbuild is None:
         raise SourceImportUnavailableError(
-            "当前部署没有 esbuild 工具链, 源码导入仅源码/桌面部署可用")
+            "当前部署没有 esbuild 工具链, 源码导入仅源码/桌面部署可用"
+        )
 
     root = frontend_root()
     try:
@@ -168,35 +207,44 @@ def compile_source(source_path: Path, pack_id_hint: str) -> tuple[bytes, str]:
             entry_source = source
         shim = tmp / "shim.tsx"
         shim.write_text(
-            _SHIM_TEMPLATE
-            .replace("__ENTRY__", json.dumps(str(entry_source)))
-            .replace("__ICONS__", json.dumps(_ICON_ALLOWLIST)),
+            _SHIM_TEMPLATE.replace("__ENTRY__", json.dumps(str(entry_source))).replace(
+                "__ICONS__", json.dumps(_ICON_ALLOWLIST)
+            ),
             encoding="utf-8",
         )
         out = tmp / "bundle.js"
         # 参数全部内部构造, esbuild 二进制来自本仓库 frontend/node_modules
-        proc = subprocess.run(
-            [
-                str(esbuild), str(shim),
-                "--bundle", "--format=esm", "--minify",
-                "--jsx=automatic",
-                f"--outfile={out}",
-                f"--alias:@={root / 'src'}",
-                "--define:process.env.NODE_ENV=\"production\"",
-                "--loader:.css=empty",
-                "--log-level=error",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_COMPILE_TIMEOUT_S,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    str(esbuild),
+                    str(shim),
+                    "--bundle",
+                    "--format=esm",
+                    "--minify",
+                    "--jsx=automatic",
+                    f"--outfile={out}",
+                    f"--alias:@={root / 'src'}",
+                    '--define:process.env.NODE_ENV="production"',
+                    "--loader:.css=empty",
+                    "--log-level=error",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_COMPILE_TIMEOUT_S,
+            )
+        except OSError as exc:
+            raise SourceImportUnavailableError("esbuild 无法执行，请检查当前平台工具链") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SourceCompileError("esbuild 编译超时，请检查扩展体积") from exc
         if proc.returncode != 0 or not out.is_file():
             tail = (proc.stderr or proc.stdout or "").strip()[-800:]
             raise SourceCompileError(f"esbuild 编译失败: {tail or '无输出'}")
         data = out.read_bytes()
         if len(data) > _MAX_BUNDLE_BYTES:
             raise SourceCompileError(
-                f"编译产物 {len(data) // 1024}KB 超过 {_MAX_BUNDLE_BYTES // (1024 * 1024)}MB 上限")
+                f"编译产物 {len(data) // 1024}KB 超过 {_MAX_BUNDLE_BYTES // (1024 * 1024)}MB 上限"
+            )
         return data, f"{source_path.name} ({len(data) // 1024}KB)"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

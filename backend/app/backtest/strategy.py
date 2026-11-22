@@ -547,7 +547,7 @@ def _filter_dependencies(strategy: StrategyDef, params: dict) -> tuple[set[str],
         if expr is None:
             return set(), True
         return set(expr.meta.root_names()), True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("strategy filter dependency resolution failed: %s", exc)
         return set(strategy.required_features), bool(strategy.required_features)
 
@@ -2131,7 +2131,7 @@ class StrategyBacktestService:
                 factor_attribution = _factor_attribution_summary(
                     factor_snapshot["frame"], result.trades
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- logged fallback keeps independent work running
                 logger.warning("factor attribution failed: %s", exc)
 
         elapsed = (time.perf_counter() - t0) * 1000
@@ -2724,7 +2724,7 @@ class StrategyBacktestService:
                     )
                 )
                 return marked["_hit"].fill_null(False).cast(pl.Boolean)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                 history_failed = True
                 logger.warning("strategy filter_history_fn failed: %s", e)
                 # 失败则回退到 filter_fn (若存在)
@@ -2737,7 +2737,7 @@ class StrategyBacktestService:
                     result = panel.select(expr.alias("_candidate_filter"))
                     if not result.is_empty():
                         return result["_candidate_filter"].fill_null(False).cast(pl.Boolean)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                 logger.warning("strategy filter_fn failed: %s", e)
                 return false_mask
 
@@ -2886,7 +2886,7 @@ class StrategyBacktestService:
     def _build_benchmark_curve(self, start: date, end: date) -> list[dict]:
         try:
             df = self.engine.repo.get_index_daily(BENCHMARK_SYMBOL, start, end, columns=["date", "close"])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("load benchmark %s failed: %s", BENCHMARK_SYMBOL, e)
             return []
 
@@ -3018,8 +3018,8 @@ class StrategyBacktestService:
         return {
             "symbol": t.symbol,
             "name": t.name,
-            "entry_date": str(t.entry_date) if isinstance(t.entry_date, date) else str(t.entry_date),
-            "exit_date": str(t.exit_date) if isinstance(t.exit_date, date) else str(t.exit_date),
+            "entry_date": str(t.entry_date),
+            "exit_date": str(t.exit_date),
             "entry_price": t.entry_price,
             "exit_price": t.exit_price,
             "pnl_pct": t.pnl_pct,

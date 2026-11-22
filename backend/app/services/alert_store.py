@@ -103,7 +103,8 @@ def list_recent(
                     continue
                 try:
                     ev = json.loads(line)
-                except Exception:
+                except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                    logging.getLogger(__name__).debug("list_recent: fallback (%s)", type(fallback_error).__name__)
                     continue
                 if ev.get("ts", 0) < cutoff:
                     continue
@@ -112,7 +113,7 @@ def list_recent(
                 if type and ev.get("type") != type:
                     continue
                 out.append(ev)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("alert_store read failed: %s", e)
         return []
     # 时间倒序 + 截断
@@ -130,7 +131,8 @@ def clear(data_dir: Path) -> int:
         try:
             with p.open("r", encoding="utf-8") as f:
                 count = sum(1 for line in f if line.strip())
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("clear: fallback (%s)", type(fallback_error).__name__)
             pass
         p.write_text("", encoding="utf-8")
         return count
@@ -156,13 +158,14 @@ def delete_one(data_dir: Path, ts: int) -> bool:
                         continue
                     try:
                         ev = json.loads(line)
-                    except Exception:
+                    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                        logging.getLogger(__name__).debug("delete_one: fallback (%s)", type(fallback_error).__name__)
                         continue
                     if not deleted and ev.get("ts") == ts:
                         deleted = True
                         continue
                     kept.append(ev)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("alert_store delete_one read failed: %s", e)
             return False
         if not deleted:
@@ -171,7 +174,7 @@ def delete_one(data_dir: Path, ts: int) -> bool:
             with p.open("w", encoding="utf-8") as f:
                 for ev in kept:
                     f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("alert_store delete_one write failed: %s", e)
             return False
         return True
@@ -185,7 +188,8 @@ def count(data_dir: Path) -> int:
     try:
         with _lock, p.open("r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("count: fallback (%s)", type(fallback_error).__name__)
         return 0
 
 
@@ -202,13 +206,14 @@ def _prune_locked(p: Path) -> None:
                     continue
                 try:
                     ev = json.loads(line)
-                except Exception:
+                except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                    logging.getLogger(__name__).debug("_prune_locked: fallback (%s)", type(fallback_error).__name__)
                     continue
                 if ev.get("ts", 0) >= cutoff:
                     kept.append(ev)
     except FileNotFoundError:
         return
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("alert_store prune read failed: %s", e)
         return
     # 上限截断 (保留最新的)
@@ -220,5 +225,5 @@ def _prune_locked(p: Path) -> None:
         with p.open("w", encoding="utf-8") as f:
             for ev in kept:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("alert_store prune write failed: %s", e)

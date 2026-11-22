@@ -12,13 +12,15 @@ run_backtest 复用现有 StrategyBacktestConfig + worker, 只读、受控窗口
 from __future__ import annotations
 
 import asyncio
+
+# 工具名常量 (与 build_tool_schemas 里 function.name 一一对应)
+import logging
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.market_time import cn_today
 
-# 工具名常量 (与 build_tool_schemas 里 function.name 一一对应)
 LIST_FACTORS = "list_factors"
 LIST_STRATEGIES = "list_strategies"
 LIST_DATA_CAPABILITIES = "list_data_capabilities"
@@ -302,7 +304,8 @@ async def execute_tool(
                     available = ", ".join(
                         str(s.get("id")) for s in engine.list_strategies()[:12] if s.get("id")
                     )
-                except Exception:  # 列举失败不影响错误本身
+                except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only; 列举失败不影响错误本身
+                    logging.getLogger(__name__).debug("execute_tool: fallback (%s)", type(fallback_error).__name__)
                     available = ""
                 hint = f"; 可用策略: {available}" if available else "; 可先用 list_strategies 查询"
                 return {"ok": False, "error": f"策略 {strategy_id} 不存在{hint}"}

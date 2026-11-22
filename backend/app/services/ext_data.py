@@ -59,7 +59,7 @@ async def run_ext_data_io(func, *args, **kwargs):
 
 class ExtField:
     """扩展字段定义。"""
-    __slots__ = ("name", "dtype", "label")
+    __slots__ = ("dtype", "label", "name")
 
     def __init__(self, name: str, dtype: str = "string", label: str = "") -> None:
         self.name = name
@@ -176,14 +176,39 @@ def collapse_ext_rows_at(
 class PullConfig:
     """定时拉取配置。"""
     __slots__ = (
-        "url", "method", "headers", "body", "response_path",
-        "field_map", "schedule_minutes", "schedule_seconds", "enabled",
-        "last_run", "last_status", "last_message", "last_rows",
-        "next_run", "time_window_start", "time_window_end", "date_param",
-        "date_format", "time_field", "auth", "timeout_seconds",
-        "page_param", "page_size_param", "page_size", "page_start", "max_pages",
-        "fanout", "schedule_time", "schedule_period", "schedule_day",
-        "schedule_trading_only", "since_param", "granularity",
+        "auth",
+        "body",
+        "date_format",
+        "date_param",
+        "enabled",
+        "fanout",
+        "field_map",
+        "granularity",
+        "headers",
+        "last_message",
+        "last_rows",
+        "last_run",
+        "last_status",
+        "max_pages",
+        "method",
+        "next_run",
+        "page_param",
+        "page_size",
+        "page_size_param",
+        "page_start",
+        "response_path",
+        "schedule_day",
+        "schedule_minutes",
+        "schedule_period",
+        "schedule_seconds",
+        "schedule_time",
+        "schedule_trading_only",
+        "since_param",
+        "time_field",
+        "time_window_end",
+        "time_window_start",
+        "timeout_seconds",
+        "url",
     )
 
     def __init__(
@@ -414,9 +439,17 @@ def get_ext_api_key(config_id: str) -> str:
 class ExtConfig:
     """一个扩展数据源的完整配置。"""
     __slots__ = (
-        "id", "label", "mode", "fields", "description",
-        "symbol_map", "code_map", "market_level",
-        "created_at", "updated_at", "pull",
+        "code_map",
+        "created_at",
+        "description",
+        "fields",
+        "id",
+        "label",
+        "market_level",
+        "mode",
+        "pull",
+        "symbol_map",
+        "updated_at",
     )
 
     def __init__(
@@ -544,7 +577,7 @@ class ExtConfigStore:
                 try:
                     raw = json.loads(cp.read_text(encoding="utf-8"))
                     configs.append(ExtConfig.from_dict(raw))
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                     logger.warning("扩展表配置解析失败 %s: %s", cp, e)
         if sig is not None and configs:
             # 缓存存私有副本, 命中时返回深拷贝, 调用方改配置对象不会污染缓存。
@@ -561,7 +594,8 @@ class ExtConfigStore:
         try:
             raw = json.loads(cp.read_text(encoding="utf-8"))
             return ExtConfig.from_dict(raw)
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("get: fallback (%s)", type(fallback_error).__name__)
             return None
 
     def create(self, config: ExtConfig) -> None:
@@ -621,7 +655,7 @@ class ExtConfigStore:
             backup = old_path.with_suffix(".json.bak")
             old_path.rename(backup)
             logger.info("ext_configs.json 已迁移至 ext/ (备份: %s)", backup.name)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("ext_configs 迁移失败: %s", e)
 
 
@@ -668,7 +702,8 @@ def detect_symbol_candidates(df: pl.DataFrame) -> tuple[list[str], list[str]]:
     for col in df.columns:
         try:
             col_data = df[col].cast(pl.Utf8).drop_nulls()
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("detect_symbol_candidates: fallback (%s)", type(fallback_error).__name__)
             continue
         if len(col_data) == 0:
             continue
@@ -692,8 +727,9 @@ def build_code_lookup(data_dir: Path) -> dict[str, str]:
         return {}
     try:
         df = pl.read_parquet(path, columns=["code", "symbol"])
-        return dict(zip(df["code"].to_list(), df["symbol"].to_list()))
-    except Exception:
+        return dict(zip(df["code"].to_list(), df["symbol"].to_list(), strict=True))
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("build_code_lookup: fallback (%s)", type(fallback_error).__name__)
         return {}
 
 
@@ -738,16 +774,14 @@ def apply_config_mapping(df: pl.DataFrame, config: ExtConfig, data_dir: Path) ->
     if cm.get("type") == "mapped" and cm["col"] in df.columns:
         df = df.with_columns(df[cm["col"]].cast(pl.Utf8).alias("code"))
 
-    if "symbol" not in df.columns and sm.get("type") == "computed":
-        if sm.get("from") == "code" and "code" in df.columns:
-            lookup = build_code_lookup(data_dir)
-            df = df.with_columns(normalize_symbol(df["code"].cast(pl.Utf8), lookup).alias("symbol"))
+    if ('symbol' not in df.columns and sm.get('type') == 'computed') and (sm.get('from') == 'code' and 'code' in df.columns):
+        lookup = build_code_lookup(data_dir)
+        df = df.with_columns(normalize_symbol(df["code"].cast(pl.Utf8), lookup).alias("symbol"))
 
-    if "code" not in df.columns and cm.get("type") == "computed":
-        if cm.get("from") == "symbol" and "symbol" in df.columns:
-            df = df.with_columns(
-                df["symbol"].cast(pl.Utf8).str.split(".").list.first().alias("code")
-            )
+    if ('code' not in df.columns and cm.get('type') == 'computed') and (cm.get('from') == 'symbol' and 'symbol' in df.columns):
+        df = df.with_columns(
+            df["symbol"].cast(pl.Utf8).str.split(".").list.first().alias("code")
+        )
 
     if "symbol" in df.columns and "code" not in df.columns:
         df = df.with_columns(
@@ -980,7 +1014,7 @@ def _invalidate_ext_derived(data_dir: Path, *, keep_strategy_cache: bool = False
         from app.factors.ext_factors import invalidate_ext_caches
 
         invalidate_ext_caches(data_dir, keep_strategy_cache=keep_strategy_cache)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("扩展数据缓存失效失败: %s", e)
 
 
@@ -1046,7 +1080,7 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
                 atomic_write_parquet(df, parquet_path)
                 fixed += 1
                 logger.info("代码格式修复: %s/%s (%d 行)", config.id, parquet_path.parent.name, len(df))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
 
     return fixed

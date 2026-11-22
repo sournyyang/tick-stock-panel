@@ -36,6 +36,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -400,7 +401,8 @@ class FuyaoProvider:
         for f in cached:
             try:
                 dmin, _ = _dump_date_range(f)
-            except Exception:  # 缓存损坏不致命, 换下一个/重拉
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only; 缓存损坏不致命, 换下一个/重拉
+                logging.getLogger(__name__).debug("_ensure_daily_big_dump: fallback (%s)", type(fallback_error).__name__)
                 continue
             if dmin is not None and start_d >= dmin:
                 return f
@@ -610,7 +612,8 @@ class FuyaoProvider:
         for candidate in sorted(_cache_dir().glob("daily_k__*.parquet"), reverse=True):
             try:
                 dmin, dmax = _dump_date_range(candidate)
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_daily_dump_info: fallback (%s)", type(fallback_error).__name__)
                 continue
             if dmin is not None and dmax is not None:
                 return candidate, dmin, dmax
@@ -913,7 +916,7 @@ class FuyaoProvider:
     # ---- financial ----
     # 字段映射: 扶摇原始字段 → 项目 canonical 列名(TickFlow 口径, 前端财务页与回测
     # FUNDAMENTAL_FACTORS 按此消费)。映射表之外的扶摇独有字段以原名透传为扩展列。
-    _INCOME_FIELD_MAP = {
+    _INCOME_FIELD_MAP: ClassVar[dict[str, str]] = {
         "operating_income": "revenue",
         "operating_costs": "operating_cost",
         "sales_fee": "selling_expense",
@@ -927,7 +930,7 @@ class FuyaoProvider:
         "parent_holder_net_profit": "net_income_attributable",
         "basic_eps": "basic_eps",
     }
-    _BALANCE_FIELD_MAP = {
+    _BALANCE_FIELD_MAP: ClassVar[dict[str, str]] = {
         "assets_total": "total_assets",
         "total_current_assets": "total_current_assets",
         "non_current_nets_total": "total_non_current_assets",
@@ -936,7 +939,7 @@ class FuyaoProvider:
         "total_debt": "total_liabilities",
         "holder_equity_total": "total_equity",
     }
-    _CASHFLOW_FIELD_MAP = {
+    _CASHFLOW_FIELD_MAP: ClassVar[dict[str, str]] = {
         "act_cash_flow_net": "net_operating_cash_flow",
         "invest_cash_flow_net": "net_investing_cash_flow",
         "financing_cash_flow_net": "net_financing_cash_flow",
@@ -945,7 +948,7 @@ class FuyaoProvider:
     }
     # 官方指标 index_id → canonical。归母净利同比近似 tickflow net_income_yoy;
     # 实测 index_id 与文档有出入(calculate_ 前缀等), 以实测为准。
-    _METRICS_FIELD_MAP = {
+    _METRICS_FIELD_MAP: ClassVar[dict[str, str]] = {
         "index_weighted_avg_roe": "roe",
         "total_assets_net_ratio": "roa",
         "sale_gross_margin": "gross_margin",
@@ -1182,7 +1185,7 @@ class FuyaoProvider:
                 )
                 for f in df.partition_by("symbol")
             }
-        except Exception as e:  # 缓存损坏等不致命: 回退逐标的接口
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running; 缓存损坏等不致命: 回退逐标的接口
             logger.warning("扶摇除权因子本地配价失败, 回退单标的接口: %s", e)
             return None
 

@@ -988,7 +988,8 @@ def _openai_error_detail(exc: Exception) -> str:
         content_type = response.headers.get("content-type", "").lower()
         try:
             text = response.text
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_openai_error_detail: fallback (%s)", type(fallback_error).__name__)
             text = ""
     if not text and isinstance(body, str):
         text = body

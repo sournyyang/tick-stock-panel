@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+
+# ----------------------------------------------------------------
+# 快捷指令: label 展示、prompt 为点击后直接发送的完整问题;
+# group 为前端空会话页的分组标题(同组相邻展示)。
+# ----------------------------------------------------------------
+import logging
 import math
 import re
 import uuid
@@ -32,16 +38,12 @@ import polars as pl
 from app.market_time import cn_today
 from app.services import tool_catalog
 
-# ----------------------------------------------------------------
-# 快捷指令: label 展示、prompt 为点击后直接发送的完整问题;
-# group 为前端空会话页的分组标题(同组相邻展示)。
-# ----------------------------------------------------------------
 QUICK_SUGGESTS: list[dict[str, str]] = [
     # — 行情与大盘 —
     {
         "id": "market-overview",
         "group": "行情与大盘",
-        "label": "今天市场怎么样？",  # noqa: RUF001 — 面向用户中文文案含全角问号
+        "label": "今天市场怎么样？",
         "prompt": "帮我看看今天的市场总览: 涨跌家数、成交额、涨停与连板梯队、情绪雷达, 以及领涨领跌板块。",
     },
     {
@@ -60,7 +62,7 @@ QUICK_SUGGESTS: list[dict[str, str]] = [
         "id": "regime-check",
         "group": "行情与大盘",
         "label": "当前市场环境",
-        "prompt": "最近一个月市场环境(regime)状态如何演变？今天是强势还是弱势, 情绪周期处于什么阶段？",  # noqa: RUF001
+        "prompt": "最近一个月市场环境(regime)状态如何演变？今天是强势还是弱势, 情绪周期处于什么阶段？",
     },
     {
         "id": "indices-check",
@@ -103,8 +105,8 @@ QUICK_SUGGESTS: list[dict[str, str]] = [
     {
         "id": "list-strategies",
         "group": "策略与信号",
-        "label": "我有哪些策略？",  # noqa: RUF001
-        "prompt": "我目前有哪些策略？分别简述每个策略是做什么的、适用什么资产。",  # noqa: RUF001
+        "label": "我有哪些策略？",
+        "prompt": "我目前有哪些策略？分别简述每个策略是做什么的、适用什么资产。",
     },
     {
         "id": "strategy-compare",
@@ -281,7 +283,8 @@ def _quotes_map(ctx: ToolContext, symbols: list[str]) -> dict[str, dict[str, Any
         return {}
     try:
         df = _asset_quote_frame(ctx, symbols)
-    except Exception:  # 行情服务未就绪时静默降级为无价格列
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only; 行情服务未就绪时静默降级为无价格列
+        logging.getLogger(__name__).debug("_quotes_map: fallback (%s)", type(fallback_error).__name__)
         return {}
     if df is None or df.is_empty() or "symbol" not in df.columns:
         return {}
@@ -369,7 +372,8 @@ def _intraday_chart_payload(
         # 最近交易日, 按服务器本地 date.today() 查分钟分区会永远为空; 无快照日期时按北京日期。
         _, trade_date = ctx.repo.get_enriched_latest_asset(asset_type, refresh=False)
         df = ctx.repo.get_minute(symbol, trade_date or cn_today(), asset_type)
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_intraday_chart_payload: fallback (%s)", type(fallback_error).__name__)
         return None
     if df is None or df.is_empty() or "close" not in df.columns or "datetime" not in df.columns:
         return None
@@ -661,7 +665,8 @@ def _run_strategy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             available = ", ".join(
                 str(s.get("id")) for s in ctx.engine.list_strategies()[:12] if s.get("id")
             )
-        except Exception:  # 列举失败不影响错误本身
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only; 列举失败不影响错误本身
+            logging.getLogger(__name__).debug("_run_strategy: fallback (%s)", type(fallback_error).__name__)
             available = ""
         hint = f"; 可用策略: {available}" if available else "; 可先用 list_strategies 查询"
         raise ValueError(f"策略 {strategy_id} 不存在{hint}")
@@ -1053,7 +1058,7 @@ def _symbol_coverage(
                 out["latest_daily"] = latest
                 out["daily_rows_30d"] = df.height
                 out["daily_missing"] = bool(global_daily_latest and latest and str(latest)[:10] < global_daily_latest)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- failure is returned to caller or parent worker
             out["daily_error"] = str(exc)[:80]
     if ctx.data_dir is not None:
         try:
@@ -1068,7 +1073,8 @@ def _symbol_coverage(
                 period = next((c for c in ("period_end", "report_date", "end_date") if c in sub.columns), None)
                 if period and sub.height:
                     out["latest_financial_period"] = _clean_value(sub[period].max())
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_symbol_coverage: fallback (%s)", type(fallback_error).__name__)
             pass
     return out
 
@@ -1104,7 +1110,8 @@ def _check_data_coverage(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
     for table in FINANCIAL_TABLES:
         try:
             df = get_financial_df(ctx.data_dir, table)
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_check_data_coverage: fallback (%s)", type(fallback_error).__name__)
             df = None
         if df is None or df.is_empty():
             financials[table] = {"present": False}
@@ -1131,7 +1138,8 @@ def _check_data_coverage(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
     try:
         job_store.reap_stale()
         active_id = job_store.active_id()
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_check_data_coverage: fallback (%s)", type(fallback_error).__name__)
         active_id = None
     if active_id:
         job = job_store.get(active_id) or {}
@@ -1662,7 +1670,7 @@ async def execute_assistant_tool(name: str, args: dict[str, Any], ctx: ToolConte
             else:
                 result = await asyncio.to_thread(handler, dict(args or {}), ctx)
             return {"ok": True, "result": _mark_action_result(name, args, result)}
-        except Exception as exc:  # 工具失败按契约回填给模型, 不打断对话流
+        except Exception as exc:  # noqa: BLE001 -- failure is returned to caller or parent worker; 工具失败按契约回填给模型, 不打断对话流
             return {"ok": False, "error": str(exc) or exc.__class__.__name__}
     return await tool_catalog.execute_tool(
         name,

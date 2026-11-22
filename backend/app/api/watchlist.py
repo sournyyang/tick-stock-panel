@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Callable, Literal
+from typing import Literal
 
 import anyio
 import polars as pl
@@ -256,7 +256,7 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:
         raise HTTPException(503, str(e)) from e
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("watchlist import-image failed")
         raise HTTPException(500, f"识别失败: {e}") from e
 
@@ -271,7 +271,7 @@ def _run_candidate_import(parse: Callable[[], dict], empty_msg: str) -> dict:
         result = parse()
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("watchlist import failed")
         raise HTTPException(500, f"解析失败: {e}") from e
     if not result["candidates"]:
@@ -621,7 +621,7 @@ def watchlist_enriched(
             df = df.with_columns(pl.col("symbol").replace_strict(name_map, default=None, return_dtype=pl.Utf8).alias("name"))
 
     # 选择内置需要的列
-    keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares", "asset_type", "prepared_daily"] if c in df.columns]
+    keep = [c for c in [*_WATCHLIST_COLS, "name", "float_shares", "asset_type", "prepared_daily"] if c in df.columns]
     df = df.select(keep)
 
     # 涨跌停价 (交易所整数分半进位口径, 仅股票): prev_close/名称已在行上, 对自选的
@@ -684,7 +684,7 @@ def watchlist_enriched(
                 )
                 .drop("base_close")
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         # 装饰列失败不得影响自选主表; 两列必须存在 (值可为 null), 否则前端排序/筛选静默失效
         logger.warning("自选加入日期/加入后涨跌幅计算跳过: %s", e, exc_info=True)
         df = df.with_columns(
@@ -724,7 +724,7 @@ def watchlist_enriched(
                         .rename({field_name: ext_col_name})
                     )
                     df = df.join(ext_df.select(["symbol", ext_col_name]), on="symbol", how="left")
-            except Exception:
+            except Exception:  # noqa: BLE001 -- logged fallback keeps independent work running
                 # view 不存在或字段不存在，尝试直接读 parquet
                 cfg = configs.get(config_id)
                 if cfg:
@@ -738,7 +738,7 @@ def watchlist_enriched(
                                 .rename({field_name: ext_col_name})
                             )
                             df = df.join(ext_df, on="symbol", how="left")
-                    except Exception as e2:
+                    except Exception as e2:  # noqa: BLE001 -- logged fallback keeps independent work running
                         logger.debug("ext join fallback failed for %s.%s: %s", config_id, field_name, e2)
 
     # 最终输出也保证每标的一行，兼容旧名单或附加数据中的重复记录。

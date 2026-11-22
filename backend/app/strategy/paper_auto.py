@@ -98,7 +98,7 @@ def load_auto_rules(data_dir: Path, account_id: str = paper.DEFAULT_ACCOUNT_ID, 
             if enabled_only and not r.get("enabled"):
                 continue
             out.append(r)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("paper auto rule load failed %s: %s", f.name, e)
     return out
 

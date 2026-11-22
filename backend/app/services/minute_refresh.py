@@ -148,7 +148,8 @@ class MinuteRefreshService:
             from app.tickflow.capabilities import Cap
 
             return capset.has(Cap.INTRADAY_UNIVERSE)
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("capability_ok: fallback (%s)", type(fallback_error).__name__)
             return False
 
     def active_provider(self) -> str:
@@ -245,7 +246,7 @@ class MinuteRefreshService:
                             break
                         self._stop.wait(min(_LOOP_STEP_S, max(0.0, self._state.next_round_at - now)))
                     continue
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
                 self._state.last_error = f"round failed: {e}"
                 logger.warning("全量分钟轮次异常: %s", e)
             self._stop.wait(_LOOP_STEP_S)

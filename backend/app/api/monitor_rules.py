@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time as _time
 from datetime import date
 from pathlib import Path
 
@@ -37,7 +38,8 @@ def _reconcile_index_asset_type(rule: dict, repo) -> dict:
         return rule
     try:
         types = {repo.resolve_asset_type(s) for s in symbols}
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_reconcile_index_asset_type: fallback (%s)", type(fallback_error).__name__)
         return rule
     if len(types) == 1:
         only = next(iter(types))
@@ -167,7 +169,8 @@ def get_options(request: Request):
                     ),
                     "label": cs.get("name", cs["id"]),
                 })
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("get_options: fallback (%s)", type(fallback_error).__name__)
         pass
 
     sector_service = getattr(request.app.state, "sector_monitor_service", None)
@@ -334,7 +337,7 @@ def save_rule(req: RuleModel, request: Request):
         group_id = str(rule.get("group_id") or "")
         try:
             group_ids = {g["id"] for g in watchlist_service.list_groups()}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             raise HTTPException(status_code=503, detail=f"自选分组读取失败: {e}") from e
         if group_id not in group_ids:
             raise HTTPException(status_code=400, detail="自选分组不存在或已被删除, 请重新选择")
@@ -390,7 +393,6 @@ def delete_rule(rule_id: str, request: Request):
 
 # ── 演示数据生成 (仅 Dev 页用) ─────────────────────────
 
-import time as _time
 
 
 def _demo_rule(rule_id: str, name: str, rtype: str, scope: str, symbols: list[str],
@@ -466,7 +468,7 @@ def seed_demo_rules(request: Request):
     ts = int(_time.time() * 1000)
     created = []
     i = 0
-    for (name, rtype, scope, symbols, conditions, logic, severity, sev) in _DEMO_RULES_TEMPLATE:
+    for (name, rtype, scope, symbols, conditions, logic, _severity, sev) in _DEMO_RULES_TEMPLATE:
         rule_id = f"demo_{ts}_{i}"
         rule = _demo_rule(rule_id, name, rtype, scope, symbols, conditions, logic, 3600, sev)
         monitor_rules.save_one(_data_dir(request), rule)
@@ -717,8 +719,8 @@ def trigger_ladder(request: Request):
     # 1. 落盘到 alerts.jsonl
     try:
         alert_store.append_many(repo.store.data_dir, rule_events)
-    except Exception:  # noqa: BLE001
-        pass  # 落盘失败不阻断推送
+    except Exception as cleanup_error:  # noqa: BLE001 -- best-effort cleanup or delivery; failure is diagnosed
+        logging.getLogger(__name__).debug("trigger_ladder: cleanup skipped (%s)", type(cleanup_error).__name__)
 
     # 2. SSE 推送 (入 pending_alerts 队列)
     if quote_svc:
@@ -731,15 +733,15 @@ def trigger_ladder(request: Request):
         } for ev in rule_events]
         try:
             quote_svc.push_alerts(sse_alerts)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as cleanup_error:  # noqa: BLE001 -- best-effort cleanup or delivery; failure is diagnosed
+            logging.getLogger(__name__).debug("trigger_ladder: cleanup skipped (%s)", type(cleanup_error).__name__)
 
     # 3. 飞书推送
     if quote_svc:
         try:
             quote_svc._maybe_send_webhook(rule_events, engine)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as cleanup_error:  # noqa: BLE001 -- best-effort cleanup or delivery; failure is diagnosed
+            logging.getLogger(__name__).debug("trigger_ladder: cleanup skipped (%s)", type(cleanup_error).__name__)
 
     return {
         "ok": True,

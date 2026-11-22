@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from threading import Lock
 from unittest.mock import MagicMock
 
@@ -21,11 +20,14 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
+# ---------- 辅助 ----------
+from app.config import settings
+from app.data_providers.custom.config import CustomSourceConfig, DatasetConfig
+from app.data_providers.custom.provider import GenericHTTPProvider
 from app.plugins.stocksdk import provider as sp
 from app.plugins.stocksdk.provider import StockSDKProvider
 from app.services import kline_sync
 
-# ---------- 辅助 ----------
 
 def _mock_minute_df(symbol: str = "600519.SH") -> pl.DataFrame:
     """构造非空分钟 K df, 用于 mock provider.get_minute 返回值。"""
@@ -304,6 +306,7 @@ def test_get_minute_batch_splits_stock_and_etf(monkeypatch):
 
     # mock repo: ETF 集合含 510300.SH; 本地分钟K返回空 (强制走 incomplete 补拉)
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = {"510300.SH"}
     mock_repo.get_minute_batch.return_value = pl.DataFrame()
 
@@ -327,6 +330,8 @@ def test_get_minute_batch_splits_stock_and_etf(monkeypatch):
     # 两个 symbol 都在结果里 (concat 后按 symbol filter 命中)
     assert "600519.SH" in result["data"]
     assert "510300.SH" in result["data"]
+    assert (settings.data_dir / "kline_minute/date=2026-01-15/part.parquet").is_file()
+    assert (settings.data_dir / "kline_etf_minute/date=2026-01-15/part.parquet").is_file()
 
 
 # ---------- 测试 9b: 取到即落盘 + 增量拉取 (尾部落后 / 中间洞 / fresh) ----------
@@ -358,11 +363,12 @@ def _endpoint_mocks(monkeypatch, local_df: pl.DataFrame, sync_ret: pl.DataFrame 
                         lambda df, d: writes.append(df))
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = local_df
     mock_repo._write_lock = Lock()
     # 真实 Path 才会触发落盘分支 (kline.py 的 isinstance 守卫)
-    mock_repo.store.data_dir = Path("data")
+    mock_repo.store.data_dir = settings.data_dir
 
     mock_capset = MagicMock()
     mock_capset.has.return_value = True
@@ -678,8 +684,6 @@ def test_provider_has_dataset_exception_does_not_fall_back(monkeypatch):
 
 # ---------- 测试 15-17: GenericHTTPProvider opt-in 参数传递 (Issue 3) ----------
 
-from app.data_providers.custom.config import CustomSourceConfig, DatasetConfig
-from app.data_providers.custom.provider import GenericHTTPProvider
 
 
 def _make_minute_config(**extra) -> CustomSourceConfig:
@@ -937,6 +941,7 @@ def test_sync_minute_single_rejects_index_symbol():
     from app.api import kline as kline_api
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.resolve_asset_type.return_value = "index"
     mock_request = MagicMock()
     mock_request.app.state.repo = mock_repo
@@ -976,6 +981,7 @@ def test_get_minute_batch_prefer_local_healthy_skips_stock_refetch(monkeypatch):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = {"510300.SH"}
     # 股票本地 100 根 (expected=240 → <90% 判 incomplete), ETF 本地空
     mock_repo.get_minute_batch.side_effect = (
@@ -1012,6 +1018,7 @@ def test_get_minute_batch_prefer_local_unhealthy_falls_back(monkeypatch):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = _mock_minute_rows("600519.SH", 100)
 
@@ -1040,6 +1047,7 @@ def test_get_minute_batch_no_flag_unaffected_even_if_healthy(monkeypatch):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = _mock_minute_rows("600519.SH", 100)
 
@@ -1084,6 +1092,7 @@ def test_get_minute_batch_leading_hole_triggers_full_day_refetch(monkeypatch):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = _mock_tail_rows(
         "600519.SH", 11, datetime(2026, 1, 15, 11, 20)
@@ -1122,6 +1131,7 @@ def test_get_minute_batch_healthy_does_not_suppress_leading_hole_refetch(monkeyp
     stale_local = _mock_minute_rows("000001.SZ", 100)  # 09:31 开头的连续序列, 仅根数不足
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = pl.concat([hole_local, stale_local])
 
@@ -1156,6 +1166,7 @@ def test_get_minute_batch_normal_open_not_treated_as_leading_hole(monkeypatch):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     # 首根 09:31, 仅 5 根 (历史日 expected=240, 根数不足但非洞)
     mock_repo.get_minute_batch.return_value = _mock_minute_rows("600519.SH", 5)
@@ -1233,6 +1244,7 @@ def _compress_mock_env(monkeypatch, *, compress_on, accept="gzip, deflate"):
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", sync_spy)
 
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.get_etf_symbol_set.return_value = set()
     mock_repo.get_minute_batch.return_value = _mock_minute_rows("600519.SH", 100)
 
@@ -1302,7 +1314,6 @@ def test_get_minute_batch_plain_without_accept_encoding(monkeypatch):
 
 def _daily_mock_env(monkeypatch, *, compress_on, accept="gzip, deflate"):
     """构造 get_daily_batch 压缩路径的最小 mock。"""
-    from app.api import kline as kline_api
     from app.services import preferences as prefs
 
     monkeypatch.setattr(prefs, "get_daily_batch_compress", lambda: compress_on)
@@ -1316,6 +1327,7 @@ def _daily_mock_env(monkeypatch, *, compress_on, accept="gzip, deflate"):
         "low": [99.0] * n, "close": [100.5] * n, "volume": [1000.0] * n,
     })
     mock_repo = MagicMock()
+    mock_repo.store.data_dir = settings.data_dir
     mock_repo.resolve_asset_type.return_value = "stock"
     mock_repo.get_daily_batch.return_value = daily_df
 
@@ -1391,7 +1403,10 @@ def test_preferences_parallel_saves_do_not_lose_each_other(tmp_path, monkeypatch
 
     t1 = threading.Thread(target=write_key, args=("minute_batch_compress",))
     t2 = threading.Thread(target=write_key, args=("daily_batch_compress",))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     final = prefs.load()
     assert final["minute_batch_compress"] is False

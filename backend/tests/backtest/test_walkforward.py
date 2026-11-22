@@ -12,6 +12,10 @@ from datetime import date
 
 import pytest
 
+# ---------------------------------------------------------------
+# fold 生成
+# ---------------------------------------------------------------
+from app.backtest.engine import PanelCache
 from app.backtest.walkforward import (
     WalkForwardConfig,
     WalkForwardService,
@@ -19,9 +23,6 @@ from app.backtest.walkforward import (
     generate_folds,
 )
 
-# ---------------------------------------------------------------
-# fold 生成
-# ---------------------------------------------------------------
 
 def test_folds_rolling_windows():
     # 1 年数据, 训练 90d / 测试 30d / 步进 30d
@@ -139,7 +140,6 @@ class _FakeOptimizer:
 
 
 # 从真实 PanelCache 取字段模板 —— 字段被重命名时本桩自动跟随, 避免 test 绿而生产 KeyError。
-from app.backtest.engine import PanelCache
 
 _ZERO_CACHE_STATS = {k: type(v)() for k, v in PanelCache().stats().items()}
 

@@ -5,6 +5,7 @@ conditions/order_by 是用户可控的 SQL 片段; 隔离连接若允许外部�
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from unittest.mock import MagicMock
 
@@ -113,7 +114,8 @@ def test_external_access_switch_is_the_effective_barrier(tmp_path) -> None:
         raised = False
         try:
             hardened.execute(inject)
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("test_external_access_switch_is_the_effective_barrier: fallback (%s)", type(fallback_error).__name__)
             raised = True
         assert raised, "external_access=False 的连接不应能读外部文件"
     finally:

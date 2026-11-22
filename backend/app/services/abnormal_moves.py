@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -160,7 +161,8 @@ def _bench_rt_pct(quote_service: Any) -> float:
     """
     try:
         df = quote_service.get_index_quotes()
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_bench_rt_pct: fallback (%s)", type(fallback_error).__name__)
         return 0.0
     if df is None or df.is_empty():
         return 0.0
@@ -197,7 +199,8 @@ def build_overview(
     if quote_service is not None:
         try:
             index_quotes = quote_service.get_index_quotes()
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("build_overview: fallback (%s)", type(fallback_error).__name__)
             index_quotes = None
         for k in BENCH_KEYS:
             bench_by_key[k] = bench_rt_pct_for(index_quotes, k)

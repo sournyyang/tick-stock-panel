@@ -243,11 +243,9 @@ async def ensure_builtin_presets(data_dir: Path) -> None:
             if _is_retired_factory_pull(config.id, existing.pull):
                 existing.pull = config.pull
                 changed = True
-            if not (existing.description or "").strip() or \
-                    (existing.description or "").startswith(_FACTORY_DESC_PREFIXES):
-                if existing.description != config.description:
-                    existing.description = config.description
-                    changed = True
+            if (not (existing.description or '').strip() or (existing.description or '').startswith(_FACTORY_DESC_PREFIXES)) and (existing.description != config.description):
+                existing.description = config.description
+                changed = True
 
             if changed:
                 store.upsert(existing)

@@ -815,7 +815,7 @@ class MiningCandidateService:
                 path.unlink()
                 self._fsync_directory(path.parent)
             self.strategy_engine.reload()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- failure is returned to caller or parent worker
             return exc
         return None
 
@@ -827,7 +827,7 @@ class MiningCandidateService:
                 path.unlink()
                 self._fsync_directory(path.parent)
             self.strategy_engine.reload()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- failure is returned to caller or parent worker
             return exc
         return None
 

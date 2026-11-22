@@ -16,7 +16,6 @@ import logging
 import os
 import threading
 import time
-import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import date, datetime
@@ -222,7 +221,7 @@ class DataStore:
             try:
                 with startup_phase(logger, f"DuckDB view {sql.split()[4]}"):
                     self.db.execute(sql)
-            except Exception as e:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 # 空数据目录(首次启动)或权限问题时 DuckDB 会抛 IOException;
                 # 跨版本/平台也可能抛 CatalogException 等。空目录缺视图不影响启动
                 # (后续同步写入数据后会重新刷新视图),这里一律降级为 debug 日志。
@@ -525,7 +524,7 @@ class KlineRepository:
                 self._warmup_enriched()
                 logger.info("enriched warmup thread done (%.1fs)", time.perf_counter() - t0)
                 self._notify_refresh_done()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("enriched warmup thread failed")
             finally:
                 with self._warmup_lock:
@@ -1599,13 +1598,12 @@ class KlineRepository:
             df = self._scan_daily_symbol(symbol, start, end, columns)
             if not df.is_empty() and all(c in df.columns for c in columns):
                 cached, cache_date = self.get_enriched_latest(symbols=[symbol], end=end)
-                if cached is not None and not cached.is_empty() and cache_date:
-                    if start <= cache_date <= end:
-                        cached_part = self._filter_cached(cached, symbol, columns)
-                        if not cached_part.is_empty():
-                            df = df.filter(pl.col("date") != cache_date)
-                            common_cols = [c for c in df.columns if c in cached_part.columns]
-                            df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+                if (cached is not None and (not cached.is_empty()) and cache_date) and (start <= cache_date <= end):
+                    cached_part = self._filter_cached(cached, symbol, columns)
+                    if not cached_part.is_empty():
+                        df = df.filter(pl.col("date") != cache_date)
+                        common_cols = [c for c in df.columns if c in cached_part.columns]
+                        df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
                 return df
 
         # 扩展范围用于指标预热 (MA60 需要 ~60 交易日 ≈ 120 日历日)
@@ -1634,13 +1632,12 @@ class KlineRepository:
 
         # 尝试用缓存数据覆盖最新日 (盘中更准确)
         cached, cache_date = self.get_enriched_latest(symbols=[symbol], end=end)
-        if not df.is_empty() and cached is not None and not cached.is_empty() and cache_date:
-            if start <= cache_date <= end:
-                cached_part = self._filter_cached(cached, symbol, None)
-                if not cached_part.is_empty():
-                    df = df.filter(pl.col("date") != cache_date)
-                    common_cols = [c for c in df.columns if c in cached_part.columns]
-                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+        if (not df.is_empty() and cached is not None and (not cached.is_empty()) and cache_date) and (start <= cache_date <= end):
+            cached_part = self._filter_cached(cached, symbol, None)
+            if not cached_part.is_empty():
+                df = df.filter(pl.col("date") != cache_date)
+                common_cols = [c for c in df.columns if c in cached_part.columns]
+                df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
 
         # 裁剪到请求范围
         if not df.is_empty():
@@ -1662,9 +1659,8 @@ class KlineRepository:
         """批量日K查询。"""
         self._assert_daily_usable(symbols=symbols, end=end)
         cached, cache_date = self.get_enriched_latest(symbols=symbols, end=end)
-        if cached is not None and not cached.is_empty() and cache_date:
-            if start >= cache_date:
-                return self._filter_cached_batch(cached, symbols, columns)
+        if (cached is not None and (not cached.is_empty()) and cache_date) and (start >= cache_date):
+            return self._filter_cached_batch(cached, symbols, columns)
 
         # 复用 300 天预计算 enriched 历史缓存 (与单股 get_daily 同源同判据):
         # 自选迷你蜡烛窗口 (days≤60) 完全落在缓存内, 免整树 glob 扫描;
@@ -1788,7 +1784,7 @@ class KlineRepository:
             return df
         try:
             return apply_minute_adjustment(df, self.store.data_dir, asset_type)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("分钟复权投影失败, 按原始数据返回: %s", e)
             return df
 
@@ -2125,7 +2121,8 @@ class KlineRepository:
             if res and res[0]:
                 d = res[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("earliest_daily_date: fallback (%s)", type(fallback_error).__name__)
             return None
         return None
 
@@ -2138,7 +2135,8 @@ class KlineRepository:
             if res and res[0]:
                 d = res[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("earliest_minute_date: fallback (%s)", type(fallback_error).__name__)
             return None
         return None
 
@@ -2174,7 +2172,8 @@ class KlineRepository:
             if res and res[0]:
                 d = res[0]
                 return d if isinstance(d, date) else date.fromisoformat(str(d))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("latest_daily_date: fallback (%s)", type(fallback_error).__name__)
             return None
         return None
 
@@ -2219,7 +2218,8 @@ class KlineRepository:
                 [cutoff],
             )
             return [r[0] for r in rows if r and r[0]]
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("symbols_lagging: fallback (%s)", type(fallback_error).__name__)
             return []
 
     def _latest_enriched_date_duckdb(self) -> date | None:

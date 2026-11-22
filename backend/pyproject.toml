@@ -85,17 +85,8 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-# BLE = flake8-blind-except: 禁止 `except Exception` 不留痕。
-# 加它的理由: 本仓原有 271 处 `# noqa: BLE001` 而 `BLE` 竟未启用 ⇒ 那些 noqa 全是
-# "无效指令"(RUF100), 即「禁止裸 except」当时**完全没有被强制**。启用后:
-#   ①271 条既有 noqa 立即可用(实测 RUF100 293→46) ②将来新增的裸 except 必须显式承认。
-# 实测本仓 backend/app: 1420 条 ⇒ 忽略 RUF001/2/3 后 611 条(其中 6 条是原先给 RUF001/2/3
-#   写的 noqa 变为"无效指令") ⇒ 再启用 BLE 后 594 条(净减 826)。
-# ⚠️ 仍会暴露 236 处**尚未表态**的 `except Exception`(soft-failure 设计, 见 CONTRIBUTING);
-#    待工作区干净时用 `ruff check --select BLE001 --add-noqa` 批量显式承认, 不在有他人
-#    未提交改动时做(会与在途改动冲突)。
-# ⚠️ 本仓 CI 目前**不跑 ruff**(ci.yml 只有 `uv run pytest tests -q`) ⇒ 本改动不会打断 CI;
-#    但正因如此, 这条门禁从来没人守——本改动让它**可执行**, 代价是 236 条既有沉默违规显形。
+# Keep broad-exception checks enabled. Plugin/job boundaries acknowledge intentional
+# isolation locally; fallback diagnostics must avoid credential-bearing messages.
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "BLE"]
 ignore = [
     "E501",    # 长行交给 fmt
@@ -106,6 +97,11 @@ ignore = [
     "RUF002",  # Docstring contains ambiguous unicode character
     "RUF003",  # Comment contains ambiguous unicode character
 ]
+
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI parameter declarations are framework metadata, not mutable Python defaults.
+extend-immutable-calls = ["fastapi.Query", "fastapi.File"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

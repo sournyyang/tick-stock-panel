@@ -97,7 +97,7 @@ def _migrate_legacy(data_dir: Path) -> None:
             if src.exists():
                 shutil.move(str(src), str(dest / name))
         logger.info("paper: 旧单账户数据已迁移到 %s", dest)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper 旧数据迁移失败 (下次重试): %s", e)
         # 迁移半途而废时目标目录已建立, 会跳过后续重试 — 清掉半成品目录保证可重试
         try:
@@ -105,7 +105,8 @@ def _migrate_legacy(data_dir: Path) -> None:
                 shutil.rmtree(dest, ignore_errors=True)
                 if not any(base.iterdir()):
                     base.rmdir()
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_migrate_legacy: fallback (%s)", type(fallback_error).__name__)
             pass
 
 
@@ -151,7 +152,7 @@ def get_account(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict | 
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper account load failed: %s", e)
         return None
 
@@ -208,7 +209,8 @@ def list_account_ids(data_dir: Path) -> list[str]:
         try:
             acc = json.loads(p.read_text(encoding="utf-8"))
             out.append((acc.get("created_at", ""), acc.get("id", p.parent.name)))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("list_account_ids: fallback (%s)", type(fallback_error).__name__)
             continue
     return [aid for _, aid in sorted(out)]
 
@@ -345,7 +347,7 @@ def load_orders(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[di
     for f in sorted(_orders_dir(data_dir, account_id).glob("order_*.json")):
         try:
             out.append(json.loads(f.read_text(encoding="utf-8")))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("paper order load failed %s: %s", f.name, e)
     return out
 
@@ -361,7 +363,8 @@ def get_order(data_dir: Path, order_id: str, account_id: str = DEFAULT_ACCOUNT_I
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("get_order: fallback (%s)", type(fallback_error).__name__)
         return None
 
 
@@ -495,7 +498,7 @@ def load_fills(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dic
             continue
         try:
             out.append(json.loads(line))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("paper fill line skipped: %s", e)
     return out
 
@@ -507,7 +510,7 @@ def load_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             return data.get("positions", {})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("paper positions load failed, rebuilding: %s", e)
     return replay_positions(data_dir, account_id=account_id)[0]
 
@@ -749,7 +752,7 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
             "conditions": [],
             "logic": "and",
         }])
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper 成交告警落盘失败 (不影响账务): %s", e)
 
     logger.info("paper filled: %s %s %d x %.3f fee %.2f", side, symbol, qty, price, fee)
@@ -854,7 +857,7 @@ def read_daily_bar(data_dir: Path, symbol: str, asset_type: str, day: str) -> di
             .select(["open", "close"])
             .collect()
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper read_daily_bar failed %s %s: %s", symbol, day, e)
         return None
     if df.is_empty():
@@ -875,7 +878,7 @@ def _prev_close(data_dir: Path, symbol: str, asset_type: str, day: str) -> float
             .select(pl.col("close").last())
             .collect()
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper prev_close failed %s: %s", symbol, e)
         return None
     if df.is_empty() or df["close"][0] is None:
@@ -895,7 +898,7 @@ def _index_close(data_dir: Path, day: str) -> float | None:
             .select("close")
             .collect()
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper index close read failed: %s", e)
         return None
     if df.is_empty() or df["close"][0] is None:
@@ -916,7 +919,7 @@ def _factor_on(data_dir: Path, symbol: str, asset_type: str, day: str) -> float 
             .select("ex_factor")
             .collect()
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("paper factor read failed %s: %s", symbol, e)
         return None
     if df.is_empty() or df["ex_factor"][0] is None:
@@ -1073,7 +1076,8 @@ def _write_nav_line(data_dir: Path, day: str, nav: dict, account_id: str = DEFAU
             try:
                 if json.loads(line).get("date") != day:
                     lines.append(line)
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_write_nav_line: fallback (%s)", type(fallback_error).__name__)
                 continue
     lines.append(json.dumps(nav, ensure_ascii=False))
     lines.sort(key=lambda s: json.loads(s)["date"])
@@ -1088,7 +1092,8 @@ def load_nav(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dict]
     for line in p.read_text(encoding="utf-8").splitlines():
         try:
             out.append(json.loads(line))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("load_nav: fallback (%s)", type(fallback_error).__name__)
             continue
     return out
 
@@ -1208,5 +1213,6 @@ def stats(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict:
 def _days_between(d1: str, d2: str) -> int:
     try:
         return (_date.fromisoformat(d2) - _date.fromisoformat(d1)).days
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_days_between: fallback (%s)", type(fallback_error).__name__)
         return 0

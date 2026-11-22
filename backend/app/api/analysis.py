@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -114,7 +115,8 @@ def _load_saved(request: Request) -> list[AnalysisMenu]:
         try:
             raw = json.loads(p.read_text(encoding="utf-8"))
             items.append(AnalysisMenu(**raw))
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_load_saved: fallback (%s)", type(fallback_error).__name__)
             continue
     return items
 

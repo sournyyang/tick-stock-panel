@@ -37,6 +37,9 @@ jobs:
       - name: 后端全量测试
         run: uv run pytest tests -q
 
+      - name: 后端 Ruff 检查
+        run: uv run ruff check app tests
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

@@ -1,6 +1,7 @@
 """扩展数据 API — CRUD + 文件上传 + JSON 写入 + 定时拉取 + schema 发现。"""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -8,7 +9,7 @@ import re
 import shutil
 import tempfile
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -31,7 +32,6 @@ from app.services.ext_data import (
     fix_symbol_format,
     get_ext_api_key,
     infer_fields_from_df,
-    parse_upload_file,
     rows_to_parquet,
     run_ext_data_io,
     write_ext_parquet,
@@ -353,7 +353,8 @@ def _with_instrument_name(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
                     .drop(lookup_name)
                 )
             return df.join(inst, on="symbol", how="left")
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_with_instrument_name: fallback (%s)", type(fallback_error).__name__)
         return df
     return df
 
@@ -1285,8 +1286,8 @@ async def run_pull(request: Request, config_id: str):
         # 写回执行状态, 让前端"上次执行"面板立即反映
         updated = await run_ext_data_io(store.get, config_id)
         if updated and updated.pull:
-            from datetime import datetime, timezone
-            updated.pull.last_run = datetime.now(timezone.utc).isoformat()
+            from datetime import datetime
+            updated.pull.last_run = datetime.now(UTC).isoformat()
             updated.pull.last_status = "success"
             updated.pull.last_message = f"{n} rows @ {d}"
             updated.pull.last_rows = n
@@ -1296,8 +1297,8 @@ async def run_pull(request: Request, config_id: str):
         # 失败也写回状态, 记录错误信息
         failed = await run_ext_data_io(store.get, config_id)
         if failed and failed.pull:
-            from datetime import datetime, timezone
-            failed.pull.last_run = datetime.now(timezone.utc).isoformat()
+            from datetime import datetime
+            failed.pull.last_run = datetime.now(UTC).isoformat()
             failed.pull.last_status = "error"
             failed.pull.last_message = str(e)[:200]
             await run_ext_data_io(store.upsert, failed)
@@ -1670,8 +1671,9 @@ def discover_schema(request: Request, config_id: str):
             {"name": name, "type": dtype}
             for name, dtype in _describe_parquet_columns(glob)
         ]}
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
         # 无数据时返回配置中定义的字段 — 键名与真实 schema 对齐 (type 而非 dtype)
+        logging.getLogger(__name__).debug("discover_schema: fallback (%s)", type(fallback_error).__name__)
         return {"columns": [
             {"name": f.name, "type": f.dtype, "label": f.label} for f in config.fields
         ]}
@@ -1692,7 +1694,8 @@ def discover_all_schemas(request: Request):
                 {"name": name, "type": dtype, "label": field_labels.get(name, name)}
                 for name, dtype in _describe_parquet_columns(glob)
             ]
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("discover_all_schemas: fallback (%s)", type(fallback_error).__name__)
             columns = [
                 {"name": f.name, "type": f.dtype, "label": f.label} for f in config.fields
             ]
@@ -1731,10 +1734,8 @@ def _refresh_views(request: Request) -> None:
                 f"CREATE OR REPLACE VIEW {name} AS "
                 f"SELECT * FROM read_parquet('{old_glob}', union_by_name=true)"
             )
-            try:
+            with contextlib.suppress(Exception):
                 db.execute(sql)
-            except Exception:
-                pass
 
     # 注册新路径视图：每个扩展表一个视图 ext_{config_id}
     ext_base = Path(d) / "ext_data"
@@ -1763,7 +1764,8 @@ def _refresh_views(request: Request) -> None:
                         f"SELECT * FROM read_parquet('{glob_pattern}', union_by_name=true)"
                     )
                     db.execute(sql)
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_refresh_views: fallback (%s)", type(fallback_error).__name__)
                 pass
 
     # 扩展列已接入 enriched 帧 (compute_signals/compute_enriched_today 注入):

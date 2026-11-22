@@ -85,7 +85,8 @@ def _string_ext_fields() -> frozenset[str]:
         from app.factors.ext_factors import ext_string_fields
 
         return ext_string_fields()
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_string_ext_fields: fallback (%s)", type(fallback_error).__name__)
         return frozenset()
 
 
@@ -171,7 +172,7 @@ def _parse_days(c: dict, key: str, i: int) -> int:
     try:
         n = int(raw)
     except (TypeError, ValueError):
-        raise ValueError(f"第 {i+1} 个条件: {key} 必须是整数: {raw!r}")
+        raise ValueError(f"第 {i+1} 个条件: {key} 必须是整数: {raw!r}") from None
     if n < 0 or n > MAX_DAYS:
         raise ValueError(f"第 {i+1} 个条件: {key} 必须在 0..{MAX_DAYS} 之间: {n}")
     return n
@@ -445,7 +446,7 @@ def build_expressions(signals: list[dict], allow_shift: bool = True) -> dict[str
             for p in parts[1:]:
                 combined = combined & p
             out[col_name] = combined
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("custom signal compile failed %s: %s", sig.get("id"), e)
     return out
 
@@ -520,7 +521,7 @@ def build_expressions_prev(
             for p in parts[1:]:
                 combined = combined & p
             out[col_name] = combined
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("custom signal (today) compile failed %s: %s", sig.get("id"), e)
     return out
 
@@ -569,7 +570,8 @@ def _expr_root_columns(expr: pl.Expr) -> set[str]:
         # Polars 的 meta.root_names() 返回表达式引用的根列名
         names = expr.meta.root_names()
         return set(names)
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_expr_root_columns: fallback (%s)", type(fallback_error).__name__)
         return set()
 
 
@@ -680,7 +682,7 @@ def build_intraday_expressions(signals: list[dict]) -> dict[str, pl.Expr]:
             for p in parts[1:]:
                 combined = combined & p
             out[intraday_column_name(sig["id"])] = combined
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("intraday signal compile failed %s: %s", sig.get("id"), e)
     return out
 

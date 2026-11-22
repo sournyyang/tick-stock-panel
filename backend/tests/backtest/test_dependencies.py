@@ -7,8 +7,8 @@ import polars as pl
 import pytest
 
 from app.backtest.strategy import StrategyDependencyResolver
-from app.strategy.seeds.near_limit_up import MATRIX_STRATEGY, META
 from app.strategy.engine import StrategyDef
+from app.strategy.seeds.near_limit_up import MATRIX_STRATEGY, META
 
 
 def _strategy(**overrides) -> StrategyDef:

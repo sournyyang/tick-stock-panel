@@ -456,8 +456,8 @@ class ScreenerService:
             if con is not None:
                 try:
                     con.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as cleanup_error:  # noqa: BLE001 -- best-effort cleanup or delivery; failure is diagnosed
+                    logging.getLogger(__name__).debug("run: cleanup skipped (%s)", type(cleanup_error).__name__)
 
         rows = df_result.to_dicts() if not df_result.is_empty() else []
         elapsed = (time.perf_counter() - t0) * 1000

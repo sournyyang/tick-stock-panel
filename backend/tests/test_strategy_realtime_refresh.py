@@ -206,6 +206,7 @@ class _MonitorWithUpdate:
 
     def __init__(self, updated: bool):
         self.updated = updated
+        self.rules = {}
 
     def set_name_map(self, name_map):
         pass

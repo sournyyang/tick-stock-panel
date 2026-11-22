@@ -63,7 +63,8 @@ def _resolve_filter_config(filter_cfg: dict | None) -> dict:
             "max_members": int(cfg["max_members"]),
             "blacklist": set(cfg["blacklist"]),
         }
-    except Exception:
+    except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+        logging.getLogger(__name__).debug("_resolve_filter_config: fallback (%s)", type(fallback_error).__name__)
         return {"min_members": 4, "max_members": 600, "blacklist": set()}
 
 
@@ -94,7 +95,7 @@ def load_risk_warning_symbols(data_dir: Path) -> frozenset[str]:
             df = pl.read_parquet(inst_dir / "**" / "*.parquet").select(["symbol", "name"])
             st = df.filter(polars_is_risk_warning_name(pl.col("name")))
             syms = frozenset(s.upper() for s in st["symbol"].to_list())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("load risk-warning symbols failed: %s", e)
     _ST_SYMBOLS_CACHE = (now, syms)
     return syms
@@ -107,7 +108,7 @@ def load_mainline_history(data_dir: Path, kind: str = "concept") -> pl.DataFrame
         return pl.DataFrame()
     try:
         df = pl.read_parquet(p)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("load_mainline_history failed: %s", e)
         return pl.DataFrame()
     if df.is_empty() or "kind" not in df.columns:
@@ -180,7 +181,8 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
         try:
             from app.services import preferences
             exclude_st = preferences.get_sentiment_exclude_st()
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("compute_mainline_range: fallback (%s)", type(fallback_error).__name__)
             exclude_st = True
     if exclude_st:
         st_syms = load_risk_warning_symbols(repo.store.data_dir)

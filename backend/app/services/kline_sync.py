@@ -141,7 +141,7 @@ def _instruments_symbol_index(data_dir) -> dict[str, list[str]] | None:
         return None
     try:
         symbols = pl.read_parquet(path, columns=["symbol"])["symbol"].drop_nulls().to_list()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("instruments 维表读取失败, 裸符号无法补全后缀: %s", e)
         return None
     index: dict[str, list[str]] = {}
@@ -226,7 +226,7 @@ def sync_daily_batch(symbols: list[str],
         sleep_between_batches(i, rpm)
         try:
             if start_time and end_time:
-                raw = _sdk_call_with_deadline(lambda: tf.klines.batch(
+                raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.batch(
                     chunk, period="1d", adjust="none",
                     start_time=_datetime_to_ms(start_time),
                     end_time=_datetime_to_ms(end_time),
@@ -234,7 +234,7 @@ def sync_daily_batch(symbols: list[str],
                     as_dataframe=False, show_progress=False,
                 ))
             else:
-                raw = _sdk_call_with_deadline(lambda: tf.klines.batch(
+                raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.batch(
                     chunk, period="1d", count=count or 250, adjust="none",
                     as_dataframe=False, show_progress=False))
         except SDKCallTimeoutError as e:
@@ -520,14 +520,13 @@ def sync_daily_by_quotes(repo: KlineRepository) -> int:
     一个请求覆盖 ~5500 只股票,比 batch K-line 快几个数量级。
     返回写入的行数。
     """
-    from datetime import date as _date
 
     from app.tickflow.client import get_client
 
     tf = get_client()
     try:
         resp = tf.quotes.get_by_universes(universes=["CN_Equity_A"])
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("get_by_universes failed: %s", e)
         return 0
 
@@ -537,7 +536,7 @@ def sync_daily_by_quotes(repo: KlineRepository) -> int:
 
     records = []
     for q in resp:
-        ext = q.get("ext") or {}
+        q.get("ext") or {}
         records.append({
             "symbol": q.get("symbol"),
             "open": q.get("open"),
@@ -751,7 +750,7 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     for i, chunk in enumerate(chunks):
         sleep_between_batches(i, limit.rpm)
         try:
-            raw = _sdk_call_with_deadline(lambda: tf.klines.ex_factors(chunk, **sdk_kwargs))
+            raw = _sdk_call_with_deadline(lambda chunk=chunk: tf.klines.ex_factors(chunk, **sdk_kwargs))
             normalized = _normalize_adj_factor(raw)
             if not normalized.is_empty():
                 all_dfs.append(normalized)
@@ -1202,7 +1201,7 @@ def fetch_intraday_full_market_burst(
             )
             seg = _normalize_minute(_compact_klines_to_df(raw))
             return ([seg] if not seg.is_empty() else [], None)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- failure is returned to caller or parent worker
             return ([], e)
 
     frames: list[pl.DataFrame] = []
@@ -1260,7 +1259,7 @@ def fetch_intraday_universe_increment(
     tf = get_client()
     try:
         raw = tf.klines.intraday_universe(universe, count=count, as_dataframe=False)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("intraday universe fetch failed (%s): %s", universe, e)
         return (pl.DataFrame(), 0)
     seg = _compact_klines_to_df(raw)
@@ -1419,7 +1418,7 @@ def _fetch_minute_single(
             adjust="none" if raw_basis else "forward",
             as_dataframe=False, show_progress=False,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- logged fallback keeps independent work running
         logger.warning("fetch_minute_single(%s, %s) failed: %s", symbol, trade_date, e)
         return pl.DataFrame()
 

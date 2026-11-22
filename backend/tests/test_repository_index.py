@@ -1,4 +1,5 @@
 """指数资产路由 — repository 层测试。"""
+import datetime as _dt
 import os
 
 import polars as pl
@@ -83,7 +84,6 @@ def test_name_map_cache_invalidated_on_instruments_refresh(repo):
     assert repo.get_name_map(["301999.SZ"]) == {"301999.SZ": "新股股份"}
 
 
-import datetime as _dt
 
 
 def test_execute_one_releases_parquet_file(repo):

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -141,12 +142,10 @@ class JobStore:
                 encoding="utf-8",
             )
             os.replace(tmp, path)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("failed to write job file %s", path)
-            try:
+            with contextlib.suppress(OSError):
                 tmp.unlink()
-            except OSError:
-                pass
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
         """从磁盘读取单个 job 文件。"""
@@ -155,7 +154,7 @@ class JobStore:
             return None
         try:
             return json.loads(path.read_text("utf-8"))
-        except Exception:
+        except Exception:  # noqa: BLE001 -- logged fallback keeps independent work running
             logger.warning("failed to read job file %s", path)
             return None
 
@@ -163,7 +162,8 @@ class JobStore:
         """留出待写文件的位置，清理文件时同步移除历史摘要。"""
         try:
             files = sorted(self._store_dir.glob("*.json"), key=lambda f: f.stat().st_mtime)
-        except Exception:
+        except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+            logging.getLogger(__name__).debug("_delete_oldest: fallback (%s)", type(fallback_error).__name__)
             return
         # 覆盖 pending/running 的已有文件时，不额外占用历史记录名额。
         keep = self._max_jobs - int(not any(f.stem == writing_id for f in files))
@@ -174,7 +174,7 @@ class JobStore:
                 oldest.unlink()
                 if oldest.stem != writing_id:
                     deleted.add(oldest.stem)
-            except Exception:
+            except Exception:  # noqa: BLE001 -- logged fallback keeps independent work running
                 logger.warning("failed to delete old job file %s", oldest)
         if deleted:
             active_id, summaries = self._summary_snapshot
@@ -188,7 +188,8 @@ class JobStore:
                 job = json.loads(f.read_text("utf-8"))
                 _summary(job)
                 jobs.append(job)
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_job_files_sorted: fallback (%s)", type(fallback_error).__name__)
                 continue
         jobs.sort(key=lambda j: j.get("started_at") or "", reverse=True)
         return jobs
@@ -205,7 +206,8 @@ class JobStore:
         for f in self._store_dir.glob("*.json"):
             try:
                 j = json.loads(f.read_text("utf-8"))
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_reap_orphans: fallback (%s)", type(fallback_error).__name__)
                 continue
             if not isinstance(j, dict):
                 continue
@@ -217,7 +219,8 @@ class JobStore:
             try:
                 mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=UTC)
                 end = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
-            except Exception:
+            except Exception as fallback_error:  # noqa: BLE001 -- optional-data fallback; diagnostic records exception type only
+                logging.getLogger(__name__).debug("_reap_orphans: fallback (%s)", type(fallback_error).__name__)
                 end = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             # mtime 早于 started_at(时钟回拨等)时夹住, 避免 duration 为负
             if j.get("started_at") and end < j["started_at"]:
@@ -507,10 +510,8 @@ class JobStore:
             self._active_id = None
             self._summary_snapshot = None, ()
             for f in self._store_dir.glob("*.json"):
-                try:
+                with contextlib.suppress(Exception):
                     f.unlink()
-                except Exception:
-                    pass
         with _CANCEL_FLAGS_LOCK:
             _CANCEL_FLAGS.clear()
 
@@ -584,7 +585,7 @@ def run_with_capacity(job_id: str, fn: Callable[[], _Result]) -> _Result:
             job_id,
             f"排队等待重任务执行槽超时({int(wait_s)}s): 槽位可能被长回测或未正常退出的"
             "残留任务占用, 请稍后重试; 若持续出现请重启后端")
-        raise JobCancelledError(job_id)
+        raise JobCancelledError(job_id) from None
 
 
 # ================================================================
