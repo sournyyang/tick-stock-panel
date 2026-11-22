@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 import os
 import re
 import shutil
@@ -23,8 +26,13 @@ OPENAI_COMPAT_PROVIDER = "openai_compat"
 OPENAI_PROVIDER = "openai"
 CODEX_CLI_PROVIDER = "codex_cli"
 CODEX_DEFAULT_COMMAND = "codex"
+CODEX_MIN_TIMEOUT_SECONDS = 600.0
 CODEX_SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 OPENAI_DEFAULT_REASONING_EFFORT = "high"
+# OpenAI 系两种请求协议: chat.completions (兼容面最广) 与 Responses (官方新协议)。
+CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
+RESPONSES_PROTOCOL = "responses"
+_SUPPORTED_PROTOCOLS = {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}
 
 _CODEX_ENV_ALLOWLIST = (
     "PATH",
@@ -67,6 +75,13 @@ _CODEX_ENV_ALLOWLIST = (
 )
 
 Message = dict[str, str]
+
+logger = logging.getLogger(__name__)
+
+
+class AIToolProtocolError(RuntimeError):
+    """可直接展示的工具协议错误，不包含上游响应或子进程内部输出。"""
+
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -123,6 +138,24 @@ def current_ai_provider() -> str:
     return secrets_store.get_ai_config("ai_provider", settings.ai_provider) or OPENAI_COMPAT_PROVIDER
 
 
+def current_ai_protocol() -> str:
+    """当前 OpenAI 系请求协议: chat_completions (默认) | responses。
+
+    仅对 openai/openai_compat 两种 provider 有意义; Codex CLI 走本地子进程,
+    恒为 chat_completions。非法存储值一律回退默认, 不抛错。
+    """
+    if is_codex_cli_provider():
+        return CHAT_COMPLETIONS_PROTOCOL
+    value = str(
+        secrets_store.get_ai_config("ai_protocol", settings.ai_protocol) or ""
+    ).strip().lower()
+    return value if value in _SUPPORTED_PROTOCOLS else CHAT_COMPLETIONS_PROTOCOL
+
+
+def is_responses_protocol() -> bool:
+    return current_ai_protocol() == RESPONSES_PROTOCOL
+
+
 def current_openai_model() -> str:
     return secrets_store.get_ai_config("ai_model", settings.ai_model)
 
@@ -143,6 +176,33 @@ def current_ai_model() -> str:
     return current_openai_model()
 
 
+def current_reasoning_context_key() -> str:
+    """Bind saved reasoning to its provider, protocol, endpoint and model."""
+    identity = [current_ai_provider(), current_ai_protocol(), current_ai_model(),
+                normalize_openai_base_url(secrets_store.get_ai_config("ai_base_url", settings.ai_base_url))]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
+def prepare_tool_messages(messages: Sequence[dict], *, model: str, base_url: str) -> list[dict]:
+    """Keep vendor metadata private and tolerate old DeepSeek text-only history."""
+    prepared = []
+    context_key = None
+    deepseek = urlsplit(base_url).hostname == "api.deepseek.com" or model.lower().rsplit("/", 1)[-1].startswith("deepseek")
+    for source in messages:
+        message = dict(source)
+        origin = message.pop("reasoning_context", None)
+        if origin is not None:
+            context_key = context_key or current_reasoning_context_key()
+            if origin != context_key:
+                message.pop("reasoning_content", None)
+        if deepseek and message.get("role") == "assistant" and message.get("reasoning_content") is None:
+            # Older sessions never saved reasoning; the required field can only
+            # be empty for those messages. Never replace a recorded empty string.
+            message["reasoning_content"] = ""
+        prepared.append(message)
+    return prepared
+
+
 def current_openai_reasoning_effort() -> str:
     stored = secrets_store.load()
     if "ai_reasoning_effort" not in stored:
@@ -158,6 +218,11 @@ def current_ai_max_output_tokens() -> int:
 def current_ai_context_window() -> int:
     """当前 AI 输入上下文窗口上限 (约 token): secrets.json 优先, 否则 config 默认。"""
     return secrets_store.get_ai_config_int("ai_context_window", settings.ai_context_window)
+
+
+def current_ai_round_checkpoint() -> int:
+    """AI 助手工具轮次检查点 (0=不检查): secrets.json 优先, 否则 config 默认。"""
+    return secrets_store.get_ai_config_int("ai_round_checkpoint", settings.ai_round_checkpoint)
 
 
 def _resolve_max_tokens(max_tokens: int | None) -> int | None:
@@ -176,7 +241,7 @@ def _estimate_input_tokens(messages: Sequence[Message]) -> int:
     """粗略估算输入 token 数: 中文按 1 字 1 token, 其余按 4 字符 1 token。"""
     total = 0
     for m in messages:
-        text = str(m.get("content") or "")
+        text = str(m.get("content") or "") + str(m.get("reasoning_content") or "")
         cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
         total += cjk + (len(text) - cjk) // 4 + 1
     return max(1, total)
@@ -219,6 +284,13 @@ def current_codex_reasoning_effort() -> str:
 
 def is_codex_cli_provider(provider: str | None = None) -> bool:
     return (provider or current_ai_provider()) == CODEX_CLI_PROVIDER
+
+
+def supports_ai_tools(provider: str | None = None) -> bool:
+    """接入适配器是否支持工具协议；具体模型/CLI 的响应仍须运行期校验。"""
+    return (provider or current_ai_provider()) in {
+        OPENAI_PROVIDER, OPENAI_COMPAT_PROVIDER, CODEX_CLI_PROVIDER,
+    }
 
 
 def normalize_codex_model(model: str) -> str:
@@ -278,6 +350,8 @@ def codex_cli_available() -> bool:
     try:
         proc = subprocess.run(
             [*base, "--version"],
+            # Windows 桌面包无控制台, 不继承可能无效的标准输入句柄。
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=15,
             check=False,
@@ -311,13 +385,146 @@ async def generate_ai_text(
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
-        return await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
+        return await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, CODEX_MIN_TIMEOUT_SECONDS))
+    if is_responses_protocol():
+        from app.services import ai_responses
+
+        return await ai_responses.run_text(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
     return await _run_openai_once(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
     )
+
+
+async def generate_ai_text_with_tools(
+    messages: Sequence[dict],
+    tools: Sequence[dict],
+    *,
+    execute_tool,
+    temperature: float | None = 0.3,
+    max_tokens: int | None = 3000,
+    timeout: float = 180.0,
+    max_rounds: int = 4,
+) -> list[dict]:
+    """通用有界工具循环: 调用 → 执行调用方工具 → role:tool 回填 → 循环。
+
+    返回完整 messages (含 tool 往返)，可扫描 role:tool 重建执行证据。
+    轮次耗尽时可能停在工具结果，调用方须检查是否存在最终正文。
+    execute_tool 为 async (name, args) -> dict, 返回 {"ok": bool, "result"|"error"},
+    工具 schema 与执行回调由调用方注入，不依赖 AI 助手扩展或其工具目录。
+    OpenAI 两种协议及 Codex 结构化输出共用此循环；Codex 响应先做结构校验，
+    各工具的参数、权限和动作确认仍由调用方的执行回调负责。
+    """
+    if not supports_ai_tools():
+        raise AIToolProtocolError("当前 AI 接入不支持工具调用，请选择支持工具调用的 AI 接入方式")
+
+    max_tokens = _resolve_max_tokens(max_tokens)
+    if not tools:
+        raise ValueError("generate_ai_text_with_tools 需要至少一个工具 schema")
+
+    req_messages: list[dict] = [dict(m) for m in messages]
+    tool_schemas = list(tools)
+
+    for _ in range(max_rounds):
+        _check_input_budget(req_messages, max_tokens=max_tokens)
+        if is_codex_cli_provider():
+            from app.services import ai_codex_tools
+
+            message = await ai_codex_tools.run_message_once(
+                req_messages, tool_schemas, max_tokens=max_tokens, timeout=timeout,
+            )
+        elif is_responses_protocol():
+            from app.services import ai_responses
+
+            message = await ai_responses.run_message_once(
+                req_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                tools=tool_schemas,
+            )
+        else:
+            message = await _run_openai_message_once(
+                req_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                tools=tool_schemas,
+            )
+        if message is None:
+            return req_messages
+
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            # 模型不再请求工具, 产出最终文本, 结束循环。
+            assistant = {"role": "assistant", "content": message.content or ""}
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning is not None:
+                assistant["reasoning_content"] = reasoning
+            req_messages.append(assistant)
+            return req_messages
+
+        assistant = {
+            "role": "assistant",
+            "tool_calls": [_assistant_tool_call(tc) for tc in tool_calls],
+        }
+        if message.content:
+            assistant["content"] = message.content
+        # DeepSeek 思考模式要求工具轮的 reasoning_content 原样回传, 否则下一轮 400。
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning is not None:
+            assistant["reasoning_content"] = reasoning
+        req_messages.append(assistant)
+
+        for tc in tool_calls:
+            tool_result = await execute_tool(
+                tc.function.name,
+                _parse_tool_arguments(tc.function.arguments),
+            )
+            req_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+            )
+
+    return req_messages
+
+
+def _assistant_tool_call(tc) -> dict:
+    """SDK 返回的 tool_call 转成回传用的 dict; Gemini 3 的 extra_content
+    (thought_signature) 需原样带回, 否则下一轮被上游 400 拒绝。"""
+    item = {
+        "id": tc.id,
+        "type": getattr(tc, "type", "function"),
+        "function": {
+            "name": tc.function.name,
+            "arguments": tc.function.arguments,
+        },
+    }
+    extra = getattr(tc, "extra_content", None)
+    if extra:
+        item["extra_content"] = extra
+    return item
+
+
+def _parse_tool_arguments(raw: str) -> dict:
+    """把 tool call 的 arguments JSON 字符串解析为 dict, 解析失败返回空 dict。"""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 async def stream_ai_text(
@@ -339,7 +546,19 @@ async def stream_ai_text(
     max_tokens = _resolve_max_tokens(max_tokens)
     _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
-        yield await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
+        yield await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, CODEX_MIN_TIMEOUT_SECONDS))
+        return
+
+    if is_responses_protocol():
+        from app.services import ai_responses
+
+        async for chunk in ai_responses.stream_text(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        ):
+            yield chunk
         return
 
     async for chunk in _stream_openai(
@@ -359,14 +578,43 @@ async def _run_openai_once(
     max_tokens: int | None,
     timeout: float,
 ) -> str:
+    message = await _run_openai_message_once(
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    if message is None:
+        return ""
+    return (message.content or "").strip()
+
+
+async def _run_openai_message_once(
+    messages: Sequence[Message],
+    *,
+    temperature: float | None,
+    max_tokens: int | None,
+    timeout: float,
+    tools: Sequence[dict] | None = None,
+):
+    """一次 OpenAI create() 调用, 返回完整 message (含 tool_calls, 而非仅 content)。
+
+    _run_openai_once 只取 .content; 工具循环需要 .tool_calls 以回填 role:tool,
+    故在此返回完整消息对象。tools 非空时以 tools= 透传, 否则走纯文本路径。
+    """
     ai_key = secrets_store.get_ai_key()
     if not ai_key:
         raise RuntimeError("AI API Key 未配置, 请在设置页配置")
 
     client = _openai_client(ai_key, timeout)
     model = current_ai_model()
-    req_messages = list(messages)
-    kwargs = _openai_kwargs(temperature=temperature, max_tokens=max_tokens)
+    req_messages = (
+        prepare_tool_messages(
+            messages, model=model,
+            base_url=secrets_store.get_ai_config("ai_base_url", settings.ai_base_url),
+        ) if tools else list(messages)
+    )
+    kwargs = _openai_kwargs(temperature=temperature, max_tokens=max_tokens, tools=tools)
     while True:
         try:
             resp = await client.chat.completions.create(
@@ -384,8 +632,8 @@ async def _run_openai_once(
                 raise RuntimeError(_format_openai_error(exc)) from exc
             raise
     if not resp.choices:
-        return ""
-    return (resp.choices[0].message.content or "").strip()
+        return None
+    return resp.choices[0].message
 
 
 async def _stream_openai(
@@ -495,9 +743,78 @@ def _openai_client(api_key: str, timeout: float):
         api_key=api_key,
         base_url=normalize_openai_base_url(secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)),
         timeout=timeout,
+        # SDK 层重试仅覆盖首包前的连接错误/超时/429/5xx, 此时尚未产出任何内容,
+        # 重试安全; 首 chunk 之后的断流不在此列, 由上层协议报错处理。
+        # 根因: DeepSeek 等上游高峰过载时首包失败率高, max_retries=0 导致一次抖动即终止。
+        max_retries=2,
+        default_headers={"User-Agent": user_agent},
+    )
+
+
+async def _probe_codex_cli(*, model: str = "", timeout: float = 90.0) -> str:
+    """Codex CLI 真实连通性探测: 跑一次最小 exec 验证命令与登录态。
+
+    旧实现只验 `codex --version` — 命令存在但未登录 (auth.json 缺失) 时
+    「测试连接」通过、实际调用全 401。探测与正式调用共用 _run_codex_cli,
+    鉴权/端点/模型问题在测试阶段即暴露, 失败信息含登录指引。
+    """
+    if not codex_cli_available():
+        raise RuntimeError("Codex CLI 不可用: 未找到可运行的 codex 命令, 请先安装 Codex CLI")
+    return await _run_codex_cli(
+        [{"role": "user", "content": "Reply exactly: OK"}],
+        max_tokens=16,
+        timeout=timeout,
+        model_override=model,
+    )
+
+
+async def probe_ai_config(
+    *,
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    protocol: str = "",
+    timeout: float = 20.0,
+) -> str:
+    """草稿配置一次性连通性探测 — 不读写任何配置状态。
+
+    「测试」必须与「保存」解耦: 旧实现先保存草稿再测试, 测试失败时坏配置
+    已经落盘并被状态栏展示为已连接。本函数用表单值直接建临时客户端发一条
+    最小消息, 成功与否都不触碰 secrets。
+
+    与正式调用共用 base URL 规范化与协议分支 (chat.completions / responses);
+    不传输出上限/温度等可选参数, 规避 max_tokens 与 max_completion_tokens 等
+    模型差异。返回模型可见文本 (推理模型可能为空串 — 200 即证明鉴权/端点/
+    模型可用); 传输层异常原样抛出, 由调用方格式化后回报。
+    """
+    if provider == CODEX_CLI_PROVIDER:
+        return await _probe_codex_cli(model=model)
+    if not api_key:
+        raise RuntimeError("未配置 API Key")
+    if not base_url:
+        raise ValueError("请先填写 API 地址")
+    if not model:
+        raise ValueError("请先填写模型名称")
+
+    from openai import AsyncOpenAI
+
+    user_agent = secrets_store.get_ai_config("ai_user_agent", "") or settings.ai_user_agent
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=normalize_openai_base_url(base_url),
+        timeout=timeout,
         max_retries=0,
         default_headers={"User-Agent": user_agent},
     )
+    prompt = [{"role": "user", "content": "Reply exactly: OK"}]
+    if protocol == RESPONSES_PROTOCOL:
+        resp = await client.responses.create(model=model, input=prompt)
+        return str(getattr(resp, "output_text", "") or "")
+    resp = await client.chat.completions.create(model=model, messages=prompt)
+    if not getattr(resp, "choices", None):
+        return ""
+    return str(resp.choices[0].message.content or "")
 
 
 # 不同模型可能拒绝 temperature 或 reasoning_effort。这里不靠模型名猜测,
@@ -574,6 +891,7 @@ def _openai_kwargs(
     model: str = "",
     base_url: str = "",
     prefer_final_answer: bool = False,
+    tools: Sequence[dict] | None = None,
 ) -> dict:
     """Build OpenAI create() kwargs and map supported provider capabilities.
 
@@ -598,6 +916,8 @@ def _openai_kwargs(
         # hidden reasoning shares max_tokens with the final answer and can
         # exhaust the budget before any visible content is emitted.
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    if tools:
+        kwargs["tools"] = list(tools)
     return kwargs
 
 
@@ -691,13 +1011,44 @@ def _compact_error_text(text: str) -> str:
     return text[:500]
 
 
+# 词边界约束: 裸 "401" 会把输出正文里任意含 401 的数字串 (如模型回复文本)
+# 误判成鉴权失败, 附出不相关的 codex login 指引; 词边界只排除数字粘连,
+# 真实鉴权报错 ("401 Unauthorized"/"status 401") 不受影响。
+_CODEX_AUTH_FAILURE_RE = re.compile(
+    r"\b401\b|\bunauthorized\b|\bnot logged in\b|\bmissing bearer\b|\blogin required\b",
+    re.IGNORECASE,
+)
+
+
+def _codex_missing_auth_hint() -> str:
+    """auth.json 缺失时的登录指引; 存在则返回空串。
+
+    新版 Codex 凭证可存系统钥匙串 (cli_auth_credentials_store=keyring/auto),
+    Codex Desktop 登录不落 auth.json; 隔离 CODEX_HOME 只复制 auth.json, 这类
+    登录态复制不到, 用户面对裸 401/超时无从下手。
+    """
+    try:
+        if (_codex_home() / "auth.json").exists():
+            return ""
+    except OSError:
+        pass
+    return (
+        "本机 Codex 登录态不可用: ~/.codex/auth.json 不存在 (新版 Codex 凭证可能存在"
+        "系统钥匙串, 隔离运行无法复用)。请在终端执行 codex login, 或 "
+        "printenv OPENAI_API_KEY | codex login --with-api-key 生成 auth.json 后重试"
+    )
+
+
 async def _run_codex_cli(
     messages: Sequence[Message],
     *,
     max_tokens: int | None,
     timeout: float,
+    model_override: str | None = None,
+    output_schema: dict | None = None,
 ) -> str:
     prompt = _codex_prompt(messages, max_tokens=max_tokens)
+    _sweep_stale_codex_run_dirs()
     run_path = Path(tempfile.mkdtemp(prefix="tickflow-codex-run-"))
     try:
         codex_home_path = run_path / "codex-home"
@@ -705,7 +1056,10 @@ async def _run_codex_cli(
         codex_home_path.mkdir()
         workspace_path.mkdir()
         output_path = codex_home_path / "last-message.txt"
-        _prepare_codex_home(codex_home_path)
+        if model_override is None:
+            _prepare_codex_home(codex_home_path)
+        else:
+            _prepare_codex_home(codex_home_path, model_override=model_override)
 
         # 不传 --ephemeral: 老版本 codex(如 0.58)无此参数, 传了直接报
         # unexpected argument; 会话隔离已由一次性临时 CODEX_HOME 保证(跑完即删)。
@@ -720,27 +1074,42 @@ async def _run_codex_cli(
             "--output-last-message",
             str(output_path),
         ]
-        model = current_ai_model().strip()
+        if output_schema is not None:
+            schema_path = run_path / "output-schema.json"
+            schema_path.write_text(json.dumps(output_schema, ensure_ascii=False), encoding="utf-8")
+            args.extend(["--output-schema", str(schema_path)])
+        model = (current_ai_model() if model_override is None else model_override).strip()
         if model:
             args.extend(["--model", model])
         args.extend(["--cd", str(workspace_path), "-"])
 
         env = _codex_process_env(codex_home_path)
 
-        returncode, stdout, stderr = await asyncio.to_thread(
-            _run_codex_process,
-            args,
-            prompt,
-            env,
-            timeout,
-        )
+        try:
+            returncode, stdout, stderr = await asyncio.to_thread(
+                _run_codex_process,
+                args,
+                prompt,
+                env,
+                timeout,
+            )
+        except RuntimeError as exc:
+            # 调用超时: 无凭证时 codex 会反复重试表现为长时间挂起 — auth.json
+            # 缺失时附登录指引, 与 401 失败路径同一提示。
+            hint = _codex_missing_auth_hint()
+            raise RuntimeError(f"{exc}\n{hint}" if hint else str(exc)) from None
 
         out = _clean_process_text(stdout)
         err = _clean_process_text(stderr)
         final_message = _read_output_file(output_path)
         if returncode != 0:
             detail = err or out or f"exit code {returncode}"
-            raise RuntimeError(f"Codex CLI 调用失败: {detail[-1200:]}")
+            message = f"Codex CLI 调用失败: {detail[-1200:]}"
+            if _CODEX_AUTH_FAILURE_RE.search(detail):
+                hint = _codex_missing_auth_hint()
+                if hint:
+                    message = f"{message}\n{hint}"
+            raise RuntimeError(message)
         result = final_message or out
         if not result:
             raise RuntimeError("Codex CLI 未返回内容")
@@ -755,6 +1124,7 @@ def _run_codex_process(
     env: dict[str, str],
     timeout: float,
 ) -> tuple[int, bytes, bytes]:
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             list(args),
@@ -765,12 +1135,27 @@ def _run_codex_process(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Codex CLI 调用超时, 请稍后重试或检查本机 Codex 登录状态") from exc
+        stderr = _clean_process_text(exc.stderr or b"")
+        logger.warning(
+            "Codex CLI timed out: elapsed_s=%.1f timeout_s=%g prompt_chars=%d "
+            "structured=%s retry_indicated=%s auth_failure_indicated=%s",
+            time.monotonic() - started, timeout, len(prompt), "--output-schema" in args,
+            any(hint in stderr.lower() for hint in ("reconnecting", "retrying", "stream disconnected")),
+            bool(_CODEX_AUTH_FAILURE_RE.search(stderr)),
+        )
+        raise RuntimeError(
+            f"Codex CLI 调用超时({timeout:g} 秒), 本轮生成已终止。"
+            "可重试, 或在 AI 设置中降低 Codex 推理强度。"
+        ) from exc
+    logger.info(
+        "Codex CLI completed: elapsed_s=%.1f timeout_s=%g prompt_chars=%d structured=%s returncode=%d",
+        time.monotonic() - started, timeout, len(prompt), "--output-schema" in args, proc.returncode,
+    )
     return proc.returncode, proc.stdout, proc.stderr
 
 
 def _codex_process_env(codex_home_path: Path) -> dict[str, str]:
-    """Pass only OS, locale, certificate, and proxy settings to Codex."""
+    """Pass OS settings and the explicitly configured provider credential to Codex."""
     env: dict[str, str] = {}
     seen: set[str] = set()
     for name in _CODEX_ENV_ALLOWLIST:
@@ -781,6 +1166,13 @@ def _codex_process_env(codex_home_path: Path) -> dict[str, str]:
         if value:
             env[name] = value
             seen.add(normalized)
+    provider = _active_codex_provider(_read_codex_config())
+    if provider:
+        key = provider[1].get("env_key")
+        if isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
     env["NO_COLOR"] = "1"
     env["CODEX_HOME"] = str(codex_home_path)
     return env
@@ -826,6 +1218,32 @@ def _make_writable_and_retry(
         func(path)
     except OSError:
         raise exc_info[1] from None
+
+
+_stale_sweep_done = False
+
+
+def _sweep_stale_codex_run_dirs(*, max_age_s: float = 3600.0, force: bool = False) -> None:
+    """清理历史进程遗留的 tickflow-codex-run-* 临时目录 (每进程一次)。
+
+    进程退出/请求取消可能中断 finally 清理, 留下空目录壳长期累积 (实测
+    每次失败调用都可能漏一个)。新任务开跑前扫一遍 tempdir; 只动超过
+    max_age_s 的同前缀目录, 不碰并发进程的活动目录。
+    """
+    global _stale_sweep_done
+    if _stale_sweep_done and not force:
+        return
+    _stale_sweep_done = True
+    try:
+        cutoff = time.time() - max_age_s
+        for path in Path(tempfile.gettempdir()).glob("tickflow-codex-run-*"):
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    _remove_tree_best_effort(path)
+            except OSError:
+                continue
+    except OSError:
+        pass
 
 
 def _codex_prompt(messages: Sequence[Message], *, max_tokens: int | None) -> str:
@@ -875,6 +1293,8 @@ def _resolve_command(command: str) -> str | None:
         resolved = shutil.which(f"{command}.cmd")
     if not resolved and sys.platform == "win32":
         resolved = _resolve_windows_codex_command(command)
+    if not resolved and sys.platform == "darwin":
+        resolved = _resolve_macos_codex_command()
     return resolved
 
 
@@ -907,6 +1327,41 @@ def _resolve_windows_codex_command(command: str) -> str | None:
     return None
 
 
+# macOS GUI 启动的应用只继承最小 PATH (/usr/bin:/bin:...), npm/brew/官方
+# 安装脚本装的 codex 与 ChatGPT.app 内置 CLI 都不在其中 — 与 Windows 的
+# _resolve_windows_desktop_codex 对称, 显式探测常见落位。测试可打桩覆盖。
+_MACOS_SYSTEM_APPLICATIONS = Path("/Applications")
+_MACOS_CODEX_BIN_DIRS = (
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
+
+def _resolve_macos_codex_command() -> str | None:
+    """Find Codex CLI in common macOS locations when the process PATH misses it."""
+    candidates: list[Path] = [Path.home() / ".local" / "bin" / "codex"]
+    for bin_dir in _MACOS_CODEX_BIN_DIRS:
+        candidates.append(bin_dir / "codex")
+    # Codex Desktop (ChatGPT.app) 内置 CLI — 与 ~/.codex 登录态配套
+    for apps in (_MACOS_SYSTEM_APPLICATIONS, Path.home() / "Applications"):
+        cli_root = apps / "ChatGPT.app" / "Contents" / "Resources" / "codex-cli"
+        candidates.append(cli_root / "CodexCLI.app" / "Contents" / "MacOS" / "codex")
+        try:
+            if cli_root.is_dir():
+                candidates.extend(sorted(cli_root.glob("*.app/Contents/MacOS/codex")))
+        except OSError:
+            continue
+    for candidate in candidates:
+        try:
+            # 与 shutil.which 同口径校验可执行位: 只查 is_file 会解析到同名
+            # 不可执行文件, 运行时报错不直观
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
 def _resolve_windows_desktop_codex() -> str | None:
     """Prefer the Codex Desktop bundled CLI over an older npm shim."""
     local_appdata = os.environ.get("LOCALAPPDATA")
@@ -928,20 +1383,20 @@ def _resolve_windows_desktop_codex() -> str | None:
     return str(newest)
 
 
-def _prepare_codex_home(target: Path) -> None:
+def _prepare_codex_home(target: Path, *, model_override: str | None = None) -> None:
     """Create an isolated CODEX_HOME that reuses auth but not fragile config."""
     source = _codex_home()
     auth_file = source / "auth.json"
     if auth_file.exists():
         shutil.copy2(auth_file, target / "auth.json")
-    _write_compatible_codex_config(target / "config.toml")
+    _write_compatible_codex_config(target / "config.toml", model_override=model_override)
 
 
 def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
-def _write_compatible_codex_config(path: Path) -> None:
+def _write_compatible_codex_config(path: Path, *, model_override: str | None = None) -> None:
     config = _read_codex_config()
     lines: list[str] = []
     active_provider = _active_codex_provider(config)
@@ -953,7 +1408,9 @@ def _write_compatible_codex_config(path: Path) -> None:
     if isinstance(openai_base_url, str) and openai_base_url:
         lines.append(_toml_string("openai_base_url", openai_base_url))
 
-    model = current_ai_model() or normalize_codex_model(str(config.get("model") or ""))
+    model = (current_ai_model() if model_override is None else model_override) or normalize_codex_model(
+        str(config.get("model") or "")
+    )
     if model:
         lines.append(_toml_string("model", model))
 
@@ -970,7 +1427,7 @@ def _write_compatible_codex_config(path: Path) -> None:
         provider_name, provider = active_provider
         lines.append("")
         lines.append(f"[model_providers.{_toml_key(provider_name)}]")
-        for key in ("name", "base_url", "wire_api", "experimental_bearer_token"):
+        for key in ("name", "base_url", "wire_api", "experimental_bearer_token", "env_key"):
             value = provider.get(key)
             if isinstance(value, str) and value:
                 lines.append(_toml_string(key, value))

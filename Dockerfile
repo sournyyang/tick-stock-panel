@@ -73,11 +73,14 @@ WORKDIR /app
 
 # Node.js/npm: 仅在启用 stock-sdk 时安装, 供桥接运行及页面安装/重装依赖使用。
 # Codex CLI 从官方 npm 包提取原生二进制，不依赖运行时 Node.js。
-# 系统源提供 Node.js >=18; --no-install-recommends 精简,
-# 自带 libnode/libc-ares 等全部动态依赖, 无需手动补库。
-# 国内构建走 apt mirror 已在 debian 镜像sources.list 配好, 无需额外换源。
-# tesseract-ocr: 自选截图导入（始终安装）; nodejs/npm: 仅 INCLUDE_STOCKSDK=1 时安装
-RUN apt-get update \
+# 国内构建换 apt 阿里云镜像 (bookworm deb822 格式)。官方 python slim 镜像的
+# sources 指向 deb.debian.org, 部分国内网络下 apt 极慢(实测阿里云 ECS 拉官方源
+# 单阶段可达 8 分钟以上); USE_CN_MIRROR 与 npm/pypi 的换源开关注一脉相承。
+# tesseract-ocr: 自选截图导入（始终安装）
+RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
     && if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
          apt-get install -y --no-install-recommends nodejs npm \
@@ -117,7 +120,7 @@ RUN --mount=type=cache,id=tickflow-stock-panel-uv,target=/root/.cache/uv \
 # Backend code
 # 注意:Docker 里 WORKDIR=/app, 而 config.py 的 _PROJECT_ROOT 是按开发布局
 # (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
-# 三个关键路径, 确保 static / tiers / data 都指向容器内正确位置。
+# 三个关键路径；TSP_DOCKER 也确保 env_file 中的相对 DATA_DIR 按 /app 解析。
 COPY backend/app ./app
 # stock-sdk 插件依赖: 从 stocksdk-builder 拷入。
 # INCLUDE_STOCKSDK=0(默认) 时, stocksdk-builder 产出空目录,此处拷入空目录,
@@ -125,13 +128,25 @@ COPY backend/app ./app
 # COPY --from 不受 .dockerignore 的 **/node_modules 规则影响。
 COPY --from=stocksdk-builder /build/node_modules ./app/plugins/stocksdk/node_modules
 COPY tiers.yaml /app/tiers.yaml
+# 版本号运行时兜底 (issue #513): 非冻结路径 _load_version() 读
+# /app/frontend/package.json, 缺文件会静默回退 _FALLBACK_VERSION 显示旧版本。
+COPY frontend/package.json /app/frontend/package.json
 ENV STATIC_DIR=/app/static \
     TIERS_YAML=/app/tiers.yaml \
     DATA_DIR=/app/data \
+    TSP_DOCKER=1 \
     TICKFLOW_ENV_FILE=/app/.env
 
 # Frontend 静态产物
 COPY --from=frontend-builder /build/dist ./static
+
+# 升级保护清单: 全量程序文件 sha256 基线 (二次开发升级对比用)。
+# 必须在 app/ 与 static/ 都落位之后生成; .venv/data 等由脚本排除规则剔除。
+# 版本号唯一权威 = frontend/package.json (与 app/__init__._load_version 同源)。
+COPY scripts/generate_manifest.py /tmp/generate_manifest.py
+COPY frontend/package.json /tmp/package.json
+RUN APP_VER=$(python3 -c "import json;print(json.load(open('/tmp/package.json'))['version'])") && \
+    python3 /tmp/generate_manifest.py --root /app --output /app/app/upgrade_manifest.json --version "$APP_VER"
 
 # Codex CLI 使用官方 npm 包携带的当前平台原生二进制，无需运行时 Node.js。
 COPY --from=codex-builder /opt/codex-native /usr/local/bin/codex

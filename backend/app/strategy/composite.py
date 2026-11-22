@@ -1,11 +1,11 @@
-"""叠加策略合并器 — 选股与回测共用的纯函数。
+"""叠加策略合并器 — 策略与回测共用的纯函数。
 
-为什么单独成模块: 选股(StrategyEngine._run_composite_strategy)和回测
+为什么单独成模块: 策略(StrategyEngine._run_composite_strategy)和回测
 (StrategyBacktestService)都要合并子策略结果, 必须共享同一套口径, 否则会出现
-"选股与回测使用不同逻辑"的金融错误(CONTRIBUTING §5.1)。
+"策略与回测使用不同逻辑"的金融错误(CONTRIBUTING §5.1)。
 
 两种合并入口:
-- merge_results: 选股合并。输入各子 StrategyResult, 输出合并后的 StrategyResult。
+- merge_results: 策略合并。输入各子 StrategyResult, 输出合并后的 StrategyResult。
 - merge_signal_matrices: 回测合并。输入各子 SignalMatrix, 输出合并后的 SignalMatrix。
 
 合并语义(首版):
@@ -53,7 +53,7 @@ def merge_results(
     strategy_id: str,
     elapsed_ms: float = 0.0,
 ) -> StrategyResult:
-    """选股合并: 按 symbol 聚合各子结果, 标准化排名加权融合 score。
+    """策略合并: 按 symbol 聚合各子结果, 标准化排名加权融合 score。
 
     Args:
         results: 各子策略的 StrategyResult(顺序与 children_weights 对齐)
@@ -80,7 +80,12 @@ def merge_results(
             ordered = sorted(symbols, key=lambda s: res.scores[s], reverse=True)
             count = len(ordered)
             for rank, sym in enumerate(ordered, start=1):
-                norm[sym] = 1 - (rank - 1) / max(count - 1, 1)
+                # 单候选无法排名, 必须用中性分: 当成"最优=1"会凭空抬高融合分,
+                # 而回测合并 (merge_signal_matrices 的 n <= 1 分支) 用的是中性分,
+                # 两条路径同一天同一标的会给出不同评分与排序。
+                norm[sym] = (
+                    _NEUTRAL_NORM if count <= 1 else 1 - (rank - 1) / (count - 1)
+                )
         else:
             # 子策略未产出 score: 命中即中性分, 不奖励也不惩罚。
             for row in res.rows:
@@ -174,6 +179,9 @@ def merge_signal_matrices(
     返回合并后的 SignalMatrix。
     """
     from app.backtest.matrix import make_signal_matrix
+
+    if any(s.entry_close_floor is not None for s in sigs):
+        raise ValueError("带持仓绑定防守线的策略不能用于叠加策略")
 
     n_times, n_assets = shape
     n_children = len(sigs)

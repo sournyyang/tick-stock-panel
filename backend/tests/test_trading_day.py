@@ -68,6 +68,59 @@ def test_all_probes_unknown_returns_none(monkeypatch):
     assert is_trading_day(monday) is None
 
 
+def test_concurrent_cold_oracle_requests_share_one_upstream_probe(monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(20)
+    calls = []
+    monday = datetime(2026, 9, 7, 10, 0, tzinfo=CN)
+
+    def probe(now):
+        calls.append(1)
+        time.sleep(0.05)
+        return False
+
+    monkeypatch.setattr(trading_day, "_probe_fuyao", probe)
+    monkeypatch.setattr(trading_day, "_probe_tickflow", lambda now: None)
+
+    def request(_):
+        barrier.wait(3)
+        return is_trading_day(monday)
+
+    with ThreadPoolExecutor(20) as pool:
+        assert list(pool.map(request, range(20))) == [False] * 20
+    assert calls == [1]
+
+
+def test_slow_oracle_followers_degrade_to_unknown_without_duplicate_probes(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    monday = datetime(2026, 9, 7, 10, 0, tzinfo=CN)
+
+    def probe(now):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return False
+
+    monkeypatch.setattr(trading_day, "_probe_fuyao", probe)
+    with ThreadPoolExecutor(1) as pool:
+        owner = pool.submit(is_trading_day, monday)
+        assert entered.wait(1)
+        try:
+            assert is_trading_day(monday) is None
+            assert calls == [1]
+        finally:
+            release.set()
+        assert owner.result(1) is False
+    assert is_trading_day(monday) is False
+
+
 # ---- tickflow 戳语义 ----
 
 def test_tickflow_stale_stamp_before_buffer_is_unknown(monkeypatch):
@@ -254,3 +307,25 @@ def test_fuyao_provider_trading_days_conversion(monkeypatch):
     monkeypatch.setattr(fp, "get_api_key", lambda: "test-key")
     days = FuyaoProvider().trading_days()
     assert days == {date(2026, 9, 4), date(2026, 9, 7)}
+
+
+def test_unknown_verdict_is_cached_within_short_ttl(monkeypatch):
+    """未知结论也要按 _TTL_UNKNOWN_S 缓存: 轮询每拍重探会重复打 tickflow 请求。"""
+    monday = datetime(2026, 9, 7, 10, 0, tzinfo=CN)
+    calls = {"fuyao": 0, "tickflow": 0}
+
+    def _fuyao(now):
+        calls["fuyao"] += 1
+        return None
+
+    def _tickflow(now):
+        calls["tickflow"] += 1
+        return None
+
+    monkeypatch.setattr(trading_day, "_probe_fuyao", _fuyao)
+    monkeypatch.setattr(trading_day, "_probe_tickflow", _tickflow)
+
+    assert is_trading_day(monday) is None
+    assert is_trading_day(monday) is None
+    assert is_trading_day(monday) is None
+    assert calls == {"fuyao": 1, "tickflow": 1}

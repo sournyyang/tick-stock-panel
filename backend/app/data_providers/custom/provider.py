@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,7 @@ import httpx
 import polars as pl
 
 from app.config import settings
-from app.data_providers.base import AssetType
+from app.data_providers.base import AssetType, ProviderRequestError
 from app.data_providers.custom.config import CustomSourceConfig, DatasetConfig
 from app.data_providers.custom.mapper import (
     apply_transforms,
@@ -21,7 +21,9 @@ from app.data_providers.custom.mapper import (
     extract_rows,
     map_rows,
 )
+from app.data_providers.minute_stream import RequestPacer
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
+from app.market_time import cn_now
 from app.tickflow.rate_limits import chunked, sleep_between_batches
 
 logger = logging.getLogger(__name__)
@@ -30,9 +32,13 @@ _REQUIRED = {
     "daily": {"symbol", "date", "open", "high", "low", "close", "volume", "amount"},
     "adj_factor": {"symbol", "trade_date", "ex_factor"},
     "realtime": {"symbol", "last_price", "prev_close", "open", "high", "low", "volume"},
-    "minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
+    "minute": {"symbol", "datetime", "open", "high", "low", "close", "volume"},
     # full_minute (全量分钟) 与 minute 同形: 当日窗口批量拉取, 字段映射一致
-    "full_minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
+    "full_minute": {"symbol", "datetime", "open", "high", "low", "close", "volume"},
+    "depth5": {"symbol", "asks", "bids"},
+    # minute/full_minute 的 amount(成交额)按契约可空 (docs/plugin-development.md:
+    # 无法提供可靠成交额时应返回 null 不得伪造, 均价线降级显示 —), 不列为必填 —
+    # 否则缺成交额的源整个被 validate 拒绝, 保存后源从列表消失
     # financial 字段由数据源决定, 只要求能映射出 symbol
     "financial": {"symbol"},
 }
@@ -97,6 +103,7 @@ class GenericHTTPProvider:
         self.config = config
         self.name = config.name
         self._client = httpx.Client(timeout=30.0)
+        self._minute_pacer = RequestPacer()
 
     def close(self) -> None:
         self._client.close()
@@ -112,12 +119,19 @@ class GenericHTTPProvider:
                 missing = sorted(required - mapped)
                 if missing:
                     errors.append(f"{dataset}: missing mapped fields: {', '.join(missing)}")
+            # 两个外部字段映射同一内部列: rename 阶段 DuplicateError → 整表拉空,
+            # 保存时拦截给明确提示 (前端映射行允许选重, 不拦会静默失败难排查)。
+            targets = list(cfg.field_map.values())
+            dup_targets = sorted({t for t in targets if targets.count(t) > 1})
+            if dup_targets:
+                errors.append(f"{dataset}: duplicate mapped target fields: {', '.join(dup_targets)}")
             if cfg.pct_unit is not None:
                 if dataset != "realtime":
                     errors.append(f"{dataset}: pct_unit 仅用于 realtime 数据集")
                 elif cfg.pct_unit not in ("percent", "decimal"):
                     errors.append(f"{dataset}: pct_unit 必须是 percent 或 decimal")
-            if dataset != "realtime":
+            # depth5/financial 逐批只注入代码参数, 起止时间不参与请求, 不纳入重名检查
+            if dataset not in {"realtime", "depth5", "financial"}:
                 request_params = [cfg.symbols_param, cfg.start_param, cfg.end_param]
                 if dataset in {"minute", "full_minute"}:
                     request_params.extend(
@@ -247,6 +261,36 @@ class GenericHTTPProvider:
             return []
         return df.to_dicts()
 
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """Return normalized five-level order books keyed by symbol."""
+        cfg = self._dataset("depth5")
+        result: dict[str, dict] = {}
+        chunks = chunked(symbols, cfg.batch)
+        for i, chunk in enumerate(chunks):
+            sleep_between_batches(i, cfg.rpm)
+            try:
+                rows = self._request_rows_retry(cfg, chunk)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "custom depth5: batch %d/%d failed (%d symbols), skipped: %s",
+                    i + 1, len(chunks), len(chunk), e,
+                )
+                continue
+            df = self._mapped_frame(cfg, rows)
+            for row in df.to_dicts():
+                symbol = row.get("symbol")
+                if not symbol:
+                    continue
+                asks = _normalize_depth_levels(row.get("asks"))
+                bids = _normalize_depth_levels(row.get("bids"))
+                result[str(symbol)] = {
+                    "asks": asks,
+                    "bids": bids,
+                    "ask_volumes": [level[1] for level in asks],
+                    "bid_volumes": [level[1] for level in bids],
+                }
+        return result
+
     def get_minute(
         self,
         symbols: list[str],
@@ -263,7 +307,15 @@ class GenericHTTPProvider:
         配置的参数名注入请求 (GET → params, POST → body), 用于上游需区分
         stock/ETF/index 或固定频率的场景。
         """
-        return self._fetch_minute_dataset(
+        frames = list(self.iter_minute(symbols, start_time, end_time, asset_type, freq, on_chunk_done))
+        parts = [frame for frame in frames if not frame.is_empty()]
+        return pl.concat(parts, how="diagonal_relaxed") if parts else pl.DataFrame()
+
+    def iter_minute(
+        self, symbols: list[str], start_time: datetime | None, end_time: datetime | None,
+        asset_type: AssetType = "stock", freq: str = "1m", on_chunk_done=None,
+    ) -> Iterator[pl.DataFrame]:
+        yield from self._iter_minute_dataset(
             "minute", symbols, start_time, end_time, asset_type, freq, on_chunk_done,
         )
 
@@ -279,9 +331,12 @@ class GenericHTTPProvider:
         传当日值。稳态增量 (get_intraday_latest) YAML 声明式源不提供 — 服务自动
         降级为仅修复轮模式并放慢节奏。
         """
-        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # 当日窗口按北京时间墙钟 (naive, 与分钟K契约及 kline_sync.fetch_intraday_custom_batch
+        # 回退路径同口径): datetime.now() 取服务器本地时区, UTC 主机上窗口整体早 8 小时
+        end = cn_now().replace(tzinfo=None)
+        start = end.replace(hour=0, minute=0, second=0, microsecond=0)
         return self._fetch_minute_dataset(
-            "full_minute", symbols, start, datetime.now(), asset_type, "1m", None,
+            "full_minute", symbols, start, end, asset_type, "1m", None,
         )
 
     def _fetch_minute_dataset(
@@ -294,27 +349,39 @@ class GenericHTTPProvider:
         freq: str = "1m",
         on_chunk_done: Callable[[int, int], None] | None = None,
     ) -> pl.DataFrame:
+        parts = [df for df in self._iter_minute_dataset(
+            ds_name, symbols, start_time, end_time, asset_type, freq, on_chunk_done,
+        ) if not df.is_empty()]
+        return pl.concat(parts, how="diagonal_relaxed") if parts else pl.DataFrame()
+
+    def _iter_minute_dataset(
+        self, ds_name: str, symbols: list[str], start_time: datetime | None,
+        end_time: datetime | None, asset_type: AssetType, freq: str, on_chunk_done,
+    ) -> Iterator[pl.DataFrame]:
+        if not symbols:
+            return
         cfg = self._dataset(ds_name)
         override: dict[str, Any] = {}
         if cfg.asset_type_param:
             override[cfg.asset_type_param] = asset_type
         if cfg.freq_param:
             override[cfg.freq_param] = freq
-        frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
         for i, chunk in enumerate(chunks):
-            sleep_between_batches(i, cfg.rpm)
-            rows = self._request_rows(
-                cfg, symbols=chunk, start_time=start_time, end_time=end_time,
-                override_params=override or None, override_body=override or None,
-            )
+            self._minute_pacer.wait(ds_name, cfg.rpm,
+                                    (lambda cur=i: on_chunk_done(cur, len(chunks))) if on_chunk_done else None)
+            try:
+                rows = self._request_rows(
+                    cfg, symbols=chunk, start_time=start_time, end_time=end_time,
+                    override_params=override or None, override_body=override or None,
+                )
+            except Exception as exc:  # history failures must reach the task
+                raise ProviderRequestError(f"自定义源 {self.name} 分钟请求失败: {type(exc).__name__}") from exc
             df = self._mapped_frame(cfg, rows)
             df = self._normalize_minute(df)
-            if not df.is_empty():
-                frames.append(df)
+            yield df
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
-        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def get_financials(
         self,
@@ -396,6 +463,17 @@ class GenericHTTPProvider:
         start_time = end_time - timedelta(days=7)
         if dataset == "realtime":
             rows = self._request_rows(cfg)
+        elif dataset == "depth5":
+            rows = self._request_rows(cfg, symbols=test_symbols)
+        elif dataset == "financial":
+            # 财务测试取 metrics 表: 与生产 get_financials("metrics") 同口径
+            override = {**cfg.params, "table": "metrics"}
+            rows = self._request_rows(
+                cfg,
+                symbols=test_symbols,
+                override_params=override,
+                override_body={**cfg.body, "table": "metrics"},
+            )
         elif dataset in {"minute", "full_minute"}:
             override: dict[str, Any] = {}
             if cfg.asset_type_param:
@@ -494,6 +572,20 @@ class GenericHTTPProvider:
         if auth.type == "query":
             return {}, {auth.param: token}
         return {}, {}
+
+
+def _normalize_depth_levels(value: Any) -> list[list[float]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    levels: list[list[float]] = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            levels.append([float(item[0]), float(item[1])])
+        except (TypeError, ValueError):
+            continue
+    return levels
 
 
 def _token_from_env(name: str | None) -> str | None:

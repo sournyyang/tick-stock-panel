@@ -115,7 +115,7 @@ export function EnrichedRebuildPanel({
           }`}>
             {canRebuild
               ? `已检测到 ${historicalShareRows.toLocaleString()} 条历史股本记录。重算会按公告可用日匹配历史流通股本，并覆盖全部 Enriched 分区。`
-              : '未检测到历史股本数据，请先在财务分析页面同步“股本表”，再执行重算。'}
+              : '未检测到历史股本数据，请先在财务概况页面同步“股本表”，再执行重算。'}
           </div>
         )}
         <div className="text-[10px] text-muted mb-2">
@@ -126,7 +126,7 @@ export function EnrichedRebuildPanel({
         <button
           onClick={() => rebuild.mutate()}
           disabled={!canRebuild || isRunning || rebuild.isPending}
-          className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent/90 text-base text-xs font-medium hover:bg-accent disabled:opacity-40 disabled:pointer-events-none transition-colors duration-150"
+          className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent/90 text-white text-xs font-medium hover:bg-accent disabled:opacity-40 disabled:pointer-events-none transition-colors duration-150"
         >
           {rebuild.isPending ? (
             <><Loader2 className="h-3 w-3 animate-spin" />计算中…</>

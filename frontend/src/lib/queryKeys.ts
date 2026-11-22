@@ -7,18 +7,41 @@
 
 // ===== Query Key 工厂 =====
 
+/** 日K修正后的直接消费查询; SSE 与数据页共用, 不扩散到分钟和财务数据。 */
+export const DAILY_DATA_QUERY_PREFIXES = new Set([
+  'screener-cached', 'screener-kline-batch', 'market-snapshot', 'overview-market',
+  'index-quotes', 'index-daily', 'watchlist-enriched', 'kline-batch', 'kline', 'kline-latest', 'stock-levels',
+  'regime-history', 'regime-latest', 'regime-states', 'regime-coverage', 'regime-phases', 'regime-mainline',
+])
+
+/** 分钟落盘补拉后的体检与直接消费查询, 不影响日K/财务或独立的指数分钟数据。 */
+export const MINUTE_DATA_QUERY_PREFIXES = new Set([
+  'minute-gaps', 'minute-batch', 'kline-minute', 'kline-minute-range',
+])
+
 /** 后台自动加入自选后刷新成员、分组与监控写入状态。 */
 export const WATCHLIST_DATA_QUERY_PREFIXES = new Set([
   'watchlist', 'watchlist-groups', 'watchlist-enriched', 'watchlist-quotes', 'monitor-rules',
 ])
 
+/** 扩展数据写入后的结构、序列和列表消费方。日K仅刷新携带扩展列的查询。 */
+export const EXT_DATA_QUERY_PREFIXES = new Set([
+  'ext-data', 'ext-data-rows', 'ext-data-schema-all', 'ext-schema-all', 'ext-series',
+  'watchlist-enriched', 'screener-cached', 'dimension-members', 'dimension-intraday',
+  'table-schema', 'custom-signals-options',
+])
+
 export const QK = {
+  dataVersions: ['data-versions'] as const,
+  extensionPackages: ['extension-packages'] as const,
   // 全局 / 共享 (Layout 预取)
   capabilities:   ['capabilities'] as const,
   settings:       ['settings'] as const,
   endpoints:      ['endpoints'] as const,
   version:        ['version'] as const,
   preferences:    ['preferences'] as const,
+  dingtalkWebhook: ['dingtalk-webhook'] as const,
+  soundPacks:     ['sound-packs'] as const,
   dataSources:    ['data-sources'] as const,
   capabilityMatrix: ['capability-matrix'] as const,
   quoteStatus:    ['quote-status'] as const,
@@ -29,8 +52,9 @@ export const QK = {
   // Watchlist
   watchlist:            ['watchlist'] as const,
   watchlistGroups:      ['watchlist-groups'] as const,
+  watchlistPrepare:     (symbols: string[]) => ['watchlist-prepare', symbols] as const,
   watchlistQuotes:      ['watchlist-quotes'] as const,
-  watchlistEnriched:    (ext?: string) => ['watchlist-enriched', ext] as const,
+  watchlistEnriched:    (ext?: string) => ['watchlist-enriched', ext ?? ''] as const,
   // 异动边缘总览 (开启监控时才查询, 参数为 min_closeness/limit)
   abnormalOverview:     (minCloseness: number, limit: number) => ['abnormal-overview', minCloseness, limit] as const,
   // 盘中异动信号聚合 (异动监控「盘中」tab)
@@ -39,31 +63,53 @@ export const QK = {
   // (expert 1s) 会导致全自选日K每秒重拉, staleTime 形同虚设。
   // 刷新点: staleTime 过期 + Watchlist 增删自选/改蜡烛天数时的手动失效;
   // 当日最后一根蜡烛由 Watchlist 用 enriched 实时 OHLC 前端修补 (零额外请求)。
-  watchlistKlineBatch:  (symbols: string) => ['kline-batch', symbols] as const,
+  // symbols 不进 key: 千只自选时 key 内嵌全量拼串 (12-17KB), 增删 1 只即换 key
+  // 整批重拉且新旧两份共存; 数据按 symbol upsert 进单 key, 仅天数变化换 key。
+  watchlistKlineBatch:  (days: number) => ['kline-batch', days] as const,
   // 不用 watchlist- 前缀: 避免被 SSE quotes_updated 高频失效(expert 1s/pro 2s)
   // 导致每次都拉 TickFlow 触限流。分时图用固定 refetchInterval 刷新即可。
-  minuteBatch:          (symbols: string) => ['minute-batch', symbols] as const,
+  // 同上不嵌 symbols: 单 key + 按 symbol 增量合并, 请求集合由视口收敛
+  // (见 lib/minuteBatchIncremental.ts)。
+  minuteBatch:          () => ['minute-batch'] as const,
   instrumentSearch:     (q: string, assetTypes?: string) => ['instrument-search', q, assetTypes ?? 'stock'] as const,
 
   // Screener
   screener:             ['screener'] as const,
   screenerStrategies:   (assetType: string = 'stock', timeframe: '1d' | '1m' | 'all' = '1d') => ['screener-strategies', assetType, timeframe] as const,
+  /** 策略池 v2 (后端权威: 条目/分组/档案库), 排序是本地视图偏好不进 key */
+  strategyPool:         ['strategy-pool'] as const,
+  strategyList:         (assetType: string = 'all', timeframe = '1d', includeResearch = false) =>
+                          ['strategies', assetType, timeframe, includeResearch] as const,
   screenerCachedSummary: ['screener-cached', 'summary'] as const,
   screenerCachedResult: (strategyId: string, asOf?: string, ext?: string) => ['screener-cached', 'strategy', strategyId, asOf ?? '', ext ?? ''] as const,
   screenerCached:       (asOf?: string, ext?: string) => ['screener-cached', 'all', asOf ?? '', ext ?? ''] as const,
   screenerKlineBatch:   (symbols: string) => ['screener-kline-batch', symbols] as const,
+  /** 扩展列迷你图: 列集 (含显示周期和天数) + 日期 + 标的集。 */
+  extSeriesAll:        ['ext-series'] as const,
+  extSeries:           (colsKey: string, date?: string | null, symbolsKey?: string) => ['ext-series', colsKey, date ?? '', symbolsKey ?? ''] as const,
   marketSnapshot:       ['market-snapshot'] as const,
   limitLadder:          (asOf?: string) => ['limit-ladder', asOf] as const,
 
   // Backtest
   backtestStatus:       ['backtest-status'] as const,
+  backtestCandidates:   ['backtest-candidates'] as const,
   factorColumns:        ['backtest-factor-columns'] as const,
+  factorLibrary:        (assetType: string) => ['factors-library', assetType] as const,
+  /** 统一定义目录 (信号+因子, P4) — 定义选择器数据源 */
+  definitions:          ['definitions'] as const,
+  resourceCatalog:      ['resource-catalog'] as const,
+  /** 用户自定义仓位策略 (设置→定义 与 回测设置共用) */
+  positionPolicies:     ['backtest-position-policies'] as const,
   miningRuns:           ['backtest-mining-runs'] as const,
   miningAvailability:   (assetType: string, profile: string, start: string, end: string) =>
                           ['backtest-mining-availability', assetType, profile, start, end] as const,
   miningRun:            (id: string) => ['backtest-mining-run', id] as const,
   miningResult:         (id: string) => ['backtest-mining-result', id] as const,
   miningConfig:         ['backtest-mining-config'] as const,
+  miningLock:           ['backtest-mining-lock'] as const,
+  guardianOverview:     ['backtest-guardian-overview'] as const,
+  guardianRuns:         ['backtest-guardian-runs'] as const,
+  labReport:            ['backtest-lab-report'] as const,
   researchCandidates:  ['research-candidates'] as const,
   strategyLinkOptions: (assetType?: 'stock' | 'etf') => assetType
     ? ['strategy-link-options', assetType] as const
@@ -73,7 +119,11 @@ export const QK = {
 
   // Data / Pipeline
   dataStatus:           ['data-status'] as const,
+  dataIntegrity:        ['data-integrity'] as const,
+  /** 分钟数据缺口体检 (发现本地分区中不完整的 标的×交易日) */
+  minuteGaps:           ['minute-gaps'] as const,
   pipelineJobs:         ['pipeline-jobs'] as const,
+  postmarketMinute:     ['postmarket-minute'] as const,
   pipelineJob:          (id: string) => ['pipeline-job', id] as const,
   extData:              ['ext-data'] as const,
   extDataRows:          (id: string, date?: string, limit?: number, columns?: string) => ['ext-data-rows', id, date, limit, columns] as const,
@@ -81,10 +131,16 @@ export const QK = {
   dimensionIntraday:    (id: string, field: string, value: string, date?: string) => ['dimension-intraday', id, field, value, date] as const,
   analysisMenus:        ['analysis-menus'] as const,
   analysisMenu:         (id: string) => ['analysis-menu', id] as const,
+  extPages:             ['ext-pages'] as const,
+  extPagesSourceNamespaces: ['ext-pages', 'source-namespaces'] as const,
 
   // Kline
   kline:                (symbol: string, start: string, end: string, extColumns?: string) =>
                            ['kline', symbol, start, end, extColumns ?? ''] as const,
+  // 批量标的名称查询键: 排序后 join — 同一集合不同来源顺序 (draft/分组成员/
+  // 持仓+订单合并) 得到同一键, 复用缓存而不是各拼各的重复请求。
+  instrumentNames:      (symbols: readonly string[]) =>
+                         ['instrument-names', [...new Set(symbols)].sort().join(',')] as const,
   klineLatest:          (symbol: string) => ['kline-latest', symbol] as const,
   stockLevels:          (symbol: string, days?: number) => ['stock-levels', symbol, days ?? 120] as const,
   klineMinute:          (symbol: string, date: string) =>
@@ -109,6 +165,19 @@ export const QK = {
   monitorRuleOptions:   ['monitor-rule-options'] as const,
   lots:                 ['lots'] as const,
   lotsKline:            (symbols: string) => ['lots-kline', symbols] as const,
+
+  // 模拟盘 (多账户: 键按账户隔离; paperAll 作账户无关失效前缀)
+  paperAll:             ['paper'] as const,
+  apiTokens:            ['settings', 'api-tokens'] as const,
+  paperAccounts:        ['paper', 'accounts'] as const,
+  paperOverview:        (acc: string) => ['paper', 'overview', acc] as const,
+  paperOrders:          (acc: string) => ['paper', 'orders', acc] as const,
+  paperTrades:          (acc: string) => ['paper', 'trades', acc] as const,
+  paperNav:             (acc: string) => ['paper', 'nav', acc] as const,
+  paperStats:           (acc: string) => ['paper', 'stats', acc] as const,
+  paperRounds:          (acc: string) => ['paper', 'rounds', acc] as const,
+  paperCompare:         ['paper', 'compare'] as const,
+  paperAutoRules:       (acc: string) => ['paper', 'auto-rules', acc] as const,
   alerts:               (source?: string) => ['alerts', source ?? ''] as const,
 
   // AI 大盘复盘
@@ -118,12 +187,25 @@ export const QK = {
   rpsRotation:          (days: number) => ['rps-rotation', days] as const,
 
   // 市场环境(Regime) — 日级离线计算, 不进 SSE 刷新
-  regimeHistory:        (limit?: number) => ['regime-history', limit ?? 0] as const,
+  // 历史查询键 = 实际请求三元组 (影响结果的参数全部进键): 'all' 在 coverage
+  // 到达前后 start/end 不同 → 自动换键重拉, 不会把默认窗口数据当"全部"展示。
+  regimeHistory:        (range: { start?: string; end?: string; limit?: number }) =>
+                         ['regime-history', range.start ?? '', range.end ?? '', range.limit ?? 0] as const,
+  // 失效用裸前缀: 前缀匹配所有历史查询变体 (regimeHistory() 带哨兵值匹配不到任何键)
+  regimeHistoryPrefix:  ['regime-history'] as const,
   regimeLatest:         ['regime-latest'] as const,
   regimeStates:         (days: number) => ['regime-states', days] as const,
   regimeCoverage:       ['regime-coverage'] as const,
   regimePhases:         (start?: string, end?: string) => ['regime-phases', start ?? '', end ?? ''] as const,
   regimeMainline:       (kind: string, start?: string, end?: string) => ['regime-mainline', kind, start ?? '', end ?? ''] as const,
+  // 板块切换 (盘中轮动, 全量分钟聚合) — 30s 前端轮询刷新; seriesKey = 自定义展示板块清单,
+  // filterKey = 自动活跃榜行数与排除名单 (会改变结果的参数必须进查询键)
+  sectorRotation:       (kind: string, flow?: string, bucket?: number, seriesKey?: string, filterKey?: string) => ['sector-rotation', kind, flow ?? '', bucket ?? 5, seriesKey ?? '', filterKey ?? ''] as const,
+  // 板块切换的指数叠加线 (核心四只, 默认上证) — 分钟取当日, 日K取昨收基准
+  sectorRotationIndexMinute: (symbol: string, date?: string) => ['sector-rotation-index-minute', symbol, date ?? ''] as const,
+  sectorRotationIndexDaily:  (symbol: string) => ['sector-rotation-index-daily', symbol] as const,
+  // 扩展表 schema 清单 (板块切换的资金流列选择器等)
+  extSchemaAll:         ['ext-schema-all'] as const,
 } as const
 
 // ===== SSE 应该 invalidate 的 key 前缀列表 =====
@@ -144,4 +226,7 @@ export const SSE_INVALIDATE_PREFIXES = [
   'index-quotes',
   'overview-market',
   'limit-ladder',
+  // 概念/行业分析的全市场快照 (#419): 后端读最新日内缓存, 行情更新后需重取,
+  // 否则停留页面时板块聚合数值一直停留旧值。仅两页打开时才实际发请求。
+  'market-snapshot',
 ] as const

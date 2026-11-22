@@ -9,7 +9,7 @@
  * 财务率类用 fmtPct、kdj 用 toFixed(1)、vol_ma 用 fmtBigNum 等。
  */
 import type { ReactNode } from 'react'
-import { fmtPrice, fmtPct, fmtBigNum, priceColorClass } from '@/lib/format'
+import { fmtPrice, fmtPct, fmtBigNum, fmtVolume, priceColorClass, cnDateFromUtc, pricePrecision } from '@/lib/format'
 import type { ColumnConfig } from '@/lib/list-columns'
 import { NUM_CELL_CLASS } from '@/lib/stock-table'
 
@@ -36,15 +36,15 @@ export function RSIBadge({ value }: { value: number | null | undefined }) {
 
 // ===== 纯数据列渲染 =====
 
-function fmtMaybePrice(value: any) {
-  return value != null && !Number.isNaN(value) ? fmtPrice(value) : '—'
+function fmtMaybePrice(value: any, digits = 2) {
+  return value != null && !Number.isNaN(value) ? fmtPrice(value, digits) : '—'
 }
 
 /**
  * 渲染一个纯数据内置列的 <td>。
  * 返回 null 表示该列不属于纯数据列（symbol/strategies/score/signals/candle 等），由调用方处理。
  */
-export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | null {
+export function renderBuiltinDataCell(r: any, col: ColumnConfig, assetType: string | undefined = r.asset_type): ReactNode | null {
   if (col.source.type !== 'builtin') return null
   const key = col.source.key
 
@@ -54,20 +54,32 @@ export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | nu
   }
 
   const numCls = `${alignTdClass(col.align)} ${NUM_CELL_CLASS}`
+  const digits = pricePrecision(assetType)
 
   switch (key) {
     // 价格
     case 'price':
-      return <td key={col.id} className={`${numCls} text-secondary`}>{fmtMaybePrice(r.close)}</td>
+      return <td key={col.id} className={`${numCls} text-secondary`}>{fmtMaybePrice(r.close, digits)}</td>
     case 'pct':
       return <td key={col.id} className={`${numCls} font-medium ${priceColorClass(r.change_pct)}`}>{fmtPct(r.change_pct)}</td>
     case 'change_amount':
-      return <td key={col.id} className={`${numCls} ${priceColorClass(r.change_amount)}`}>{r.change_amount != null ? fmtPrice(r.change_amount) : '—'}</td>
+      return <td key={col.id} className={`${numCls} ${priceColorClass(r.change_amount)}`}>{fmtMaybePrice(r.change_amount, digits)}</td>
     case 'amplitude':
       return <td key={col.id} className={numCls}>{r.amplitude != null ? `${(r.amplitude * 100).toFixed(2)}%` : '—'}</td>
+    case 'open':         return <td key={col.id} className={numCls}>{fmtMaybePrice(r.open, digits)}</td>
+    case 'high':         return <td key={col.id} className={numCls}>{fmtMaybePrice(r.high, digits)}</td>
+    case 'low':          return <td key={col.id} className={numCls}>{fmtMaybePrice(r.low, digits)}</td>
+    case 'prev_close':   return <td key={col.id} className={numCls}>{fmtMaybePrice(r.prev_close, digits)}</td>
+    // 涨跌停价 (仅股票有值, ETF/指数后端置 null); A 股口径红涨绿跌
+    case 'limit_up_price':
+      return <td key={col.id} className={`${numCls} ${r.limit_up_price != null ? 'text-danger' : ''}`}>{fmtMaybePrice(r.limit_up_price, digits)}</td>
+    case 'limit_down_price':
+      return <td key={col.id} className={`${numCls} ${r.limit_down_price != null ? 'text-bear' : ''}`}>{fmtMaybePrice(r.limit_down_price, digits)}</td>
     // 成交
     case 'turnover':
       return <td key={col.id} className={numCls}>{r.turnover_rate != null ? `${Number(r.turnover_rate).toFixed(2)}%` : '—'}</td>
+    case 'volume':
+      return <td key={col.id} className={`${numCls} text-secondary`}>{r.volume != null ? fmtVolume(r.volume) : '—'}</td>
     case 'amount':
       return <td key={col.id} className={`${numCls} text-secondary`}>{fmtBigNum(r.amount)}</td>
     case 'float_val':
@@ -83,13 +95,13 @@ export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | nu
     case 'annual_vol':
       return <td key={col.id} className={numCls}>{r.annual_vol_20d != null ? fmtPct(r.annual_vol_20d) : '—'}</td>
     // 均线
-    case 'ma5':  return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma5)}</td>
-    case 'ma10': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma10)}</td>
-    case 'ma20': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma20)}</td>
-    case 'ma60': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma60)}</td>
+    case 'ma5':  return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma5, digits)}</td>
+    case 'ma10': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma10, digits)}</td>
+    case 'ma20': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma20, digits)}</td>
+    case 'ma60': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.ma60, digits)}</td>
     // 区间
-    case 'high_60d': return <td key={col.id} className={numCls}>{r.high_60d != null ? fmtPrice(r.high_60d) : '—'}</td>
-    case 'low_60d':  return <td key={col.id} className={numCls}>{r.low_60d != null ? fmtPrice(r.low_60d) : '—'}</td>
+    case 'high_60d': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.high_60d, digits)}</td>
+    case 'low_60d':  return <td key={col.id} className={numCls}>{fmtMaybePrice(r.low_60d, digits)}</td>
     // 技术指标
     case 'rsi6':  return <td key={col.id} className={numCls}><RSIBadge value={r.rsi_6} /></td>
     case 'rsi14': return <td key={col.id} className={numCls}><RSIBadge value={r.rsi_14} /></td>
@@ -103,9 +115,9 @@ export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | nu
     case 'kdj_k': return <td key={col.id} className={numCls}>{r.kdj_k != null ? r.kdj_k.toFixed(1) : '—'}</td>
     case 'kdj_d': return <td key={col.id} className={numCls}>{r.kdj_d != null ? r.kdj_d.toFixed(1) : '—'}</td>
     case 'kdj_j': return <td key={col.id} className={numCls}>{r.kdj_j != null ? r.kdj_j.toFixed(1) : '—'}</td>
-    case 'boll_upper': return <td key={col.id} className={numCls}>{r.boll_upper != null ? fmtPrice(r.boll_upper) : '—'}</td>
-    case 'boll_lower': return <td key={col.id} className={numCls}>{r.boll_lower != null ? fmtPrice(r.boll_lower) : '—'}</td>
-    case 'atr14':    return <td key={col.id} className={numCls}>{r.atr_14 != null ? fmtPrice(r.atr_14) : '—'}</td>
+    case 'boll_upper': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.boll_upper, digits)}</td>
+    case 'boll_lower': return <td key={col.id} className={numCls}>{fmtMaybePrice(r.boll_lower, digits)}</td>
+    case 'atr14':    return <td key={col.id} className={numCls}>{fmtMaybePrice(r.atr_14, digits)}</td>
     case 'vol_ma5':  return <td key={col.id} className={numCls}>{r.vol_ma5 != null ? fmtBigNum(r.vol_ma5) : '—'}</td>
     case 'vol_ma10': return <td key={col.id} className={numCls}>{r.vol_ma10 != null ? fmtBigNum(r.vol_ma10) : '—'}</td>
     // 动量
@@ -142,6 +154,15 @@ export function renderBuiltinDataCell(r: any, col: ColumnConfig): ReactNode | nu
           )}
         </td>
       )
+    // 自选加入信息（后端读时计算；added_at 为 naive UTC，须转北京时间展示）
+    case 'added_at':
+      return (
+        <td key={col.id} className={`${alignTdClass(col.align)} text-secondary`}>
+          {cnDateFromUtc(r.added_at) || '—'}
+        </td>
+      )
+    case 'pct_since_added':
+      return <td key={col.id} className={`${numCls} ${priceColorClass(r.pct_since_added)}`}>{fmtPct(r.pct_since_added)}</td>
     // 财务指标（后端 enriched 未返回时显示 —）
     case 'eps':           return <td key={col.id} className={numCls}>{r.eps != null ? fmtPrice(r.eps) : '—'}</td>
     case 'bps':           return <td key={col.id} className={numCls}>{r.bps != null ? fmtPrice(r.bps) : '—'}</td>

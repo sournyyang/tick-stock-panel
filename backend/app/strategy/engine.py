@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
@@ -20,6 +22,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from app.config import settings
 from app.strategy.scoring import (
     SCORING_DIRECTION_LOW,
     effective_scoring,
@@ -50,6 +53,55 @@ DEFAULT_BASIC_FILTER: dict = {
 
 # 叠加策略硬上限：子策略数量。控制信号计算成本与字段并集膨胀，避免 OOM。
 MAX_COMPOSITE_CHILDREN = 8
+
+
+def _normalize_backtest_requirements(raw: Any) -> dict:
+    """Optional execution requirements, separate from editable recommendations."""
+    if raw is None:
+        return {}
+    allowed = {
+        "entry_fill": ("close_t", "open_t+1"),
+        "exit_fill": ("close_t", "open_t+1", "signal_next_minute"),
+        "mode": ("position", "full"),
+        "minute_fill": (False, True),
+    }
+    if not isinstance(raw, dict) or set(raw) - set(allowed):
+        raise ValueError("META.backtest_requirements contains unsupported fields")
+    for name, value in raw.items():
+        expected = bool if name == "minute_fill" else str
+        if type(value) is not expected or value not in allowed[name]:
+            raise ValueError(f"META.backtest_requirements.{name} is invalid")
+    return dict(raw)
+
+
+def _normalize_backtest_defaults(raw: Any) -> dict:
+    """Optional editable portfolio recommendations, never API fill overrides."""
+    if raw is None:
+        return {}
+    bounds = {
+        "initial_capital": (0, None),
+        "max_exposure_pct": (0, 1),
+        "commission_pct": (0, 1),
+        "stamp_tax_pct": (0, 1),
+        "slippage_bps": (0, 10000),
+    }
+    if not isinstance(raw, dict) or set(raw) - (set(bounds) | {"max_positions", "position_sizing"}):
+        raise ValueError("META.backtest_defaults contains unsupported fields")
+    for name, value in raw.items():
+        if name == "max_positions":
+            valid = type(value) is int and value > 0
+        elif name == "position_sizing":
+            valid = isinstance(value, str) and value in {"equal", "score_weight"}
+        else:
+            low, high = bounds[name]
+            valid = (
+                type(value) in (int, float) and math.isfinite(value)
+                and value >= low and (high is None or value <= high)
+                and (name != "initial_capital" or value > 0)
+            )
+        if not valid:
+            raise ValueError(f"META.backtest_defaults.{name} is invalid")
+    return dict(raw)
 
 
 def _normalize_param_defs(params: Any) -> list[dict]:
@@ -160,6 +212,9 @@ class StrategyDataContext:
     daily_history: pl.DataFrame | None = None
     market: Any | None = None
     cache_key: str | None = None
+    # enriched 数据换代号 (repo.get_matrix_data_generation, 详见 enriched_generation):
+    # 装配方填入, 消费方用作共享矩阵缓存的失效指纹 — 数据重建换代号变, 缓存自动失效。
+    data_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,8 +251,7 @@ class StrategyDef:
     filter_fn: Callable[[pl.DataFrame, dict], pl.Expr] | None
     filter_history_fn: Callable[[pl.DataFrame, dict], pl.DataFrame] | None
     lookback_days: int
-    source: str  # "builtin" | "custom" | "ai" | "composite"
-    take_profit: float | None = None
+    source: str  # "custom" | "ai" | "composite"
     required_features: frozenset[str] = field(default_factory=frozenset)
     file_path: Path | None = None
     execution_backend: str = "polars_expr"
@@ -208,6 +262,11 @@ class StrategyDef:
     # 仅 minute_filter: META["daily_history_bars"] 声明需要的日线历史窗口 (0=不需要;
     # >0 时 filter_minute_history 必须接受 daily 关键字, 引擎注入 context.daily_history)
     minute_daily_bars: int = 0
+    # 模块 SCORING 常量的因子键 (custom_factor_* 排名策略用; 策略包闭包消费)
+    scoring_columns: tuple[str, ...] = ()
+    # 模块 TAKE_PROFIT 常量（正收益比例, 如 0.10 = +10% 止盈）; 与 STOP_LOSS 对称,
+    # 供回测/实盘风控读取（此前遗漏, 模块常量不生效）
+    take_profit: float | None = None
 
 
 @dataclass
@@ -229,6 +288,38 @@ class _RealtimeMatrixEntry:
     buffer: Any
 
 
+def _resolve_required_features(meta: dict, mod, filter_history_fn, path: Path) -> frozenset[str]:
+    """显式声明 (META/module REQUIRED_FEATURES) 优先; 缺失且存在动态
+    filter_history 时, AST 推导列依赖兜底 — 推导不可证明则保持为空,
+    回测层继续走全量指标计算 (fail-closed)。
+
+    推导范围是整个策略文件 + 同目录 `_*.py` 依赖文件, 不只是 filter_history
+    函数体: 列引用在模块级辅助函数或依赖文件里硬编码时, 只看函数体会漏列,
+    回测帧缺列直接 ColumnNotFoundError。范围放宽只会多载列, 不会漏。"""
+    declared = frozenset(meta.get("required_features", []) or []) | frozenset(
+        getattr(mod, "REQUIRED_FEATURES", []) or []
+    )
+    if declared or filter_history_fn is None:
+        return declared
+    from app.strategy.feature_deps import infer_features_from_sources
+
+    family = [path, *sorted(p for p in path.parent.glob("_*.py") if p != path)]
+    try:
+        sources = [p.read_text(encoding="utf-8") for p in family]
+    except OSError as e:
+        logger.debug("strategy %s: 依赖源码读取失败, 保持全量兜底: %s", meta.get("id", "<unknown>"), e)
+        return declared
+    inferred = infer_features_from_sources(sources)
+    if inferred is None:
+        return declared
+    logger.info(
+        "strategy %s: 依赖源码 AST 推导出 %d 个依赖列, 免除回测全量兜底",
+        meta.get("id", "<unknown>"),
+        len(inferred),
+    )
+    return inferred
+
+
 class StrategyEngine:
     """策略引擎 — 策略加载 + 执行 + 评分"""
 
@@ -241,10 +332,16 @@ class StrategyEngine:
         override_loader: Callable[[str], dict] | None = None,
     ):
         self._strategies: dict[str, StrategyDef] = {}
+        self.definition_revision = 0
         self._load_errors: list[dict] = []  # 加载失败的策略 [{file, error}]
         self._strategy_dirs = strategy_dirs or []
         self._realtime_matrices: dict[str, _RealtimeMatrixEntry] = {}
         self._realtime_matrix_lock = threading.RLock()
+        # run_all 共享矩阵进程级缓存: 矩阵 = 纯函数(history, 字段并集), 矩阵数组
+        # 构建后只读, 同 generation 同窗口复用免重建 (全市场矩阵构建数秒)。
+        # 失效: 指纹含 enriched generation + 窗口范围 (数据/窗口变化自动重建),
+        # reload/删除策略时与 _realtime_matrices 一同清空。
+        self._shared_matrix_cache: dict[tuple, Any] = {}
         # 可选的 override 加载器: 叠加策略执行时用它查子策略的用户覆盖配置,
         # 保证 composite 内跑子策略与单独跑子策略使用同一口径(CONTRIBUTING §5.1)。
         # None 时(测试/无 data_dir) 子策略用默认参数, 不报错。
@@ -395,13 +492,15 @@ class StrategyEngine:
                         "types",
                         "typing",
                     }),
-                    extra_allowed_calls=frozenset({"vars"}),
                 )
         except ValueError:
             raise
-        except Exception:  # noqa: BLE001
-            # 文件读不到/语法错等: 不阻断, 让下方 exec_module 抛原样错误
-            pass
+        except SyntaxError as e:
+            raise ValueError(f"策略语法错误: 第 {e.lineno} 行, {e.msg}") from e
+        except (OSError, UnicodeDecodeError) as e:
+            # fail-closed: 文件读不到/读不懂时不得放行到 exec_module,
+            # 否则异常输入即可让校验静默跳过 (GH #475 同类逃逸)。
+            raise ValueError(f"策略安全校验失败: {e}") from e
 
         spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
@@ -439,17 +538,14 @@ class StrategyEngine:
         meta.setdefault("descending", True)
         meta.setdefault("limit", 100)
 
+        # research/ 目录: 挖掘功能的研究模板 (research_only), 对外按 custom 口径。
         source = "custom"
         normalized_path = str(path).replace("\\", "/")
-        if "/builtin/" in normalized_path:
-            source = "builtin"
-        elif "/ai/" in normalized_path:
+        if "/ai/" in normalized_path:
             source = "ai"
         elif "/composite/" in normalized_path:
             source = "composite"
 
-        if source == "builtin" and "asset_types" not in meta:
-            raise ValueError("builtin strategy META must declare asset_types")
         meta.setdefault("asset_types", ["stock"])
         meta.setdefault("timeframes", ["1d"])
         for field_name in ("asset_types", "timeframes"):
@@ -467,6 +563,10 @@ class StrategyEngine:
         # _strategy_detail() 的 {p["id"]: p["default"] for p in params} 处抛 TypeError,
         # 导致整个 /api/strategies 列表 500. 降级为空 list 而非崩溃, 策略仍可见可用.
         meta["params"] = _normalize_param_defs(meta.get("params"))
+        meta["backtest_requirements"] = _normalize_backtest_requirements(
+            meta.get("backtest_requirements")
+        )
+        meta["backtest_defaults"] = _normalize_backtest_defaults(meta.get("backtest_defaults"))
 
         # 合并默认基础过滤
         bf = {**DEFAULT_BASIC_FILTER}
@@ -499,6 +599,13 @@ class StrategyEngine:
             )
 
         matrix_strategy = getattr(mod, "MATRIX_STRATEGY", None)
+        # 因子排名类策略 (custom_factor_*) 把评分因子写在模块 SCORING 常量里交给
+        # MATRIX_STRATEGY 构造, 不进 META.scoring — 依赖闭包 (strategy_bundle) 需要
+        # 在加载期拿到它, 与 ENTRY_SIGNALS 等常量同一口径。
+        module_scoring = getattr(mod, "SCORING", None)
+        scoring_columns: tuple[str, ...] = ()
+        if isinstance(module_scoring, dict) and module_scoring:
+            scoring_columns = tuple(str(k) for k in module_scoring)
         composite_spec: CompositeSpec | None = None
         minute_daily_bars = 0
         if execution_backend == "matrix_native":
@@ -575,8 +682,7 @@ class StrategyEngine:
             take_profit=getattr(mod, "TAKE_PROFIT", None),
             filter_fn=filter_fn,
             filter_history_fn=filter_history_fn,
-            required_features=frozenset(meta.get("required_features", []) or [])
-            | frozenset(getattr(mod, "REQUIRED_FEATURES", []) or []),
+            required_features=_resolve_required_features(meta, mod, filter_history_fn, path),
             lookback_days=int(getattr(mod, "LOOKBACK_DAYS", meta.get("lookback_days", 1)) or 1),
             source=source,
             file_path=path,
@@ -585,6 +691,7 @@ class StrategyEngine:
             composite=composite_spec,
             filter_minute_history_fn=filter_minute_history_fn,
             minute_daily_bars=minute_daily_bars,
+            scoring_columns=scoring_columns,
         )
 
     def reload(self) -> None:
@@ -596,6 +703,8 @@ class StrategyEngine:
             raise ValueError(f"strategy reload failed: {details}")
         with self._realtime_matrix_lock:
             self._realtime_matrices.clear()
+            self._shared_matrix_cache.clear()
+            self.definition_revision += 1
 
     # ================================================================
     # 查询
@@ -634,8 +743,10 @@ class StrategyEngine:
         strategies = dict(self._strategies)
         strategies.pop(strategy_id)
         self._strategies = strategies
+        self.definition_revision += 1
         with self._realtime_matrix_lock:
             self._realtime_matrices.clear()
+            self._shared_matrix_cache.clear()
         return True
 
     def find_dependents(self, strategy_id: str) -> list[str]:
@@ -722,6 +833,13 @@ class StrategyEngine:
         for strategy_id in strategy_ids:
             strategy = self.get(strategy_id)
             overrides = overrides_map.get(strategy_id) or {}
+            # 叠加条件含「前 N 日」偏移时, 历史窗口需覆盖其回看深度 (as_of + N 个交易日)。
+            overlay = self._effective_overlay(overrides)
+            if overlay:
+                from app.strategy import custom_signals as _custom_signals
+                overlay_days = _custom_signals.overlay_max_days(overlay)
+                if overlay_days > 0:
+                    required = max(required, overlay_days + 1)
             scoring = effective_scoring(strategy.meta.get("scoring"), overrides)
             required = max(required, scoring_warmup_bars(scoring))
             if strategy.execution_backend == "matrix_native":
@@ -732,7 +850,7 @@ class StrategyEngine:
                 )
                 required = max(
                     required,
-                    int(strategy.matrix_strategy.required_warmup_bars(params)) + 1,
+                    self._matrix_history_bars(strategy, params),
                 )
             elif strategy.execution_backend == "composite":
                 # composite 预热 = 各子策略预热的 max。
@@ -795,7 +913,7 @@ class StrategyEngine:
             matrix_ids.append(strategy_id)
             max_warmup = max(
                 max_warmup,
-                int(strategy.matrix_strategy.required_warmup_bars(params)) + 1,
+                self._matrix_history_bars(strategy, params),
                 scoring_warmup_bars(
                     effective_scoring(
                         strategy.meta.get("scoring"),
@@ -822,6 +940,9 @@ class StrategyEngine:
             raise ValueError("realtime matrix timestamp cannot be converted to date")
         symbols = tuple(current["symbol"].cast(pl.Utf8).unique().sort().to_list())
         fingerprint = (
+            context.asset_type,
+            context.timeframe,
+            context.data_generation,
             tuple(sorted(field_columns)),
             max_warmup,
             symbols,
@@ -900,6 +1021,12 @@ class StrategyEngine:
         params = self.resolve_params(s, params, overrides)
         entry_signals = self._effective_signals(overrides, "entry_signals", s.entry_signals)
         exit_signals = self._effective_signals(overrides, "exit_signals", s.exit_signals)
+        overlay_conditions = self._effective_overlay(overrides)
+        # 叠加条件运行期守卫 (保存期已拦, 手改 override 文件时的双保险)
+        if overlay_conditions and s.execution_backend in ("composite", "minute_filter"):
+            raise ValueError(
+                f"strategy {strategy_id}: 叠加条件不支持 {s.execution_backend} 策略"
+            )
 
         if s.execution_backend == "matrix_native":
             return self._run_matrix_strategy(
@@ -953,6 +1080,19 @@ class StrategyEngine:
                     strategy_id=strategy_id,
                     exit_signal_hits=exit_signal_hits,
                 )
+            # 盘中信号列注入(csgi_): 实盘扫描与分钟回测共用本路径 — 与监控评估
+            # 同一特征构造器, 单点注入保证三处口径一致。
+            history = self._inject_intraday_signal_columns(history)
+            missing_csgi = [
+                name for name in s.required_features
+                if name.startswith("csgi_") and name not in history.columns
+            ]
+            if missing_csgi:
+                raise ValueError(
+                    "策略引用了未定义的盘中信号: "
+                    + ", ".join(sorted(missing_csgi))
+                    + " — 请先在「自定义信号」中创建(timeframe=intraday)后再运行"
+                )
             if s.minute_daily_bars > 0:
                 df = s.filter_minute_history_fn(history, params, daily=context.daily_history)
             else:
@@ -983,6 +1123,15 @@ class StrategyEngine:
                     "策略引用了未定义的自定义信号: "
                     + ", ".join(sorted(missing_csg))
                     + " — 请先在「自定义信号」管理中创建对应信号后再运行"
+                )
+            missing_csgi = [
+                name for name in s.required_features
+                if name.startswith("csgi_")
+            ]
+            if missing_csgi:
+                raise ValueError(
+                    "盘中信号仅可用于分钟策略(timeframes=['1m']), 日线策略不支持: "
+                    + ", ".join(sorted(missing_csgi))
                 )
             df = s.filter_history_fn(df, params)
             if "date" in df.columns:
@@ -1017,6 +1166,57 @@ class StrategyEngine:
         if s.filter_fn:
             expr = s.filter_fn(df, params)
             df = df.filter(expr)
+
+        # Stage 2.5: 叠加条件 (每策略 overlay 硬过滤) — 策略过滤之后、评分之前:
+        # 评分 min-max 归一化与 limit 截断都在过滤后的候选上进行; exit_signal_hits
+        # 已在 :942 过滤前的帧上收集, 已持仓的卖出信号不受影响。
+        if overlay_conditions:
+            from app.strategy import custom_signals
+            try:
+                overlay_expr = custom_signals.build_overlay_expr(overlay_conditions)
+            except ValueError as e:
+                raise ValueError(f"叠加条件编译失败: {e}") from e
+            if overlay_expr is not None:
+                overlay_days = custom_signals.overlay_max_days(overlay_conditions)
+                if overlay_days > 0:
+                    # 「前 N 日」偏移需要更早的行来 shift: 候选帧只是当日切片, 改在
+                    # 完整历史窗口上求值 as_of 行掩码, 再按 symbol 交集回候选行。
+                    if history is None or history.is_empty():
+                        raise ValueError(
+                            "叠加条件含「前 N 日」偏移, 需要历史数据窗口; "
+                            "当前调用未提供 history"
+                        )
+                    src = history
+                else:
+                    src = df
+                # engine.run 不保证任意注册表因子列在帧上 → 先按条件依赖物化
+                src = custom_signals.materialize_factor_columns(
+                    src, {"__overlay__": overlay_expr}
+                )
+                missing = custom_signals.overlay_missing_columns(
+                    overlay_conditions, src.columns
+                )
+                if missing:
+                    raise ValueError(
+                        "叠加条件引用的列不存在: " + ", ".join(missing)
+                        + " — 请检查扩展数据拉取/因子计算是否可用"
+                    )
+                if overlay_days > 0:
+                    # 掩码必须在完整帧上算 (先 filter 到 as_of 会截断 shift 所需的历史行),
+                    # 再取 as_of 行读掩码 — 与 matrix 路径同一顺序。
+                    masked = src.with_columns(
+                        overlay_expr.fill_null(False).alias("__overlay__")
+                    )
+                    allowed = (
+                        masked.filter(pl.col("date") == as_of)
+                        .filter(pl.col("__overlay__"))["symbol"]
+                        .cast(pl.Utf8)
+                        .unique()
+                        .to_list()
+                    )
+                    df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(allowed))
+                else:
+                    df = df.filter(overlay_expr.fill_null(False))
 
         # Stage 3: 评分
         df = self._apply_scoring(df, scoring, scoring_directions)
@@ -1069,6 +1269,14 @@ class StrategyEngine:
         return list(default or [])
 
     @staticmethod
+    def _effective_overlay(overrides: dict) -> list[dict] | None:
+        """叠加条件 override; 归一为非空条件列表或 None (None/[] = 未配置)。"""
+        value = (overrides or {}).get("overlay_filter")
+        if isinstance(value, list) and value:
+            return value
+        return None
+
+    @staticmethod
     def _collect_signal_hits(df: pl.DataFrame, signals: list[str]) -> list[dict]:
         if df.is_empty() or not signals or "symbol" not in df.columns:
             return []
@@ -1099,8 +1307,15 @@ class StrategyEngine:
         overrides_map: dict | None = None,
         *,
         strategy_ids: list[str] | None = None,
+        parallel: bool = True,
     ) -> dict[str, StrategyResult]:
-        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。"""
+        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。
+
+        parallel=True 时用有界线程池并发执行: 策略对 context 是只读纯函数
+        (polars 计算释放 GIL), 并发不改变结果, 逐策略耗时日志不变。composite
+        子策略的递归 run_all 以 parallel=False 调用, 保证嵌套时线程总数仍
+        不超过 worker 上限, 不随叠加层数放大。
+        """
         if context.current is None:
             raise ValueError("strategy run_all context requires current data")
         df = context.current
@@ -1122,37 +1337,16 @@ class StrategyEngine:
             raise ValueError("selected strategies require history data")
 
         shared_matrix = context.market
-        matrix_strats = [
-            (sid, strategy)
-            for sid, strategy in selected
-            if strategy.execution_backend == "matrix_native"
-        ]
-        if (
-            shared_matrix is None
-            and matrix_strats
-            and shared_history is not None
-            and not shared_history.is_empty()
-        ):
-            from app.backtest.matrix import build_market_data_matrix
-
-            field_columns: set[str] = set()
-            for sid, strategy in matrix_strats:
-                field_columns.update(
-                    self._matrix_field_columns(
-                        strategy,
-                        overrides_map.get(sid),
-                        params_map.get(sid),
-                    )
-                )
-            shared_matrix = build_market_data_matrix(
-                shared_history,
-                field_columns=field_columns,
+        if shared_matrix is None:
+            shared_matrix = self.build_shared_matrix(
+                context, selected, params_map, overrides_map
             )
 
         results: dict[str, StrategyResult] = {}
 
-        for sid, _ in selected:
-            results[sid] = self.run(
+        def _execute(sid: str) -> tuple[str, StrategyResult]:
+            started = time.perf_counter()
+            result = self.run(
                 sid,
                 replace(
                     context,
@@ -1163,8 +1357,117 @@ class StrategyEngine:
                 params=params_map.get(sid),
                 overrides=overrides_map.get(sid),
             )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            # >=1s 打 INFO 供热点归因 (哪些策略吃掉了 run_all 的大头), 其余 DEBUG 防噪。
+            log_fn = logger.info if elapsed_ms >= 1000 else logger.debug
+            log_fn(
+                "run_all: strategy %s took %.0fms (total=%d)",
+                sid,
+                elapsed_ms,
+                result.total,
+            )
+            return sid, result
+
+        workers = min(settings.strategy_run_all_workers, len(selected))
+        if parallel and workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="strategy-run"
+            ) as pool:
+                futures = [pool.submit(_execute, sid) for sid, _ in selected]
+                # 按原顺序收集: 首个失败策略的异常语义与串行执行一致。
+                for future in futures:
+                    sid, result = future.result()
+                    results[sid] = result
+        else:
+            for sid, _ in selected:
+                sid, result = _execute(sid)
+                results[sid] = result
 
         return results
+
+    def build_shared_matrix(
+        self,
+        context: StrategyDataContext,
+        selected: list[tuple[str, StrategyDef]],
+        params_map: dict | None = None,
+        overrides_map: dict | None = None,
+    ):
+        """按所选策略的字段并集构建市场数据矩阵; 无矩阵策略或无历史时返回 None。
+
+        渐进式 run_all (逐策略执行) 也用它一次建好并集矩阵后放入 context.market,
+        避免每个 matrix_native 策略重复构建同一份大矩阵 (全市场历史, 秒级)。
+        """
+        params_map = params_map or {}
+        overrides_map = overrides_map or {}
+        matrix_strats = [
+            (sid, strategy)
+            for sid, strategy in selected
+            if strategy.execution_backend == "matrix_native"
+        ]
+        history = context.history
+        if not matrix_strats or history is None or history.is_empty():
+            return None
+
+        from app.backtest.matrix import build_market_data_matrix
+
+        field_columns: set[str] = set()
+        for sid, strategy in matrix_strats:
+            field_columns.update(
+                self._matrix_field_columns(
+                    strategy,
+                    overrides_map.get(sid),
+                    params_map.get(sid),
+                )
+            )
+
+        # 纯函数缓存: 矩阵只由 (history 窗口, 字段并集) 决定且数组只读, 同指纹
+        # 直接复用。指纹含 enriched generation (数据换代自动失效) + 窗口范围
+        # (不同 lookback 的 history 不可混用)。generation 未知 (分钟/ETF/测试
+        # Fake 数据) 时 fail-closed 不缓存, 保持每次重建的旧行为。
+        generation = getattr(context, "data_generation", None)
+        fingerprint: tuple | None = None
+        if generation and "date" in history.columns:
+            window = (
+                str(history["date"].min()),
+                str(history["date"].max()),
+                history.height,
+            )
+            fingerprint = (
+                context.asset_type,
+                str(context.as_of),
+                tuple(sorted(field_columns)),
+                window,
+                generation,
+            )
+            with self._realtime_matrix_lock:
+                cached_matrix = self._shared_matrix_cache.get(fingerprint)
+            if cached_matrix is not None:
+                logger.info(
+                    "run_all: shared matrix cache hit (fields=%d)", len(field_columns)
+                )
+                return cached_matrix
+
+        matrix_t0 = time.perf_counter()
+        matrix = build_market_data_matrix(history, field_columns=field_columns)
+        logger.info(
+            "run_all: shared matrix built in %.0fms (fields=%d)",
+            (time.perf_counter() - matrix_t0) * 1000,
+            len(field_columns),
+        )
+        if fingerprint is not None:
+            with self._realtime_matrix_lock:
+                # 只保留最近一份: 字段并集随策略池变化, 旧矩阵价值低且占内存
+                self._shared_matrix_cache.clear()
+                self._shared_matrix_cache[fingerprint] = matrix
+        return matrix
+
+    @staticmethod
+    def _matrix_history_bars(strategy: StrategyDef, params: dict) -> int:
+        from app.factors.registry import factor_warmup_bars
+
+        required = int(strategy.matrix_strategy.required_warmup_bars(params)) + 1
+        fields = getattr(strategy.matrix_strategy, "required_fields_for_params", None)
+        return max(required, factor_warmup_bars(fields(params))) if callable(fields) else required
 
     @staticmethod
     def _matrix_field_columns(
@@ -1284,11 +1587,64 @@ class StrategyEngine:
         if not target_ids:
             return StrategyResult(as_of=as_of, strategy_id=strategy_id)
         target_time = target_ids[-1]
+        target_frame = self._matrix_target_frame(source_panel, as_of)
         entry_active = signals.entry[target_time]
         exit_active = signals.exit[target_time]
         if asset_mask is not None:
             entry_active = entry_active & asset_mask
             exit_active = exit_active & asset_mask
+        # 叠加条件 (每策略 overlay 硬过滤): 在带完整 enriched 列 (ext_*/因子) 的
+        # target_frame 上评估, 按符号掩码 entry (只挡入场, exit/持仓卖出不动)。
+        # 与 polars 路径 Stage 2.5 同一套条件编译与 fail-closed 语义。
+        overlay_conditions = self._effective_overlay(overrides)
+        if overlay_conditions:
+            from app.strategy import custom_signals
+            try:
+                overlay_expr = custom_signals.build_overlay_expr(overlay_conditions)
+            except ValueError as e:
+                raise ValueError(f"叠加条件编译失败: {e}") from e
+            if overlay_expr is not None:
+                overlay_days = custom_signals.overlay_max_days(overlay_conditions)
+                # 「前 N 日」偏移需要更早的行来 shift: 在完整 source_panel 上求值,
+                # 再取 as_of 行读掩码; 无偏移时维持现状 (只评估当日切片)。
+                eval_frame = target_frame
+                if overlay_days > 0:
+                    if source_panel is None or source_panel.is_empty():
+                        raise ValueError("叠加条件含「前 N 日」偏移, 需要历史数据窗口")
+                    eval_frame = source_panel
+                eval_frame = custom_signals.materialize_factor_columns(
+                    eval_frame, {"__overlay__": overlay_expr}
+                )
+                missing = custom_signals.overlay_missing_columns(
+                    overlay_conditions, eval_frame.columns
+                )
+                if missing:
+                    raise ValueError(
+                        "叠加条件引用的列不存在: " + ", ".join(missing)
+                        + " — 请检查扩展数据拉取/因子计算是否可用"
+                    )
+                if overlay_days > 0:
+                    masked = eval_frame.with_columns(
+                        overlay_expr.fill_null(False).alias("__overlay__")
+                    )
+                    keep_frame = self._matrix_target_frame(masked, as_of)
+                    keep = set(
+                        keep_frame.filter(pl.col("__overlay__"))[
+                            "symbol"
+                        ].cast(pl.Utf8).to_list()
+                    )
+                else:
+                    keep = set(
+                        eval_frame.filter(overlay_expr.fill_null(False))[
+                            "symbol"
+                        ].cast(pl.Utf8).to_list()
+                    )
+                allowed = np.fromiter(
+                    (str(symbol) in keep for symbol in market.symbols),
+                    dtype=bool,
+                    count=len(market.symbols),
+                )
+                entry_active = np.where(allowed, entry_active, 0)
         entry_signal_hits = self._matrix_signal_hits(
             entry_active,
             signals.entry_signal_code[target_time],
@@ -1311,7 +1667,6 @@ class StrategyEngine:
                 exit_signal_hits=exit_signal_hits,
             )
 
-        target_frame = self._matrix_target_frame(source_panel, as_of)
         row_by_symbol = {
             str(row["symbol"]): row
             for row in target_frame.iter_rows(named=True)
@@ -1354,7 +1709,7 @@ class StrategyEngine:
         overrides: dict | None = None,
         started_at: float,
     ) -> StrategyResult:
-        """叠加策略选股: 调度各子策略(共享 context)→ 合并结果。
+        """叠加策略: 调度各子策略(共享 context)→ 合并结果。
 
         复用 run_all 共享 current/history/market, 避免各子策略重复加载数据。
         子策略必须已在加载期通过两阶段引用校验(存在/非嵌套/asset_types 一致)。
@@ -1402,6 +1757,9 @@ class StrategyEngine:
             params_map={},
             overrides_map=overrides_map,
             strategy_ids=child_ids,
+            # 嵌套调用串行: 父级 worker 已并发, 子级再开池会使线程总数随叠加
+            # 层数放大 (4×4×...), 超出并发闸与核数的合理范围。
+            parallel=False,
         )
         ordered_results = [child_results[cid] for cid in child_ids]
 
@@ -1548,9 +1906,13 @@ class StrategyEngine:
                     board_exprs.append(
                         pl.col("symbol").str.starts_with("300")
                         | pl.col("symbol").str.starts_with("301")
+                        | pl.col("symbol").str.starts_with("302")
                     )
                 elif b == "科创板":
-                    board_exprs.append(pl.col("symbol").str.starts_with("688"))
+                    board_exprs.append(
+                        pl.col("symbol").str.starts_with("688")
+                        | pl.col("symbol").str.starts_with("689")
+                    )
                 elif b == "北交所":
                     board_exprs.append(pl.col("symbol").str.contains(r"\.BJ$"))
             if board_exprs:
@@ -1573,6 +1935,48 @@ class StrategyEngine:
         "name", "total_shares", "float_shares", "amount",
         "turnover_rate", "change_pct", "pre_close",
     )
+
+    def _user_data_dir(self) -> Path | None:
+        """从策略目录推导 data_dir(…/strategies/custom → data_dir)。推不出则跳过注入。"""
+        for d in self._strategy_dirs:
+            if d.name == "custom" and d.parent.name == "strategies":
+                return d.parent.parent
+        return None
+
+    def _inject_intraday_signal_columns(self, minute_df: pl.DataFrame) -> pl.DataFrame:
+        """向当日分钟K帧注入自定义盘中信号列(csgi_, 当日条件上升沿)。
+
+        单点注入: 实盘分钟扫描与分钟回测 worker 共用本方法, 特征计算与
+        监控评估同源(intraday_features), 保证口径一致。无定义/帧为空时原样返回。
+        """
+        if minute_df is None or minute_df.is_empty() or "datetime" not in minute_df.columns:
+            return minute_df
+        data_dir = self._user_data_dir()
+        if data_dir is None:
+            return minute_df
+        try:
+            from app.strategy import custom_signals
+            from app.strategy.intraday_features import build_feature_frame
+
+            definitions = custom_signals.load_intraday_all(data_dir)
+            if not definitions:
+                return minute_df
+            exprs = custom_signals.build_intraday_expressions(definitions)
+            if not exprs:
+                return minute_df
+            frame = build_feature_frame(minute_df)
+            if frame.is_empty():
+                return minute_df
+            evaluated = custom_signals.apply_intraday_edges(frame, exprs).select(
+                ["symbol", "datetime", *exprs.keys()]
+            )
+            return minute_df.join(evaluated, on=["symbol", "datetime"], how="left").with_columns(
+                [pl.col(name).fill_null(False).cast(pl.Boolean).alias(name) for name in exprs]
+            )
+        except Exception as e:
+            # 注入失败不阻断策略执行: 未注入列会由 required_features 校验兜底报错
+            logger.warning("intraday signal inject failed: %s", e)
+            return minute_df
 
     @staticmethod
     def _join_basic_columns(df: pl.DataFrame, current: pl.DataFrame) -> pl.DataFrame:

@@ -12,7 +12,7 @@ STRATEGY_PATH = (
     Path(__file__).resolve().parents[2]
     / "app"
     / "strategy"
-    / "builtin"
+    / "seeds"
     / "trial_line_breakout.py"
 )
 

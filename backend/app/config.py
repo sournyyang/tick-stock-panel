@@ -1,7 +1,9 @@
 """全局配置 — 从环境变量 / .env 读取。"""
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -13,8 +15,80 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 此时:
 #   - 只读资源 (tiers.yaml / 前端 dist) 放在 _MEIPASS 内
 #   - 可写用户数据 (data_dir) 放在可执行文件旁的用户目录
-# 非 frozen 模式 (开发/Docker): 保持原有 __file__ 推导, 行为完全不变。
+# 源码模式按项目根解析；官方 Docker 镜像显式标记其扁平 /app 布局。
 _IS_FROZEN = getattr(sys, "frozen", False)
+_DOCKER_MOUNTINFO = Path("/proc/self/mountinfo")
+logger = logging.getLogger(__name__)
+
+
+def _docker_root() -> Path | None:
+    if not _IS_FROZEN and os.environ.get("TSP_DOCKER") == "1":
+        return Path(__file__).resolve().parent.parent
+    return None
+
+
+def _docker_data_mounts() -> list[tuple[Path, str]]:
+    # ismount() can miss bind mounts on the same filesystem; use Linux mountinfo.
+    try:
+        lines = _DOCKER_MOUNTINFO.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    mounts = []
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 5 or len(filesystem) < 3:
+            continue
+        point = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]))
+        if point.is_absolute():
+            mounts.append((point, filesystem[0]))
+    return mounts
+
+
+def _resolve_data_dir(path: Path) -> Path:
+    docker_root = _docker_root()
+    if docker_root is None:
+        return path if path.is_absolute() else (_PROJECT_ROOT / path).resolve()
+
+    mounts = _docker_data_mounts()
+
+    def mounted(directory: Path) -> bool:
+        matches = [(point, fs) for point, fs in mounts if directory.resolve().is_relative_to(point)]
+        if not matches:
+            return False
+        # A nested tmpfs can hide a durable parent mount.
+        point, filesystem = max(matches, key=lambda item: len(item[0].parts))
+        return point != Path("/") and filesystem not in {"tmpfs", "ramfs"}
+
+    if not path.is_absolute():
+        legacy = (_PROJECT_ROOT / path).resolve()
+        target = (docker_root / path).resolve()
+        if legacy != target:
+            if mounted(legacy):
+                logger.warning("Docker 相对 DATA_DIR 沿用已有挂载目录 %s", legacy)
+                return legacy
+            try:
+                has_legacy_data = next(legacy.iterdir(), None) is not None
+            except FileNotFoundError:
+                has_legacy_data = False
+            except OSError as exc:
+                raise RuntimeError(f"无法检查 Docker 旧数据目录 {legacy}，未切换数据目录") from exc
+            if has_legacy_data:
+                # RuntimeError avoids Pydantic echoing settings (including keys).
+                raise RuntimeError(
+                    f"Docker 旧数据目录 {legacy} 中仍有文件，停止切换到 {target}。"
+                    "请先备份旧容器数据并迁入持久化目录；"
+                    f"如需沿用旧目录，请明确设置 DATA_DIR={legacy} 并挂载该目录。"
+                    "程序不会自动迁移或覆盖文件。"
+                )
+        path = target
+    if not mounted(path):
+        logger.warning(
+            "Docker 数据目录 %s 未检测到持久化挂载（或无法读取挂载信息）；"
+            "请将宿主机数据目录挂载到此路径，避免升级重建容器后丢失 Key 和数据。",
+            path,
+        )
+    return path
 
 
 def _user_data_root() -> Path:
@@ -22,27 +96,37 @@ def _user_data_root() -> Path:
 
     定位策略 (按优先级):
       1. 环境变量 DATA_DIR (pydantic-settings 自动注入到 settings.data_dir, 不在此处理)
-      2. 打包桌面版: exe 同级的 data/ 子目录 (<安装目录>/data/)
-         —— 与程序同处一个总目录 (用户选择的安装目录), 视觉直观, 便于备份/迁移。
-      3. 非 frozen (开发模式): 项目根 data/
+      2. 打包桌面版:
+         - macOS: ~/Library/Application Support/TSP —— 必须在 .app 包外。
+           升级用新 TSP.app 替换旧包时 Finder 会把整个旧包移入废纸篓,
+           数据放包内 (≤0.3.6 的 exe 同级 data) 等于每次覆盖安装都被清空;
+           App Support 是 mac 用户数据惯例位置, 替换 .app 永不触碰,
+           也规避向 /Applications 包内写入的权限问题。包内旧数据由
+           recover_desktop_data() 在后端启动前恢复旧配置。
+         - Windows/Linux: exe 同级的 data/ 子目录 (<安装目录>/data/)
+           —— 与程序同处一个总目录 (用户选择的安装目录), 视觉直观, 便于备份/迁移。
+      3. 非 frozen: 源码使用项目根 data/；官方 Docker 使用应用目录下的 data/
 
-    为什么不用 platformdirs 默认 (%LOCALAPPDATA%) 作为主路径:
+    为什么 Windows 不用 platformdirs 默认 (%LOCALAPPDATA%) 作为主路径:
       - 落在 C 盘系统目录, 用户不易察觉, 占系统盘空间
       - 用户期望「数据跟随程序」(便于备份/迁移)
     为什么放 {app}/data (exe 旁的 data/) 而非 {app} 外的兄弟目录:
       - 用户体验: 用户选了安装目录, 自然期望「程序和数据都在这」, 单一总目录更直观。
       - 数据安全: Inno Setup 覆盖安装(升级)时只往 {app} 写新程序文件, 不会清空
         目录里不在安装清单上的运行时文件 (data/ 即此类), 故覆盖安装不丢数据。
-        (注意: 卸载时需在 .iss 中豁免 data/, 见 packaging/tickflow.iss 的 [UninstallDelete]。)
-    旧版本数据迁移: 见 DataStore._migrate_legacy_data_dir(), 老用户首次启动自动搬迁。
+        (注意: 卸载时需在 .iss 中豁免 data/, 见 packaging/tsp.iss 的 [UninstallDelete]。)
+    旧版本恢复由 app.services.data_dir_upgrade 处理，已有配置优先并保留原配置备份。
     """
-    # 打包桌面版: exe 同级的 data/ 子目录 (与程序同一总目录, 覆盖安装不丢数据)
+    # 打包桌面版
     if _IS_FROZEN:
+        # macOS: 数据放 .app 包外 (升级替换 App 不丢数据), 位置为 mac 惯例路径
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / "TSP"
+        # Windows/Linux: exe 同级的 data/ 子目录 (与程序同一总目录, 覆盖安装不丢数据)
         exe_dir = Path(sys.executable).resolve().parent
         return exe_dir / "data"
 
-    # 开发模式: 项目根 data/
-    return _PROJECT_ROOT / "data"
+    return (_docker_root() or _PROJECT_ROOT) / "data"
 
 
 def _resource_root() -> Path:
@@ -84,9 +168,11 @@ class Settings(BaseSettings):
 
     # AI
     ai_provider: str = "openai_compat"
-    ai_base_url: str = "https://api.zhaji.dev/v1"
+    # OpenAI 系请求协议: chat_completions (兼容面最广) | responses (OpenAI 官方新协议)。
+    ai_protocol: str = "chat_completions"
+    ai_base_url: str = "https://llm.runninghub.ai/v1"
     ai_api_key: str = ""
-    ai_model: str = "gpt-5.5"
+    ai_model: str = "openai/gpt-6-astra-saver"
     ai_codex_command: str = "codex"
     ai_codex_reasoning_effort: str = ""
     # 默认浏览器风格 UA,绕过 Cloudflare 等 CDN/WAF 的 Bot 拦截(Issue #8)。
@@ -98,9 +184,12 @@ class Settings(BaseSettings):
     )
     # AI 输出上限 (max_tokens) 与输入上下文窗口上限 (约 token)。
     # 任务级 max_tokens 会被钳制到 ai_max_output_tokens; 输入估算超出上下文窗口时给出明确报错。
-    # 默认 8192 高于所有现有任务 (最多 4500), 避免默认配置反而截断长报告; 可在 AI 设置里调整。
-    ai_max_output_tokens: int = 8192
-    ai_context_window: int = 64000
+    # 钳制仅封顶不放大: 现有任务最多请求 4500, 上调默认值只影响用户自行调高任务上限的场景。
+    # 上下文 128000 对齐当前主流模型底线 (GPT/Claude/GLM/DeepSeek/Kimi 均 ≥128k); 可在 AI 设置里调整。
+    ai_max_output_tokens: int = 16384
+    ai_context_window: int = 128000
+    # AI 助手工具轮次检查点: 连续 N 轮工具调用未完成时弹「继续/停止」卡; 0=不检查。
+    ai_round_checkpoint: int = 100
 
     # Server
     host: str = "0.0.0.0"
@@ -112,11 +201,38 @@ class Settings(BaseSettings):
     backtest_matrix_cache_prewarm: bool = True
     backtest_matrix_cache_prewarm_years: int = 5
 
+    # polars collect 并发闸 — polars 共享执行器在多线程并发 collect 下存在死锁
+    # (上游 #24448/#25754 同族), 限流并发是社区验证的缓解手段。background 限额
+    # 保证预热/增量等后台计算不占满闸位饿死页面读请求。
+    polars_collect_permits: int = 4
+    polars_collect_background_permits: int = 2
+
+    # 后端自愈看门狗 — 探测 collect 闸与全局写锁, 连续失败即退出交由
+    # supervisor 拉起 (见 app/watchdog.py)。误伤防护靠保守阈值。
+    watchdog_enabled: bool = True
+    watchdog_interval_s: float = 30.0
+    watchdog_probe_timeout_s: float = 15.0
+    watchdog_failure_threshold: int = 2
+
+    # 策略批量执行 (run_all / 策略页全量跑) 的并发 worker 上限。实测 2026-09-07:
+    # polars eager 操作内部已多线程并行, 外层再并发 4 worker 属超订, 41 策略
+    # 299.6s 慢于串行 — 默认 1 (串行)。保留开关供配合 POLARS_MAX_THREADS 调优实验。
+    strategy_run_all_workers: int = 1
+
+    # run_all 渐进式返回: HTTP 同步等待时限 (秒)。策略按历史耗时升序执行,
+    # 到点后已算完的随响应返回, 未算完的转后台继续算并逐个写入策略缓存,
+    # 前端轮询 cached-summary 点亮卡片。0 = 关闭 (整段阻塞, 旧行为)。
+    strategy_run_all_first_return_s: float = 15.0
+
+    # 同步路由 (def) 线程池容量: Starlette/anyio 默认 40。看板自动刷新 +
+    # 多标签页 + 长计算路由并存时 40 容易排队, 调大仅提高上限 (按需创建)。
+    api_sync_thread_pool: int = 100
+
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。
     auth_password: str = ""
 
-    # Data — frozen: exe 同级 data/ 子目录; 非 frozen: 项目根 data/
+    # Data — 桌面版按平台约定；源码使用项目根 data/；Docker 使用 /app/data。
     # (均可被环境变量 DATA_DIR 覆盖, pydantic-settings 自动注入)
     data_dir: Path = _user_data_root()
 
@@ -128,10 +244,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> Settings:
-        """确保 data_dir 是绝对路径（环境变量传入的相对路径基于项目根目录解析）。"""
-        if not self.data_dir.is_absolute():
-            # 相对路径基于项目根目录解析，而非 CWD
-            self.data_dir = (_PROJECT_ROOT / self.data_dir).resolve()
+        """Docker 相对路径按应用目录解析；源码、桌面和绝对路径契约不变。"""
+        self.data_dir = _resolve_data_dir(self.data_dir)
         if self.backtest_matrix_cache_max_mb <= 0:
             raise ValueError("backtest_matrix_cache_max_mb must be positive")
         if self.backtest_matrix_cache_prewarm_years <= 0:
@@ -140,6 +254,20 @@ class Settings(BaseSettings):
             raise ValueError("ai_max_output_tokens must be positive")
         if self.ai_context_window <= 0:
             raise ValueError("ai_context_window must be positive")
+        if self.polars_collect_permits < 2:
+            raise ValueError("polars_collect_permits must be >= 2")
+        if not 1 <= self.polars_collect_background_permits < self.polars_collect_permits:
+            raise ValueError(
+                "polars_collect_background_permits must be in [1, polars_collect_permits)"
+            )
+        if self.watchdog_interval_s <= 0 or self.watchdog_probe_timeout_s <= 0:
+            raise ValueError("watchdog intervals must be positive")
+        if self.watchdog_failure_threshold < 1:
+            raise ValueError("watchdog_failure_threshold must be >= 1")
+        if self.strategy_run_all_workers < 1:
+            raise ValueError("strategy_run_all_workers must be >= 1")
+        if self.strategy_run_all_first_return_s < 0:
+            raise ValueError("strategy_run_all_first_return_s must be >= 0")
         return self
 
     @property

@@ -14,6 +14,7 @@ from typing import Any
 
 import polars as pl
 
+from app.services.fs_utils import atomic_write_parquet
 from app.tickflow.capabilities import Cap, CapabilitySet
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ def _financial_is_custom() -> bool:
     return custom_sources.provider_has_dataset(provider, "financial")
 
 
+def _financial_capability_label() -> str:
+    """门禁日志标签: "财务数据 ← fuyao" / "…(档位不足)", 便于判断该切哪个源。"""
+    from app.data_providers.capabilities import capability_gate
+    _, label = capability_gate("financial")
+    return label
+
+
 def _fetch_table(
     table: str,
     symbols: list[str],
@@ -61,7 +69,7 @@ def _fetch_table(
     """通过当前财务数据源拉取一张标准化财务表。"""
     is_custom = _financial_is_custom()
     if not is_custom and not capset.has(Cap.FINANCIAL):
-        logger.info("sync_%s skipped: no FINANCIAL capability", table)
+        logger.info("sync_%s skipped: %s 不可用", table, _financial_capability_label())
         return pl.DataFrame()
     if not symbols:
         logger.warning("sync_%s skipped: no symbols", table)
@@ -133,7 +141,7 @@ def _write_table(table: str, df: pl.DataFrame, data_dir: Path) -> int:
     out_dir = data_dir / "financials" / table
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "part.parquet"
-    df.write_parquet(out_file)
+    atomic_write_parquet(df, out_file)
 
     logger.info("sync_%s done: %d records written", table, len(df))
     return len(df)
@@ -160,7 +168,8 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     语义(区分"覆盖"与"填空"): 每列独立取 announce_date 最新的非空值 —
     新同步行有值则覆盖旧值, 新行缺的列(如 fuyao 不提供的字段)由旧行补齐,
     实现多数据源并集共存。历史报告期不可变, 合并不会引入过期数据。
-    无 announce_date 的帧按输入顺序, 后写优先(与旧行为 keep="last" 一致)。
+    无 announce_date 的帧按输入顺序, 后写优先(与旧行为 keep="last" 一致);
+    公告日为空视为最旧, 不得压过带公告日的行。
     """
     valid = [
         frame
@@ -176,7 +185,10 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     sort_keys = ["symbol", "period_end"] + (
         ["announce_date"] if "announce_date" in merged.columns else []
     )
-    merged = merged.sort(sort_keys, nulls_last=True)
+    # 公告日为空排在最前: 排到最后会让"公告日未知"的旧行在逐列 last() 时胜出,
+    # 产出 announce_date 是新公告、数值却是旧值的自相矛盾行。symbol/period_end
+    # 已在上面过滤掉空值, 不受该参数影响。
+    merged = merged.sort(sort_keys, nulls_last=False)
     value_cols = [c for c in merged.columns if c not in ("symbol", "period_end")]
     return (
         merged.group_by("symbol", "period_end")
@@ -246,7 +258,7 @@ def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
 def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     """同步所有财务表。返回 {table: rows}。"""
     if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
-        logger.info("sync_all financials skipped: no FINANCIAL capability")
+        logger.info("sync_all financials skipped: %s 不可用", _financial_capability_label())
         return {}
 
     symbols = _get_symbols(data_dir)
@@ -327,7 +339,7 @@ class FinancialScheduler:
         self._data_dir = data_dir
         self._capset = capset
         if not capset.has(Cap.FINANCIAL) and not _financial_is_custom():
-            logger.info("FinancialScheduler skipped: no FINANCIAL capability")
+            logger.info("FinancialScheduler skipped: %s 不可用", _financial_capability_label())
             return
         # 从持久化恢复上次同步时间: 重启后前端仍能显示真实最后同步时间,而非"尚未同步"
         try:

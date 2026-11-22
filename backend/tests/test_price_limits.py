@@ -17,6 +17,34 @@ from app.price_limits import (
     polars_price_limit_pct,
     price_limit_pct,
 )
+from app.strategy import custom_signals
+
+
+@pytest.fixture(autouse=True)
+def _limit_signal_definitions(monkeypatch):
+    """注入涨跌停信号定义 (与 data/user_data/custom_signals 种子同语义),
+    使 signal_limit_* 列断言不依赖运行目录的用户数据。"""
+    def _cond(left, op, right):
+        return {"left": left, "op": op, "right": right, "leftDays": 0, "rightDays": 0}
+
+    sigs = [
+        {"id": "limit_up", "column": "signal_limit_up",
+         "conditions": [_cond("raw_close", ">", "0"),
+                        _cond("raw_close", ">=", "field:limit_up_price")]},
+        {"id": "limit_down", "column": "signal_limit_down",
+         "conditions": [_cond("raw_close", ">", "0"),
+                        _cond("raw_close", "<=", "field:limit_down_price")]},
+        {"id": "limit_down_recovery", "column": "signal_limit_down_recovery",
+         "conditions": [_cond("raw_low", ">", "0"),
+                        _cond("raw_close", ">", "field:limit_down_price"),
+                        _cond("raw_low", "<=", "field:limit_down_price"),
+                        _cond("close", ">", "field:open")]},
+    ]
+    monkeypatch.setattr(
+        pipeline, "_custom_signal_exprs", custom_signals.build_expressions(
+            [{**s, "name": s["id"], "kind": "both", "enabled": True} for s in sigs]
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -138,14 +166,53 @@ def test_minute_price_limit_prefers_authoritative_prices_only_today(monkeypatch)
         "rate": 0.10,
         "limit_up": 10.88,
         "limit_down": 8.90,
+        "no_limit": False,
         "source": "instrument",
     }
     assert historical == {
         "rate": 0.05,
         "limit_up": None,
         "limit_down": None,
+        "no_limit": False,
         "source": "rule",
     }
+
+
+class _NewStockRepo:
+    """listing_date 在无涨跌幅窗口内的注册制新股维表 (C沈鼓场景)。"""
+
+    def __init__(self, listing: date):
+        self.listing = listing
+
+    def get_instruments_asset(self, asset_type: str) -> pl.DataFrame:
+        assert asset_type == "stock"
+        return pl.DataFrame({
+            "symbol": ["601091.SH"],
+            "name": ["C沈鼓"],
+            "limit_up": [100000.0],   # 哨兵值
+            "limit_down": [None],
+            "listing_date": [self.listing],
+        })
+
+
+def test_minute_price_limit_no_limit_window_overrides_rate_and_sentinel():
+    """listing_date 命中窗口: 历史日 (哨兵/as_of 均失效) 也返回 no_limit=True。"""
+    listing = date(2026, 9, 17)
+    repo = _NewStockRepo(listing)
+
+    # 行情日 = 上市次日 (窗口内), 维表 as_of 与行情日无关 (无 as_of 列)
+    info = kline._get_price_limit_info(repo, "601091.SH", date(2026, 9, 18), "stock", "C沈鼓")
+
+    assert info is not None
+    assert info["no_limit"] is True
+    assert info["limit_up"] is None
+    assert info["limit_down"] is None
+
+    # 窗口外 (第 6 个交易日之后) 恢复 rate 口径
+    after = kline._get_price_limit_info(repo, "601091.SH", date(2026, 10, 15), "stock", "沈鼓能源")
+    assert after is not None
+    assert after["no_limit"] is False
+    assert after["rate"] == 0.10
 
 
 def _daily_limit_rows(current_close: float) -> pl.DataFrame:
@@ -189,6 +256,71 @@ def test_daily_limit_prices_require_matching_instrument_date(instrument_as_of, e
     assert "_instrument_as_of" not in result.columns
 
 
+def test_daily_limit_prices_ignore_zero_placeholder_and_match_realtime():
+    """维表涨跌停价为 0 (数据源未提供该字段的占位值) 时必须回退理论价。
+
+    直接采用 0 会让「raw_close >= 0 - 0.005」恒成立, 当日所有标的被判涨停,
+    连板数一路累加; 跌停侧反过来永远判不出跌停。实时路径
+    (_compute_limit_signals_today) 已有 >0 守卫, 冷路径必须同口径。
+    """
+    instruments = pl.DataFrame({
+        "symbol": ["600001.SH"],
+        "name": ["普通股"],
+        "limit_up": [0.0],
+        "limit_down": [0.0],
+        "as_of": [date(2026, 7, 20)],
+    })
+
+    # 只涨 0.5%: 不是涨停
+    mild = pipeline.compute_limit_signals(
+        _daily_limit_rows(10.05),
+        instruments,
+        needed={"signal_limit_up", "consecutive_limit_ups"},
+    )
+    assert mild["signal_limit_up"][-1] is False
+    assert mild["consecutive_limit_ups"][-1] == 0
+
+    # 真涨停 11.00 = 10.00 x 1.1: 理论价兜底后仍须判出
+    sealed = pipeline.compute_limit_signals(
+        _daily_limit_rows(11.00),
+        instruments,
+        needed={"signal_limit_up", "consecutive_limit_ups"},
+    )
+    assert sealed["signal_limit_up"][-1] is True
+    assert sealed["consecutive_limit_ups"][-1] == 1
+
+    # 真跌停 9.00 = 10.00 x 0.9: 占位 0 不得让跌停漏判
+    floored = pipeline.compute_limit_signals(
+        _daily_limit_rows(9.00),
+        instruments,
+        needed={"signal_limit_down"},
+    )
+    assert floored["signal_limit_down"][-1] is True
+
+    # 与实时路径同一份维表同一结论
+    realtime = pipeline._compute_limit_signals_today(
+        pl.DataFrame({
+            "symbol": ["600001.SH"],
+            "date": [date(2026, 7, 20)],
+            "open": [10.05],
+            "high": [10.05],
+            "low": [10.05],
+            "close": [10.05],
+            "raw_close": [10.05],
+            "raw_high": [10.05],
+            "raw_low": [10.05],
+            "_prev_close_raw": [10.0],
+            "volume": [1000.0],
+        }),
+        instruments,
+    )
+    # 实时路径不注入信号列 (定义注入在 compute_enriched_today 末尾), 按引擎判定价对拍
+    assert realtime["limit_up_price"][0] == pytest.approx(10.995)
+    assert realtime["consecutive_limit_ups"][0] == 0
+    assert mild["limit_up_price"][-1] == realtime["limit_up_price"][0]
+    assert mild["consecutive_limit_ups"][-1] == realtime["consecutive_limit_ups"][0]
+
+
 def test_realtime_limit_prices_ignore_stale_instrument_date():
     today = date(2026, 7, 20)
     rows = pl.DataFrame({
@@ -214,7 +346,9 @@ def test_realtime_limit_prices_ignore_stale_instrument_date():
 
     result = pipeline._compute_limit_signals_today(rows, instruments)
 
-    assert result["signal_limit_down"][0] is False
+    # 过期维表 → 回退理论跌停价 9.005 (而非权威 9.105), 9.10 未触及 → 不判跌停
+    assert result["limit_down_price"][0] == pytest.approx(9.005)
+    assert result["consecutive_limit_downs"][0] == 0
     assert "_instrument_as_of" not in result.columns
 
 
@@ -254,3 +388,111 @@ def test_limit_down_recovery_uses_raw_low_under_later_ex_div():
     assert day2["signal_limit_down_recovery"][0] is False
     day3 = df.filter(pl.col("date") == date(2024, 1, 4))
     assert day3["signal_limit_down_recovery"][0] is True
+
+
+def test_matrix_limit_lock_uses_exchange_reference_on_ex_div_with_later_event(tmp_path):
+    """除权日涨跌停判定价必须用交易所除权参考价, 不能直接用前复权昨收。
+
+    事件: d3 除权 (ex_factor=1.25), d6 再除权 (ex_factor=1.25)。
+    d3 的交易所参考价 = raw昨收/ex_factor = 10/1.25 = 8.00, 涨停价 8.80;
+    前复权昨收 = 10/1.5625 = 6.40 (被 d6 事件额外缩放)。旧口径拿 6.40 当参考
+    → 限价 7.04, raw 8.79 被误标"涨停锁死"。
+    """
+    root = tmp_path / "market"
+    spec = [
+        # (date, raw_close, F(d) = 该日之后所有事件因子乘积)
+        (date(2024, 1, 2), 10.00, 1.5625),
+        (date(2024, 1, 3), 10.00, 1.5625),
+        (date(2024, 1, 4), 8.79, 1.25),   # ex1 除权日: 真涨停价 8.80, 未触及
+        (date(2024, 1, 5), 8.70, 1.25),
+        (date(2024, 1, 8), 8.70, 1.25),
+        (date(2024, 1, 9), 7.00, 1.0),    # ex2 除权日 (窗口末日)
+    ]
+    for trade_date, raw, f in spec:
+        partition = root / f"date={trade_date.isoformat()}"
+        partition.mkdir(parents=True)
+        pl.DataFrame({
+            "symbol": ["600001.SH"],
+            "date": [trade_date],
+            "open": [raw], "high": [raw], "low": [raw],
+            "close": [raw / f], "raw_close": [raw], "volume": [1000.0],
+        }).write_parquet(partition / "part.parquet")
+
+    market = load_market_data_matrix_from_parquet(
+        root, spec[0][0], spec[-1][0],
+        field_columns={"raw_close"},
+        instruments=pl.DataFrame({"symbol": ["600001.SH"], "name": ["普通股"]}),
+        cache_root=tmp_path / "cache",
+    )
+    # d3 除权日: 参考价 8.00 → 涨停 8.80 / 跌停 7.20, raw 8.79 均未触及
+    assert market.limit_up_locked[2, 0] == 0
+    assert market.limit_down_locked[2, 0] == 0
+    # d6 第二次除权日 (窗口末日, F=1): 参考价 8.70/1.25 = 6.96,
+    # 涨停 7.66 / 跌停 6.26, raw 7.00 未封板
+    assert market.limit_up_locked[5, 0] == 0
+    assert market.limit_down_locked[5, 0] == 0
+
+
+def test_limit_price_on_ex_div_with_later_event_uses_exchange_reference():
+    """enriched 路径同口径: 除权日 limit_up/down_price 用除权参考价, 不是前复权昨收。
+
+    事件: d3 除权 (f=1.25), d4 再除权 (f=1.25)。
+    d3 参考价 = 10/1.25 = 8.00 (前复权昨收 6.40 被事件额外缩放, 旧口径算出
+    涨停价 7.04 → raw 8.79 误判涨停); d4 参考价 = 8.79/1.25 = 7.032,
+    raw 7.74 恰为涨停价 → 正常检出 (防过度修正)。
+    """
+    raw = pl.DataFrame({
+        "symbol": ["600001.SH"] * 4,
+        "date": [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)],
+        "open": [10.00, 10.00, 8.79, 7.74],
+        "high": [10.00, 10.00, 8.79, 7.74],
+        "low": [10.00, 10.00, 8.79, 7.74],
+        "close": [10.00, 10.00, 8.79, 7.74],
+        "volume": [10000.0] * 4,
+        "amount": [1.0e7] * 4,
+    })
+    factors = pl.DataFrame({
+        "symbol": ["600001.SH"] * 2,
+        "trade_date": [date(2024, 1, 4), date(2024, 1, 5)],
+        "ex_factor": [1.25, 1.25],
+    })
+    instruments = pl.DataFrame({
+        "symbol": ["600001.SH"], "name": ["普通股"], "float_shares": [1.0e8],
+    })
+
+    df = pipeline.compute_enriched(raw, factors=factors, instruments=instruments)
+
+    d3 = df.filter(pl.col("date") == date(2024, 1, 4))
+    # 落库列为含容差的交易所生效价: 涨停 8.80-0.005 / 跌停 7.20+0.005
+    assert d3["limit_up_price"][0] == pytest.approx(8.795)
+    assert d3["limit_down_price"][0] == pytest.approx(7.205)
+    assert d3["signal_limit_up"][0] is False
+    assert d3["consecutive_limit_ups"][0] == 0
+
+    d4 = df.filter(pl.col("date") == date(2024, 1, 5))
+    assert d4["limit_up_price"][0] == pytest.approx(7.725)
+    assert d4["signal_limit_up"][0] is True
+    assert d4["consecutive_limit_ups"][0] == 1
+
+
+def test_chinext_302_codes_use_growth_board_rules():
+    """深交所创业板已启用 302 号段 (如 2025-02-17 起的 302132.SZ 中航成飞),
+    与 300/301 同为 ±20%, 注册制新股同样有 5 个交易日无涨跌幅窗口。"""
+    assert price_limit_pct("302132.SZ", date(2026, 10, 16)) == pytest.approx(0.20)
+
+    df = pl.DataFrame({
+        "symbol": ["302132.SZ", "000001.SZ"],
+        "trade_date": [date(2026, 10, 16)] * 2,
+        "is_risk_warning": [False, False],
+    })
+    pct = df.select(
+        polars_price_limit_pct(pl.col("symbol"), pl.col("trade_date"), pl.col("is_risk_warning"))
+    ).to_series()
+    assert pct.to_list() == pytest.approx([0.20, 0.10])
+
+
+def test_chinext_302_no_limit_window_follows_gem_registration_date():
+    from app.price_limits import no_limit_window_days
+
+    # 2023-02-17 主板注册制之前、2020-08-24 创业板注册制之后上市
+    assert no_limit_window_days("302001.SZ", date(2021, 6, 1)) == 5

@@ -3,14 +3,41 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import polars as pl
+import pytest
 
 from app.indicators.pipeline import (
     ENRICHED_COLUMNS_BY_CATEGORY,
-    SIGNAL_DEPENDENCIES,
     compute_enriched_today,
     compute_indicators,
 )
+from app.strategy import custom_signals
 from app.tickflow.repository import DataStore, KlineRepository
+
+
+@pytest.fixture(autouse=True)
+def _isolated_limit_signal(monkeypatch):
+    """信号列已定义驱动: 注入最小 limit_up 定义, 不依赖运行目录的用户数据。
+
+    无涨跌幅限制日 limit_up_price 为 null → 信号为 null (非 False),
+    消费端按假值处理; 断言用 ``is not True`` 口径。
+    """
+    from app.indicators import pipeline
+
+    sigs = [{
+        "id": "limit_up", "name": "涨停", "kind": "both", "enabled": True,
+        "column": "signal_limit_up",
+        "conditions": [
+            {"left": "raw_close", "op": ">", "right": "0", "leftDays": 0, "rightDays": 0},
+            {"left": "raw_close", "op": ">=", "right": "field:limit_up_price",
+             "leftDays": 0, "rightDays": 0},
+        ],
+    }]
+    prev_fields = custom_signals.prev_day_fields(sigs)
+    monkeypatch.setattr(
+        pipeline, "_custom_signal_exprs_today",
+        custom_signals.build_expressions_prev(sigs, prev_fields),
+    )
+    monkeypatch.setattr(pipeline, "_custom_prev_fields_cache", prev_fields)
 
 
 def _historical_cache(latest: date) -> pl.DataFrame:
@@ -156,6 +183,35 @@ def _previous_enriched() -> pl.DataFrame:
     })
 
 
+def test_realtime_enriched_does_not_multiply_duplicate_snapshot_rows():
+    today = date(2026, 7, 30)
+    today_rows = pl.DataFrame({
+        "symbol": ["600001.SH", "600001.SH"],
+        "date": [today, today],
+        "open": [10.0, 10.1],
+        "high": [10.1, 10.2],
+        "low": [9.9, 10.0],
+        "close": [10.1, 10.2],
+        "volume": [1100.0, 1200.0],
+        "amount": [11110.0, 12240.0],
+        "prev_close": [10.0, 10.0],
+    })
+    duplicate_previous = pl.concat([
+        _previous_enriched(),
+        _previous_enriched(),
+    ])
+
+    result = compute_enriched_today(
+        _live_state(),
+        duplicate_previous,
+        today_rows,
+    )
+
+    assert result.select("symbol", "raw_close").to_dicts() == [
+        {"symbol": "600001.SH", "raw_close": 10.2},
+    ]
+
+
 def test_realtime_enriched_keeps_rows_without_history_and_limits_technical_fields():
     today = date(2026, 7, 30)
     today_rows = pl.DataFrame({
@@ -202,11 +258,47 @@ def test_realtime_enriched_keeps_rows_without_history_and_limits_technical_field
             "extremes", "momentum", "volatility", "rsi",
         )
         for column in ENRICHED_COLUMNS_BY_CATEGORY[category]
-    } | set(SIGNAL_DEPENDENCIES)
+    }
     assert all(resumed[column] is None for column in technical_columns)
-    assert ipo["signal_limit_up"] is False
+    assert ipo["signal_limit_up"] is not True  # 无涨跌幅日判定价为 null
     assert halted["signal_limit_up"] is not True
     assert "_has_history_state" not in result.columns
+
+
+def test_realtime_enriched_missing_quote_extra_fields_fall_back_to_recompute():
+    """quote_extra 未提供换手/振幅 (fuyao 等源) 时, 当日值必须从 float_shares/价格回退计算。
+
+    实时链路 _build_quote_extra 丢弃全空列后, today_ohlcv 不带这两列,
+    _compute_limit_signals_today 从 float_shares 算换手、compute_enriched_today
+    从价格算振幅 —— 不允许再出现「全空列进管道 → 列存在即跳过重算 → 当日永远为空」。
+    """
+    today = date(2026, 7, 30)
+    today_rows = pl.DataFrame({
+        "symbol": ["600001.SH", "000820.SZ", "001000.SZ"],
+        "date": [today] * 3,
+        "open":  [10.1, 11.0, 11.0],
+        "high":  [10.2, 11.2, 11.1],
+        "low":   [10.0, 10.8, 10.9],
+        "close": [10.2, 11.0, 11.0],
+        "volume": [1200.0, 3000.0, 2000.0],
+        "amount": [12240.0, 33000.0, 22000.0],
+        "prev_close": [10.0, 10.5, 10.5],
+    })
+    instruments = pl.DataFrame({
+        "symbol": ["600001.SH", "000820.SZ", "001000.SZ"],
+        "name": ["已有历史", "复牌股票", "上市新股"],
+        "float_shares": [1_000_000.0] * 3,
+        "limit_up": [11.0, 11.0, 100000.0],
+        "limit_down": [9.0, 9.0, 0.0],
+        "as_of": [today] * 3,
+    })
+
+    result = compute_enriched_today(_live_state(), _previous_enriched(), today_rows, instruments)
+
+    # 换手 = volume(手) * 10000 / float_shares(股)
+    assert result["turnover_rate"].to_list() == [12.0, 30.0, 20.0]
+    # 振幅 = (high - low) / prev_close
+    assert result["amplitude"].is_not_null().all()
 
 
 def test_repository_restores_active_rows_missing_from_latest_enriched(tmp_path):

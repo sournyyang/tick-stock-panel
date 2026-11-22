@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as dtime
 
 import polars as pl
@@ -136,6 +136,19 @@ class StockSDKProvider:
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- minute ----
+    def get_minute_postmarket(self, symbols: list[str], trade_date: date) -> pl.DataFrame:
+        """盘后采集单批：串行限速、单次尝试，失败交给盘后检查点延后重试。"""
+        if not symbols:
+            return pl.DataFrame()
+        result = bridge.run_job({
+            "op": "minute_postmarket", "symbols": symbols,
+            "date": trade_date.isoformat(),
+        }, timeout=len(symbols) * 10 + 15)
+        frames = [self._minute_df(rows, symbol)
+                  for symbol, rows in (result.get("rows") or {}).items() if rows]
+        frames = [frame for frame in frames if not frame.is_empty()]
+        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
     def get_minute(
         self,
         symbols: list[str],

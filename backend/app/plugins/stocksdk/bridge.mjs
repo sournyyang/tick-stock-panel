@@ -196,6 +196,23 @@ async function opMinute(sdk, job) {
   return out
 }
 
+async function opMinutePostmarket(sdk, job) {
+  const out = {}
+  for (const sym of job.symbols || []) {
+    // 不叠加空结果重试：全市场逐股失败由 Python 检查点延后重试。
+    try {
+      const bars = await sdk.kline.cnMinute(sym, {
+        period: '1', startDate: `${job.date} 09:30:00`, endDate: `${job.date} 15:00:00`,
+      })
+      out[sym] = Array.isArray(bars) ? bars : []
+    } catch {
+      out[sym] = []
+    }
+    await sleep(1000)
+  }
+  return out
+}
+
 async function opRealtime(sdk, job) {
   const { concurrency = 8 } = job
   const all = await sdk.batch.cn({ concurrency })
@@ -262,7 +279,10 @@ async function main() {
       process.stdout.write(JSON.stringify({ ok: true, op: 'ping', version: StockSDK.version || 'ok' }))
       return
     }
-    const sdk = new StockSDK({ retry: { maxRetries: 3, baseDelay: 400 } })
+    const sdk = new StockSDK(op === 'minute_postmarket'
+      ? { timeout: 8000, retry: { maxRetries: 0 },
+          rateLimit: { requestsPerSecond: 1, maxBurst: 1 } }
+      : { retry: { maxRetries: 3, baseDelay: 400 } })
     let rows
     switch (op) {
       case 'daily':
@@ -273,6 +293,9 @@ async function main() {
         break
       case 'minute':
         rows = await opMinute(sdk, job)
+        break
+      case 'minute_postmarket':
+        rows = await opMinutePostmarket(sdk, job)
         break
       case 'realtime':
         rows = await opRealtime(sdk, job)

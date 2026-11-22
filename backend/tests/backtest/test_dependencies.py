@@ -4,9 +4,10 @@ import types
 from datetime import date, timedelta
 
 import polars as pl
+import pytest
 
 from app.backtest.strategy import StrategyDependencyResolver
-from app.strategy.builtin.near_limit_up import MATRIX_STRATEGY, META
+from app.strategy.seeds.near_limit_up import MATRIX_STRATEGY, META
 from app.strategy.engine import StrategyDef
 
 
@@ -28,6 +29,13 @@ def _strategy(**overrides) -> StrategyDef:
     )
     values.update(overrides)
     return StrategyDef(**values)
+
+
+@pytest.fixture(autouse=True)
+def _migrated_signal_definitions(monkeypatch):
+    """注入迁移自内置的信号定义 (信号列定义驱动, 不依赖运行目录)。"""
+    from tests.signal_seeds import install_pipeline_caches
+    install_pipeline_caches(monkeypatch)
 
 
 def test_resolver_merges_signals_scoring_filter_and_execution_columns():
@@ -171,6 +179,8 @@ def test_history_strategy_without_required_features_falls_back_to_full(caplog):
 
     assert plan.full_feature_fallback is True
     assert "rsi_14" in plan.indicator_columns
+    # 动态依赖策略可能引用股本列 — 兜底一并加载 (kanban float_shares 回归)
+    assert {"float_shares", "total_shares"} <= plan.instrument_columns
     assert "falls back to full feature computation" in caplog.text
 
 

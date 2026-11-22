@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import secrets_store
@@ -57,14 +59,16 @@ def get_settings() -> dict:
     from app.services import preferences
     from app.services.ai_provider import (
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
+        current_ai_protocol,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
     )
 
     key = secrets_store.get_tickflow_key()
@@ -80,8 +84,11 @@ def get_settings() -> dict:
         "extras_caps": extras_caps(),
         # 首次使用引导
         "onboarding_completed": preferences.get_onboarding_completed(),
+        # 配置文件位置 (AI 与数据源 Key 统一存放, 支持外部编辑后热加载)
+        "secrets_path": str(secrets_store.file_path()),
         # AI 配置
         "ai_provider": ai_provider,
+        "ai_protocol": current_ai_protocol(),
         "ai_base_url": secrets_store.get_ai_config("ai_base_url", settings.ai_base_url),
         "ai_api_key_masked": secrets_store.mask(secrets_store.get_ai_key()),
         "has_ai_key": bool(secrets_store.get_ai_key()),
@@ -95,6 +102,7 @@ def get_settings() -> dict:
         "ai_user_agent": secrets_store.get_ai_config("ai_user_agent", settings.ai_user_agent),
         "ai_max_output_tokens": current_ai_max_output_tokens(),
         "ai_context_window": current_ai_context_window(),
+        "ai_round_checkpoint": current_ai_round_checkpoint(),
     }
 
 
@@ -143,7 +151,8 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
     故自动切到默认付费端点(api.tickflow.org);free 档则清除自定义端点。
     """
     from app.tickflow.policy import (
-        base_tier_name, is_invalid_key,
+        base_tier_name,
+        is_invalid_key,
     )
 
     key = req.api_key.strip()
@@ -251,12 +260,58 @@ class AiSettingsIn(BaseModel):
     base_url: str = ""
     api_key: str | None = None
     model: str = ""
+    protocol: str = ""              # chat_completions | responses; 空=保持原值
     reasoning_effort: str = Field(default="high", max_length=64)
     codex_command: str = ""
     codex_reasoning_effort: str = ""
     user_agent: str = ""
     max_output_tokens: int | None = None   # 输出上限, 钳制所有任务的 max_tokens
     context_window: int | None = None      # 输入上下文窗口上限 (约 token)
+    round_checkpoint: int | None = None    # 助手工具轮次检查点; 0=不检查
+
+
+class AiTestIn(BaseModel):
+    """草稿连通性测试入参 — 只读表单值, 与保存完全解耦。"""
+
+    provider: str = "openai_compat"
+    base_url: str = ""
+    api_key: str | None = None      # 留空回退已保存 Key (改模型/协议不必重输)
+    model: str = ""
+    protocol: str = ""
+
+
+@router.post("/ai/test")
+async def test_ai_settings(req: AiTestIn) -> dict:
+    """用当前表单值发一次最小请求验证连通性, 不保存/不修改任何配置。
+
+    与 POST /ai (保存) 解耦: 测试失败不影响已保存配置, 状态栏也不会把
+    未验证的草稿展示为已生效。错误保留 200 包体 (ok=false), 由前端内联
+    展示在测试结果徽章, 不触发全局 toast。
+    """
+    from app.services.ai_provider import (
+        RESPONSES_PROTOCOL,
+        _format_openai_error,
+        _is_openai_transport_error,
+        probe_ai_config,
+    )
+
+    provider = req.provider or "openai_compat"
+    api_key = (req.api_key or "").strip() or (secrets_store.get_ai_key() or "")
+    protocol = req.protocol if req.protocol == RESPONSES_PROTOCOL else ""
+    try:
+        text = await probe_ai_config(
+            provider=provider,
+            api_key=api_key,
+            base_url=req.base_url.strip(),
+            model=req.model.strip(),
+            protocol=protocol,
+        )
+    except Exception as exc:  # noqa: BLE001 — 连通性测试: 任何异常都转为结果回报
+        detail = str(exc) or repr(exc)
+        if _is_openai_transport_error(exc):
+            detail = _format_openai_error(exc)
+        return {"ok": False, "error": detail, "error_type": type(exc).__name__}
+    return {"ok": True, "model": req.model.strip() or provider, "response": text[:80]}
 
 
 @router.post("/ai")
@@ -264,17 +319,21 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
     """保存 AI 配置（全部持久化到 secrets.json）"""
     from app.config import settings
     from app.services.ai_provider import (
+        CHAT_COMPLETIONS_PROTOCOL,
         OPENAI_PROVIDER,
+        RESPONSES_PROTOCOL,
         ai_configured,
+        current_ai_context_window,
+        current_ai_max_output_tokens,
         current_ai_model,
+        current_ai_protocol,
         current_ai_provider,
+        current_ai_round_checkpoint,
         current_codex_command,
         current_codex_model,
         current_codex_reasoning_effort,
         current_openai_model,
         current_openai_reasoning_effort,
-        current_ai_context_window,
-        current_ai_max_output_tokens,
         normalize_codex_command,
         normalize_codex_model,
         normalize_codex_reasoning_effort,
@@ -299,6 +358,12 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         if req.base_url:
             updates["ai_base_url"] = req.base_url
             settings.ai_base_url = req.base_url
+        if req.protocol:
+            # 协议仅对 openai/openai_compat 有意义; 非法值 fail-loud, 避免静默落错协议。
+            if req.protocol not in (CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL):
+                raise HTTPException(status_code=400, detail=f"不支持的协议: {req.protocol}")
+            updates["ai_protocol"] = req.protocol
+            settings.ai_protocol = req.protocol
         if req.api_key is not None:
             if req.api_key:
                 updates["ai_api_key"] = req.api_key
@@ -326,6 +391,12 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
             raise HTTPException(status_code=400, detail="上下文窗口必须为正整数")
         updates["ai_context_window"] = req.context_window
         settings.ai_context_window = req.context_window
+    if req.round_checkpoint is not None:
+        # 0=关闭检查点(不询问), 正值须 ≥5 防误填 1/2 造成每轮都弹卡
+        if req.round_checkpoint != 0 and req.round_checkpoint < 5:
+            raise HTTPException(status_code=400, detail="轮次检查点须为 0(不检查)或不小于 5 的整数")
+        updates["ai_round_checkpoint"] = req.round_checkpoint
+        settings.ai_round_checkpoint = req.round_checkpoint
 
     if updates:
         secrets_store.save(updates)
@@ -334,6 +405,7 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
     return {
         "ok": True,
         "ai_provider": provider,
+        "ai_protocol": current_ai_protocol(),
         "ai_model": current_ai_model(),
         "ai_openai_model": current_openai_model(),
         "ai_reasoning_effort": current_openai_reasoning_effort(),
@@ -343,6 +415,7 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         "ai_configured": ai_configured(provider),
         "ai_max_output_tokens": current_ai_max_output_tokens(),
         "ai_context_window": current_ai_context_window(),
+        "ai_round_checkpoint": current_ai_round_checkpoint(),
     }
 
 
@@ -364,18 +437,87 @@ def clear_ai_settings() -> dict:
         "ai_codex_command",
         "ai_codex_reasoning_effort",
     )
-    secrets_store.clear("ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
+    secrets_store.clear("ai_provider", "ai_protocol", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
     # 同步重置运行时内存(provider 回默认值,其余置空)
     settings.ai_provider = "openai_compat"
+    settings.ai_protocol = "chat_completions"
     settings.ai_base_url = ""
     settings.ai_api_key = ""
     settings.ai_model = ""
     settings.ai_codex_command = "codex"
     settings.ai_codex_reasoning_effort = ""
-    settings.ai_max_output_tokens = 8192
-    settings.ai_context_window = 64000
+    settings.ai_max_output_tokens = 16384
+    settings.ai_context_window = 128000
 
     return {"ok": True}
+
+
+@router.get("/ai/sponsor-models")
+async def list_sponsor_models() -> dict:
+    """代理获取赞助商(RunningHub)的模型列表。
+
+    其网关按 Origin 头过滤: 浏览器跨域请求只会拿到国产模型子集,
+    服务端请求无 Origin 头可取全量, 故由后端代理转发。
+
+    /v1/models 除 id 外还携带 pricing (discountRate/分层单价) 与
+    context_length; 精简为 items 下发供前端展示折扣徽章与价格,
+    models 保持纯 id 列表向后兼容。
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.get("https://llm.runninghub.ai/v1/models")
+            res.raise_for_status()
+            data = res.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc
+
+    def _amount(pricing: dict, dim: str) -> float | None:
+        value = (pricing.get(dim) or {}).get("amount")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    def _rate(band: dict | None) -> float | None:
+        if not isinstance(band, dict):
+            return None
+        value = band.get("discountRate")
+        return float(value) if isinstance(value, (int, float)) else None
+
+    items: list[dict] = []
+    for raw in data.get("data", []):
+        if not isinstance(raw, dict):
+            continue
+        model_id = raw.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        pricing = raw.get("pricing") if isinstance(raw.get("pricing"), dict) else {}
+        rate = pricing.get("discountRate")
+        context_length = raw.get("context_length")
+        # 忙闲时定价: 上游把两档折扣放在 pricing.timePricing.timeBands。
+        # 顶层 discountRate 为忙时价, 忙闲时展示需单独透传。
+        time_pricing = pricing.get("timePricing")
+        time_pricing = time_pricing if isinstance(time_pricing, dict) else {}
+        bands = time_pricing.get("timeBands")
+        bands = [b for b in bands if isinstance(b, dict)] if isinstance(bands, list) else []
+        busy = next((b for b in bands if b.get("code") == "BUSY"), None)
+        offpeak = next((b for b in bands if b.get("code") == "OFF_PEAK"), None)
+        current_band = time_pricing.get("currentBand")
+        current = next((b for b in bands if b.get("code") == current_band), None) if isinstance(current_band, str) else None
+        items.append({
+            "id": model_id,
+            "context_length": context_length if isinstance(context_length, int) else None,
+            "discount_rate": float(rate) if isinstance(rate, (int, float)) else 1.0,
+            "input_price": _amount(pricing, "input"),
+            "output_price": _amount(pricing, "output"),
+            # 忙闲时 (无 timePricing 的模型为 None, 前端回退单一折扣)
+            "busy_discount_rate": _rate(busy),
+            "offpeak_discount_rate": _rate(offpeak),
+            "offpeak_label": offpeak.get("label") if isinstance(offpeak, dict) and isinstance(offpeak.get("label"), str) else None,
+            "current_band": current_band if isinstance(current_band, str) else None,
+            "current_discount_rate": _rate(current),
+        })
+    items.sort(key=lambda x: x["id"])
+    return {"models": [item["id"] for item in items], "items": items}
 
 
 # ===== 偏好设置 =====
@@ -389,7 +531,7 @@ def _realtime_allowed() -> bool:
 def _minute_history_days() -> int | None:
     """当前分钟源的 1 分钟历史深度(交易日); None = 深历史(tickflow 基准)。
 
-    provider 可选类属性 minute_history_days 声明 (如 stock-sdk = 5,
+    provider 可选类属性 minute_history_days 声明 (如浅源 = 5,
     免费分时接口只保留最近 5 个交易日); 未声明或走 tickflow 时视为深历史。
     前端分时档位/默认值据此收窄。
     """
@@ -528,6 +670,9 @@ def get_preferences() -> dict:
         "instruments_schedule": preferences.get_instruments_schedule(),
         "enriched_batch_size": preferences.get_enriched_batch_size(),
         "index_daily_batch_size": preferences.get_index_daily_batch_size(),
+        "daily_batch_symbols": preferences.get_daily_batch_symbols(),
+        "minute_batch_symbols": preferences.get_minute_batch_symbols(),
+        "backtest_worker_rss_limit_gib": preferences.get_backtest_worker_rss_limit_gib(),
         "watchlist_columns": preferences.get_watchlist_columns(),
         "screener_result_columns": preferences.get_screener_result_columns(),
         "sse_refresh_pages": preferences.get_sse_refresh_pages(),
@@ -537,6 +682,12 @@ def get_preferences() -> dict:
         "feishu_webhook_url": preferences.get_feishu_webhook_url(),
         "feishu_webhook_secret": preferences.get_feishu_webhook_secret(),
         "wecom_webhook_url": preferences.get_wecom_webhook_url(),
+        "dingtalk_webhook_url": preferences.get_dingtalk_webhook_url(),
+        "dingtalk_webhook_secret_set": bool(secrets_store.get_dingtalk_webhook_secret()),
+        "custom_webhook_url": preferences.get_custom_webhook_url(),
+        "custom_webhook_secret_set": bool(secrets_store.get_custom_webhook_secret()),
+        "email_smtp_config": preferences.get_email_smtp_config(),
+        "email_smtp_password_set": bool(secrets_store.get_email_smtp_password()),
         "wecom_bot_id": preferences.get_wecom_bot_id(),
         "wecom_bot_secret": preferences.get_wecom_bot_secret(),
         "wecom_bot_enabled": preferences.get_wecom_bot_enabled(),
@@ -547,12 +698,21 @@ def get_preferences() -> dict:
         "monitor_ext_fields": preferences.get_monitor_ext_fields(),
         "nav_order": preferences.get_nav_order(),
         "nav_hidden": preferences.get_nav_hidden(),
+        "nav_layout": preferences.get_nav_layout(),
+        "dashboard_layout": preferences.get_dashboard_layout(),
         "screener_auto_run": preferences.get_screener_auto_run(),
+        "assistant_auto_approve_actions": preferences.get_assistant_auto_approve_actions(),
+        "assistant_mask_enabled": preferences.get_assistant_mask_enabled(),
         "limit_ladder_monitor_enabled": preferences.get_limit_ladder_monitor_enabled(),
         "depth_polling_interval": preferences.get_depth_polling_interval(),
         "depth_finalize_time": preferences.get_depth_finalize_time(),
         "review_schedule": preferences.get_review_schedule(),
         "review_push_channels": preferences.get_review_push_channels(),
+        "review_push_mode": preferences.get_review_push_mode(),
+        "market_recap_system_prompt": preferences.get_market_recap_system_prompt(),
+        # 界面偏好 (通知弹窗/声效/语音播报/外链模板/界面缩放): 历史只存 localStorage,
+        # 桌面版端口变化后 origin 改变导致读取不到 — 后端保存权威副本, 前端启动时回填。
+        "ui_prefs": preferences.get_ui_prefs(),
         **preferences.get_mining_schedule(),
     }
 
@@ -587,6 +747,7 @@ def get_capability_matrix() -> dict:
             "realtime_data_provider": preferences.get_realtime_data_provider(),
             "daily_data_provider": preferences.get_daily_data_provider(),
             "minute_data_provider": preferences.get_minute_data_provider(),
+            "full_minute_data_provider": preferences.get_full_minute_data_provider(),
             "depth5_data_provider": preferences.get_depth5_data_provider(),
             "adj_factor_provider": preferences.get_adj_factor_provider(),
             "financial_data_provider": preferences.get_financial_provider(),
@@ -600,7 +761,7 @@ def save_plugin_key(req: PluginKeyIn) -> dict:
     """保存插件 API Key(先探后存, 对齐 /tickflow-key 语义)。
 
     流程: probe_plugin_key 用候选 Key 实探 → 有效才写 secrets.json
-    ({plugin}_api_key, 优先级高于 .env) → load_all 重扫, 插件即刻变为可切换。
+    ({plugin}_api_key, 优先级高于 .env) → 定向刷新当前插件。
     """
     from app.data_providers import custom as custom_sources
 
@@ -608,11 +769,27 @@ def save_plugin_key(req: PluginKeyIn) -> dict:
     key = req.api_key.strip()
     if not key:
         return {"ok": False, "error": "key empty"}
-    ok, message = custom_sources.probe_plugin_key(name, key)
-    if not ok:
-        return {"ok": False, "reason": "invalid", "error": message}
-    secrets_store.save({f"{name}_api_key": key})
-    custom_sources.load_all()
+    from contextlib import nullcontext
+
+    from app.data_providers.custom import packages
+    external = packages.read_state(name) is not None
+    with packages.mutation() if external else nullcontext():
+        ok, message = custom_sources.probe_plugin_key(name, key)
+        if not ok:
+            return {"ok": False, "reason": "invalid", "error": message}
+        previous = secrets_store.load().get(f"{name}_api_key") if external else None
+        secrets_store.save({f"{name}_api_key": key})
+        try:
+            if external:
+                custom_sources.refresh_plugin(name, strict=True)
+            else:
+                custom_sources.refresh_plugin(name)
+        except ValueError:
+            if previous is None:
+                secrets_store.clear(f"{name}_api_key")
+            else:
+                secrets_store.save({f"{name}_api_key": previous})
+            return {"ok": False, "error": "插件初始化失败，已保留原配置"}
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {
         "ok": True,
@@ -628,12 +805,12 @@ def clear_plugin_key(name: str) -> dict:
     from app.data_providers import custom as custom_sources
 
     manifest = custom_sources.plugin_manifest(name)
-    if manifest is None or not custom_sources.is_builtin(name):
+    if manifest is None:
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
     if not manifest.get("api_key_env"):
         raise HTTPException(status_code=400, detail=f"插件 '{name}' 不支持在界面配置 Key")
     secrets_store.clear(f"{name.lower()}_api_key")
-    custom_sources.load_all()
+    custom_sources.refresh_plugin(name)
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {
         "ok": True,
@@ -708,10 +885,24 @@ def get_data_source(name: str) -> dict:
 
 @router.post("/data-sources")
 def save_data_source(req: CustomSourceIn) -> dict:
-    """创建或更新一个自定义数据源 yaml, 保存后自动 reload。"""
+    """创建或更新一个自定义数据源 yaml, 保存后自动 reload。
+
+    先验后存 (对齐插件 Key 的先探后存语义): 用与加载同一套校验试建临时
+    provider, 不通过直接 400 且不落盘 — 否则 YAML 写入但 load_all 校验失败,
+    源从列表静默消失, 前端还弹"已保存"成功提示 (用户反馈: 全量分钟缺
+    amount 映射被拒, 以为存上了)。
+    """
     from app.data_providers import custom as custom_sources
     config = req.model_dump()
     config["name"] = (config.get("name") or "").lower()
+    probe = None
+    try:
+        probe = custom_sources.create_provider(config)  # 失败自抛 ValueError(含全部校验原因)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        if probe is not None:
+            probe.close()  # 临时探针(仅校验用), 不留连接资源
     try:
         custom_sources.save_config(config["name"], config)
         custom_sources.load_all()
@@ -780,10 +971,15 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     """保存数据源选择。"""
     from app.services import preferences
     updates = req.model_dump(exclude_none=True)
-    if updates:
-        preferences.save(updates)
-    # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
-    request.app.state.capabilities = detect_capabilities()
+    with preferences.mutation():
+        from app.data_providers import custom as custom_sources
+        removing = {p["name"] for p in custom_sources.list_plugins() if p.get("pending_remove")}
+        if any(provider.lower() in removing for provider in updates.values()):
+            raise HTTPException(400, "该插件正在等待卸载，请选择其他数据源")
+        if updates:
+            preferences.save(updates)
+        # 与插件卸载共用写锁，避免并发请求重新引用已移除的数据源。
+        request.app.state.capabilities = detect_capabilities()
     return {
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
@@ -805,7 +1001,7 @@ def update_data_source_job_timeouts(req: DataSourceJobTimeoutPrefs) -> dict:
 
 @router.put("/preferences/minute-batch-compress")
 def update_minute_batch_compress(req: MinuteBatchCompressPrefs) -> dict:
-    """保存分时批量响应的 gzip 传输压缩开关。逐请求即时读取, 保存后立即生效。"""
+    """保存分时详情与批量响应的 gzip 传输压缩开关。逐请求即时读取, 保存后立即生效。"""
     from app.services import preferences
     preferences.save({"minute_batch_compress": req.minute_batch_compress})
     return {"minute_batch_compress": preferences.get_minute_batch_compress()}
@@ -813,7 +1009,7 @@ def update_minute_batch_compress(req: MinuteBatchCompressPrefs) -> dict:
 
 @router.put("/preferences/daily-batch-compress")
 def update_daily_batch_compress(req: DailyBatchCompressPrefs) -> dict:
-    """保存日K批量响应的 gzip 传输压缩开关 (与分时独立)。逐请求即时读取。"""
+    """保存日K详情与批量响应的 gzip 传输压缩开关 (与分时独立)。逐请求即时读取。"""
     from app.services import preferences
     preferences.save({"daily_batch_compress": req.daily_batch_compress})
     return {"daily_batch_compress": preferences.get_daily_batch_compress()}
@@ -847,6 +1043,23 @@ class NavHiddenIn(BaseModel):
     nav_hidden: list[str]
 
 
+class NavLayoutIn(BaseModel):
+    nav_layout: dict | None
+    nav_hidden: list[str] | None = None
+
+
+@router.put("/preferences/nav-layout")
+def update_nav_layout(req: NavLayoutIn) -> dict:
+    from app.services import preferences
+
+    try:
+        layout = preferences.set_nav_layout(req.nav_layout, req.nav_hidden)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"nav_layout": layout, "nav_order": preferences.get_nav_order(),
+            "nav_hidden": preferences.get_nav_hidden()}
+
+
 @router.put("/preferences/nav-order")
 def update_nav_order(req: NavOrderIn) -> dict:
     """保存左侧菜单排序（内置页面 path + 扩展分析菜单 id 的有序列表）。"""
@@ -861,6 +1074,22 @@ def update_nav_hidden(req: NavHiddenIn) -> dict:
     from app.services import preferences
     saved = preferences.set_nav_hidden(req.nav_hidden)
     return {"nav_hidden": saved}
+
+
+class DashboardLayoutIn(BaseModel):
+    """看板自定义布局; layout=null 恢复默认。"""
+    layout: dict | None = None
+
+
+@router.put("/preferences/dashboard-layout")
+def update_dashboard_layout(req: DashboardLayoutIn) -> dict:
+    """保存看板自定义布局(网格 blob); null = 清除回默认布局。"""
+    from app.services import preferences
+    try:
+        saved = preferences.set_dashboard_layout(req.layout)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"dashboard_layout": saved}
 
 
 @router.put("/preferences/watchlist-columns")
@@ -878,6 +1107,27 @@ def get_screener_result_columns() -> dict:
     from app.services import preferences
     cols = preferences.get_screener_result_columns()
     return {"columns": cols}
+
+
+class UiPrefsIn(BaseModel):
+    """界面偏好增量更新; 值为 null = 删除该项 (回前端默认)。"""
+
+    model_config = ConfigDict(extra="allow")
+
+
+@router.put("/preferences/ui-prefs")
+def update_ui_prefs(req: UiPrefsIn) -> dict:
+    """保存界面偏好 (通知弹窗/声效/语音播报/外链模板/界面缩放)。
+
+    键集合由 services.preferences 的白名单约束 (未知键忽略); 用 extra=allow 的
+    透传模型而非逐字段声明, 新增一项只需前后端各加一个键, 不产生两处易漂移的清单。
+    """
+    from app.services import preferences
+    try:
+        saved = preferences.set_ui_prefs(req.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ui_prefs": saved}
 
 
 @router.put("/preferences/screener-result-columns")
@@ -984,12 +1234,14 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
         if repo is not None:
             try:
                 issues = data_integrity.scan_recent_integrity(repo.store.data_dir)
+                issues = [i for i in issues if i.table in data_integrity.active_daily_tables()]
             except Exception:  # noqa: BLE001
                 issues = []
             earliest = data_integrity.earliest_issue_day(issues)
             if issues and data_integrity.within_auto_repair_window(earliest):
+                symbols = data_integrity._stock_snapshot_symbols(issues)
                 job_id, is_new = data_integrity.launch_integrity_repair(
-                    request.app.state, earliest, "realtime_gate",
+                    request.app.state, earliest, "realtime_gate", symbols=symbols,
                 )
                 if job_id is not None:
                     detail = (
@@ -999,6 +1251,16 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
                         + f"（任务 {job_id}）"
                     )
                     raise HTTPException(status_code=409, detail=detail)
+                backoff = data_integrity.repair_backoff_remaining_s(
+                    repo.store.data_dir, earliest,
+                )
+                if backoff > 0:
+                    raise HTTPException(status_code=409, detail=(
+                        f"检测到{data_integrity.describe_issues(issues)}；"
+                        f"上次自动修复未成功（多为数据源拉取失败），"
+                        f"{int(backoff // 60) + 1} 分钟后将自动重试，"
+                        "也可到 数据→修正数据 手动执行"
+                    ))
 
     preferences.save({"realtime_quotes_enabled": req.realtime_quotes_enabled})
     if qs:
@@ -1017,6 +1279,42 @@ def update_realtime_quote_scope(req: RealtimeQuoteScopePrefs) -> dict:
     from app.services import preferences
     cfg = req.model_dump(exclude_none=True)
     return preferences.set_realtime_quote_scope(cfg)
+
+
+class AssistantAutoApproveIn(BaseModel):
+    """AI 助手动作工具免确认开关。"""
+
+    enabled: bool
+
+
+@router.put("/preferences/assistant-auto-approve")
+def update_assistant_auto_approve(req: AssistantAutoApproveIn) -> dict:
+    """保存 AI 助手「动作工具免确认」开关。
+
+    打开后 create_signal_strategy / run_backtest / add_to_watchlist / sync_data
+    不再弹确认卡, 直接执行。默认关闭; 轮次检查点不受影响。
+    """
+    from app.services import preferences
+    saved = preferences.set_assistant_auto_approve_actions(req.enabled)
+    return {"assistant_auto_approve_actions": saved}
+
+
+class AssistantMaskIn(BaseModel):
+    """AI 助手毛玻璃遮罩开关。"""
+
+    enabled: bool
+
+
+@router.put("/preferences/assistant-mask")
+def update_assistant_mask(req: AssistantMaskIn) -> dict:
+    """保存 AI 助手「毛玻璃遮罩」开关 (默认开启)。
+
+    开启时助手抽屉背后覆盖毛玻璃遮罩, 点击遮罩关闭助手;
+    关闭则恢复非模态体验 (页面主体可正常交互)。纯视觉偏好, 无副作用。
+    """
+    from app.services import preferences
+    saved = preferences.set_assistant_mask_enabled(req.enabled)
+    return {"assistant_mask_enabled": saved}
 
 
 class WatchlistGroupsInNavPrefs(BaseModel):
@@ -1140,6 +1438,48 @@ class MainlineFilterIn(BaseModel):
     exclude_st: bool | None = None
 
 
+class EmotionScoreConfigIn(BaseModel):
+    """情绪评分口径 (维度权重 / 子项权重与归一化区间 / 档位阈值)。
+
+    config 为整棵树或 null — 传 null 表示恢复出厂口径。不做逐字段白名单:
+    结构由 emotion_score.merge_config 归一化 (未知 key 丢弃、缺项补默认、
+    阈值乱序自动重排), 用户改坏权重也不会让看板算不出分。
+    """
+
+    config: dict | None = None
+
+
+@router.get("/emotion-score/config")
+def get_emotion_score_config() -> dict:
+    """情绪评分口径: 当前配置 + 出厂默认 + 维度顺序 + 档位名。
+
+    看板「情绪雷达」卡片的配置对话框一次拉全 —— 前端不硬编码任何权重/区间/
+    阈值字面量, 表单全部由本接口返回的结构渲染。
+    """
+    from app.services import preferences
+    from app.services.emotion_score import public_config
+
+    payload = public_config(preferences.get_emotion_score_config())
+    payload["customized"] = preferences.get_emotion_score_config() is not None
+    return payload
+
+
+@router.put("/emotion-score/config")
+def update_emotion_score_config(req: EmotionScoreConfigIn) -> dict:
+    """保存情绪评分口径; config 传 null/{} = 恢复出厂。
+
+    形状校验在 preferences 层 (经 emotion_score.merge_config), 值的合法性
+    (负权重/区间倒置/阈值乱序) 由计算时归一化兜底, 故此处不做逐字段白名单。
+    """
+    from app.services import preferences
+    from app.services.emotion_score import public_config
+
+    saved = preferences.set_emotion_score_config(req.config)
+    payload = public_config(saved)
+    payload["customized"] = saved is not None
+    return payload
+
+
 @router.put("/preferences/mainline-filter")
 def update_mainline_filter(req: MainlineFilterIn) -> dict:
     """更新市场主线过滤配置。部分更新; 修改后需重算主线(POST /api/regime/mainline/recompute)生效。
@@ -1192,8 +1532,7 @@ def update_feishu_webhook(req: FeishuWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空则需为合法的飞书自定义机器人地址。
     - secret: 机器人启用了「签名校验」时填密钥, 留空表示不验签。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_feishu_url(url):
@@ -1218,8 +1557,7 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
     - url: 传入空串表示清空配置; 非空需为合法企业微信群推送 Webhook 地址, 或纯 key。
     - 用户可只填 key (webhook/send?key=xxx 的 xxx 部分), 后端自动补全为完整 URL。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     url = (req.url or "").strip()
     if url and not webhook_adapter.is_valid_wecom_url(url):
@@ -1232,8 +1570,128 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
     return {"wecom_webhook_url": saved_url}
 
 
+class DingtalkWebhookPrefsIn(BaseModel):
+    url: str
+    # None 保留已保存的密钥；显式空串清除。
+    secret: str | None = None
+
+
+@router.get("/preferences/dingtalk-webhook")
+def get_dingtalk_webhook(response: Response) -> dict:
+    """仅配置表单读取明文密钥，避免进入全局偏好和浏览器持久化缓存。"""
+    from app.services import preferences
+
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "url": preferences.get_dingtalk_webhook_url(),
+        "secret": secrets_store.get_dingtalk_webhook_secret(),
+    }
+
+
+@router.put("/preferences/dingtalk-webhook")
+def update_dingtalk_webhook(req: DingtalkWebhookPrefsIn) -> dict:
+    from app.services import dingtalk_adapter, preferences
+
+    url = req.url.strip()
+    if url and not dingtalk_adapter.is_valid_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail="请输入钉钉机器人原始 Webhook 地址 "
+                   "(https://oapi.dingtalk.com/robot/send?access_token=...)，不要附带 timestamp/sign",
+        )
+    saved_url = preferences.set_dingtalk_webhook_url(url)
+    if not saved_url:
+        secrets_store.set_dingtalk_webhook_secret("")
+    elif req.secret is not None:
+        secrets_store.set_dingtalk_webhook_secret(req.secret)
+    return {
+        "dingtalk_webhook_url": saved_url,
+        "dingtalk_webhook_secret_set": bool(secrets_store.get_dingtalk_webhook_secret()),
+    }
+
+
+class CustomWebhookPrefsIn(BaseModel):
+    url: str
+    # None preserves the stored secret; an explicit empty string clears it.
+    secret: str | None = None
+
+
+@router.put("/preferences/custom-webhook")
+def update_custom_webhook(req: CustomWebhookPrefsIn) -> dict:
+    """Configure the generic third-party JSON webhook and optional HMAC secret."""
+    from app.services import preferences, webhook_adapter
+
+    url = (req.url or "").strip()
+    if url and not webhook_adapter.is_valid_custom_url(url):
+        raise HTTPException(status_code=400, detail="Webhook 地址必须是完整的 HTTP(S) URL")
+    saved_url = preferences.set_custom_webhook_url(url)
+    if not saved_url:
+        secrets_store.set_custom_webhook_secret("")
+    elif req.secret is not None:
+        secrets_store.set_custom_webhook_secret(req.secret)
+    return {
+        "custom_webhook_url": saved_url,
+        "custom_webhook_secret_set": bool(secrets_store.get_custom_webhook_secret()),
+    }
+
+
+class EmailSmtpPrefsIn(BaseModel):
+    host: str
+    port: int = Field(default=465, ge=1, le=65535)
+    security: Literal["ssl", "starttls", "none"] = "ssl"
+    username: str = ""
+    # None preserves the stored password; an explicit empty string clears it.
+    password: str | None = None
+    from_address: str = ""
+    to_addresses: list[str] = Field(default_factory=list)
+
+
+@router.put("/preferences/email-smtp")
+def update_email_smtp(req: EmailSmtpPrefsIn) -> dict:
+    """Configure the SMTP transport shared by monitor alerts and review reports."""
+    from app.services import email_adapter, preferences
+
+    host = (req.host or "").strip()
+    username = (req.username or "").strip()
+    from_address = (req.from_address or username).strip()
+    recipients = list(dict.fromkeys(item.strip() for item in req.to_addresses if item.strip()))
+    if host:
+        if not from_address or not email_adapter.is_valid_email(from_address):
+            raise HTTPException(status_code=400, detail="请填写有效的发件人邮箱")
+        if not recipients or any(not email_adapter.is_valid_email(item) for item in recipients):
+            raise HTTPException(status_code=400, detail="请至少填写一个有效的收件人邮箱")
+        effective_password = (
+            secrets_store.get_email_smtp_password()
+            if req.password is None
+            else req.password
+        )
+        if username and not effective_password:
+            raise HTTPException(status_code=400, detail="已填写 SMTP 登录用户名, 请同时填写密码或授权码")
+    else:
+        username = ""
+        from_address = ""
+        recipients = []
+
+    config = preferences.set_email_smtp_config({
+        "host": host,
+        "port": req.port,
+        "security": req.security,
+        "username": username,
+        "from_address": from_address,
+        "to_addresses": recipients,
+    })
+    if not host or not username:
+        secrets_store.set_email_smtp_password("")
+    elif req.password is not None:
+        secrets_store.set_email_smtp_password(req.password)
+    return {
+        "email_smtp_config": config,
+        "email_smtp_password_set": bool(secrets_store.get_email_smtp_password()),
+    }
+
+
 class WebhookTestIn(BaseModel):
-    channel: Literal["feishu", "wecom"]
+    channel: Literal["feishu", "wecom", "dingtalk", "custom", "email"]
 
 
 @router.post("/preferences/webhook-test")
@@ -1244,8 +1702,7 @@ def test_webhook(req: WebhookTestIn) -> dict:
     未配置 / 地址非法 / 发送失败均返回 HTTP 200 + {ok: False}，
     前端统一读 detail 渲染绿/红，不抛 400。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     title = "TickFlow Stock Panel 推送测试"
     body = "如果你看到这条消息，说明推送配置正确 🎉"
@@ -1259,16 +1716,55 @@ def test_webhook(req: WebhookTestIn) -> dict:
         secret = preferences.get_feishu_webhook_secret()
         # 诊断用途单次尝试: 失败即返回, 不等生产退避重试 (~17s)
         ok = webhook_adapter.send_feishu(url, title, body, secret, max_attempts=1)
-    else:  # wecom
+    elif req.channel == "wecom":
         url = preferences.get_wecom_webhook_url()
         if not url:
             return {"ok": False, "detail": "尚未配置企业微信 Webhook，请先保存"}
         if not webhook_adapter.is_valid_wecom_url(url):
             return {"ok": False, "detail": "已保存的企业微信 Webhook 地址非法，请重新保存"}
         ok = webhook_adapter.send_wecom(url, title, body)
+    elif req.channel == "dingtalk":
+        from app.services import dingtalk_adapter
+
+        url = preferences.get_dingtalk_webhook_url()
+        if not url:
+            return {"ok": False, "detail": "尚未配置钉钉 Webhook，请先保存"}
+        if not dingtalk_adapter.is_valid_url(url):
+            return {"ok": False, "detail": "已保存的钉钉 Webhook 地址非法，请重新保存"}
+        result = dingtalk_adapter.send_text_result(
+            url, title, body, secrets_store.get_dingtalk_webhook_secret(), max_attempts=1,
+        )
+        return {"ok": result.ok, "detail": result.detail}
+    elif req.channel == "custom":
+        url = preferences.get_custom_webhook_url()
+        if not url:
+            return {"ok": False, "detail": "尚未配置第三方 Webhook, 请先保存"}
+        if not webhook_adapter.is_valid_custom_url(url):
+            return {"ok": False, "detail": "已保存的第三方 Webhook 地址非法, 请重新保存"}
+        ok = webhook_adapter.send_custom(
+            url,
+            title,
+            body,
+            event_type="test",
+            secret=secrets_store.get_custom_webhook_secret(),
+            max_attempts=1,
+        )
+    else:  # email
+        from app.services import email_adapter
+
+        config = preferences.get_email_smtp_config()
+        if not email_adapter.is_configured(config):
+            return {"ok": False, "detail": "尚未完整配置邮件 SMTP, 请先保存"}
+        ok = email_adapter.send_email(
+            config,
+            secrets_store.get_email_smtp_password(),
+            title,
+            body,
+            max_attempts=1,
+        )
 
     if ok:
-        return {"ok": True, "detail": "测试消息已发送，请到群内查收"}
+        return {"ok": True, "detail": "测试消息已发送, 请检查对应接收端"}
     return {"ok": False, "detail": "推送失败：网络不可达或地址/密钥不正确，详情见后端日志"}
 
 
@@ -1353,7 +1849,7 @@ def update_webhook_enabled_default(req: WebhookEnabledDefaultIn) -> dict:
 
 
 class WebhookDefaultChannelsIn(BaseModel):
-    channels: list[str]  # 多选: ['feishu','wecom'] 等; 空数组=默认不推送
+    channels: list[str]  # 多选: feishu / wecom / dingtalk / custom / email; 空数组=不推送
 
 
 @router.put("/preferences/webhook-default-channels")
@@ -1374,7 +1870,7 @@ def update_quote_interval(req: QuoteIntervalIn, request: Request) -> dict:
     """更新行情轮询间隔。按档位自动 clamp。"""
     qs = getattr(request.app.state, "quote_service", None)
     if not qs:
-        return {"interval": req.interval, "min_interval": qs.get_min_interval(), "max_interval": 60.0}
+        return {"interval": req.interval, "min_interval": 6.0, "max_interval": 60.0}
     clamped = qs.set_interval(req.interval)
     return {
         "interval": clamped,
@@ -1554,7 +2050,9 @@ async def test_endpoint(req: TestEndpointIn) -> dict:
     import statistics
 
     base = req.url.rstrip("/")
-    rounds = max(1, min(10, req.rounds or _endpoints_cache.get("data", {}).get("testRounds", 5)))
+    # 缓存初值的 "data" 是 None(键存在, get 的默认值不生效), 端点清单未预热时要兜底
+    manifest = _endpoints_cache.get("data") or {}
+    rounds = max(1, min(10, req.rounds or manifest.get("testRounds", 5)))
     health_url = base + "/health"
 
     latencies: list[float] = []
@@ -1664,6 +2162,37 @@ def update_index_daily_batch_size(req: IndexDailyBatchSizeIn) -> dict:
     from app.services import preferences
     size = preferences.set_index_daily_batch_size(req.size)
     return {"index_daily_batch_size": size}
+
+
+class BatchSymbolsIn(BaseModel):
+    size: int
+
+
+@router.put("/preferences/daily-batch-symbols")
+def update_daily_batch_symbols(req: BatchSymbolsIn) -> dict:
+    """保存 daily-batch 单请求标的数上限 (同时是前端分块大小)。"""
+    from app.services import preferences
+    return {"daily_batch_symbols": preferences.set_daily_batch_symbols(req.size)}
+
+
+@router.put("/preferences/minute-batch-symbols")
+def update_minute_batch_symbols(req: BatchSymbolsIn) -> dict:
+    """保存 minute-batch 单请求标的数上限 (同时是前端分块大小)。"""
+    from app.services import preferences
+    return {"minute_batch_symbols": preferences.set_minute_batch_symbols(req.size)}
+
+
+class BacktestWorkerRssLimitIn(BaseModel):
+    gib: int = Field(ge=0, le=64, description="回测/优化 worker RSS 上限 (GiB), 0 = 不限制")
+
+
+@router.put("/preferences/backtest-worker-rss-limit")
+def update_backtest_worker_rss_limit(req: BacktestWorkerRssLimitIn) -> dict:
+    """保存回测/优化 worker RSS 内存上限 (GiB)。对下一个任务即生效, 无需重启。"""
+    from app.services import preferences
+    return {
+        "backtest_worker_rss_limit_gib": preferences.set_backtest_worker_rss_limit_gib(req.gib)
+    }
 
 
 # ── 五档盘口 sealed 配置 ──────────────────────────────
@@ -1779,7 +2308,7 @@ def update_review_schedule(req: ReviewScheduleIn, request: Request) -> dict:
     sched = preferences.set_review_schedule(req.enabled, req.hour, req.minute)
 
     # 动态操作 APScheduler job
-    from app.jobs.daily_pipeline import _register_review_job, REVIEW_JOB_ID
+    from app.jobs.daily_pipeline import REVIEW_JOB_ID, _register_review_job
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler:
         if sched["enabled"]:
@@ -1796,17 +2325,183 @@ def update_review_schedule(req: ReviewScheduleIn, request: Request) -> dict:
 
 
 class ReviewPushIn(BaseModel):
-    channels: list[str]  # 多选: ['feishu'] 等; 空数组=不推送。微信等开发中
+    channels: list[str]  # 多选: feishu / wecom / dingtalk / custom / email; 空数组=不推送
+    mode: str | None = None  # 可选: auto=归档即推 / manual=仅显式 push; 不传则不变
 
 
 @router.put("/preferences/review-push")
 def update_review_push(req: ReviewPushIn) -> dict:
-    """复盘推送渠道(多选) — 选定把复盘报告(手动生成 / 定时生成归档后)推送到哪些外部工具。
+    """复盘推送设置(渠道多选 + 触发方式)。
 
     纯偏好, 与定时复盘 / 实时行情完全独立, 常驻可单独设置。空数组=不推送。
     实际推送由归档端点(POST /api/market-recap/reports)与定时任务(_run_scheduled_review)
-    在归档后读取本列表逐个推送。白名单外的渠道会被过滤掉。
+    在归档后读取渠道列表, 并按 review_push_mode 决定是否外发:
+      - manual: 定时复盘只归档不推送, 手动保存需显式 push=true
+      - auto: 归档即推(行为与旧逻辑一致)
+    白名单外的渠道会被过滤掉, 白名单外的 mode 值回退 manual。
     """
     from app.services import preferences
     saved = preferences.set_review_push_channels(req.channels)
-    return {"review_push_channels": saved}
+    mode = preferences.get_review_push_mode()
+    if req.mode is not None:
+        mode = preferences.set_review_push_mode(req.mode)
+    return {"review_push_channels": saved, "review_push_mode": mode}
+
+
+class MarketRecapPromptIn(BaseModel):
+    prompt: str  # 自定义系统提示词全文; 空串 = 恢复内置默认模板
+
+
+@router.get("/preferences/market-recap-prompt")
+def get_market_recap_prompt() -> dict:
+    """复盘系统提示词: 自定义值 + 内置默认全文。
+
+    默认全文单独按需拉取 (约 2.4k 字符), 不塞进 GET /preferences 大 dict。
+    """
+    from app.services import preferences
+    from app.services.market_recap import _SYSTEM_PROMPT
+
+    custom = preferences.get_market_recap_system_prompt()
+    return {"custom": custom, "default": _SYSTEM_PROMPT, "customized": bool(custom)}
+
+
+@router.put("/preferences/market-recap-prompt")
+def update_market_recap_prompt(req: MarketRecapPromptIn) -> dict:
+    """保存自定义复盘系统提示词; 空串恢复默认模板。超长返回 400。"""
+    from app.services import preferences
+
+    try:
+        saved = preferences.set_market_recap_system_prompt(req.prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"custom": saved, "customized": bool(saved)}
+
+
+# ================================================================
+# API Token 管理 (open-platform-plan §4) — 仅 UI 会话可达
+# (挂在 /api/settings 前缀下, 受访问密码保护; Token 通道无对应 scope,
+#  网关规则表里没有本组端点, Bearer 调用会被 403 拒绝)
+# ================================================================
+class ApiTokenCreateIn(BaseModel):
+    name: str
+    scopes: list[str]
+
+
+@router.get("/api-tokens")
+def api_tokens_list(request: Request) -> dict:
+    from app.services import api_tokens as svc
+
+    return {"tokens": svc.list_tokens(request.app.state.repo.store.data_dir)}
+
+
+@router.post("/api-tokens")
+def api_tokens_create(body: ApiTokenCreateIn, request: Request) -> dict:
+    """创建 Token — 明文只在本次响应出现一次, 前端弹窗提示立即保存。"""
+    from app.services import api_tokens as svc
+
+    try:
+        record, plaintext = svc.create_token(request.app.state.repo.store.data_dir, body.name, body.scopes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"token": record, "plaintext": plaintext}
+
+
+@router.delete("/api-tokens/{token_id}")
+def api_tokens_revoke(token_id: str, request: Request) -> dict:
+    from app.services import api_tokens as svc
+
+    if not svc.revoke_token(request.app.state.repo.store.data_dir, token_id):
+        raise HTTPException(status_code=404, detail=f"Token '{token_id}' 不存在")
+    return {"status": "revoked", "id": token_id}
+
+
+# ── 声效语音包: 用户上传自定义提示音 (data/sound_packs), 前端以 custom:<文件名> 选择 ──
+
+_SOUND_PACK_DIR = "sound_packs"
+# 浏览器 <audio> 即取即播, 单文件无需过大; 过大的文件上传慢且占磁盘
+_SOUND_PACK_MAX_BYTES = 4 * 1024 * 1024
+_SOUND_PACK_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus", ".webm"}
+_SOUND_PACK_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+    ".opus": "audio/ogg", ".webm": "audio/webm",
+}
+
+
+def _sound_pack_dir(request: Request) -> Path:
+    return request.app.state.repo.store.data_dir / _SOUND_PACK_DIR
+
+
+def _safe_pack_path(pack_dir: Path, name: str) -> Path:
+    """名字 → 目录内路径; 拒绝穿越/非法名。"""
+    if not name or "/" in name or "\\" in name or ".." in name or name != name.strip():
+        raise HTTPException(status_code=400, detail="语音包名称非法")
+    path = (pack_dir / name).resolve()
+    if path.parent != pack_dir.resolve():
+        raise HTTPException(status_code=400, detail="语音包名称非法")
+    return path
+
+
+@router.get("/sound-packs")
+def sound_packs_list(request: Request) -> dict:
+    pack_dir = _sound_pack_dir(request)
+    packs: list[dict] = []
+    if pack_dir.is_dir():
+        for f in sorted(pack_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in _SOUND_PACK_EXTS:
+                packs.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "ext": f.suffix.lower().lstrip("."),
+                })
+    return {"packs": packs}
+
+
+@router.post("/sound-packs")
+async def sound_packs_upload(request: Request, file: UploadFile = File(...)) -> dict:
+    import re
+
+    raw = file.filename or ""
+    suffix = Path(raw).suffix.lower()
+    if suffix not in _SOUND_PACK_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的音频格式 '{suffix or '(无后缀)'}', 可选: {', '.join(sorted(_SOUND_PACK_EXTS))}",
+        )
+    # 词干只保留安全字符 (中文/字母/数字/_-.), 其余替换为 _; 控制长度防文件名失控
+    stem = re.sub(r"[^\w\-.()\u4e00-\u9fff]", "_", Path(raw).stem).strip("._")[:40] or "pack"
+    name = f"{stem}{suffix}"
+
+    data = await file.read()
+    if len(data) > _SOUND_PACK_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件超过 {_SOUND_PACK_MAX_BYTES // 1024 // 1024}MB 上限 (当前 {len(data) / 1024 / 1024:.1f}MB)",
+        )
+    if not data:
+        raise HTTPException(status_code=400, detail="空文件")
+
+    pack_dir = _sound_pack_dir(request)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    target = _safe_pack_path(pack_dir, name)
+    # 同名重传 = 替换 (用户自定义音的自然语义)
+    target.write_bytes(data)
+    return {"status": "saved", "pack": {"name": name, "size": len(data), "ext": suffix.lstrip(".")}}
+
+
+@router.delete("/sound-packs/{name}")
+def sound_packs_delete(name: str, request: Request) -> dict:
+    path = _safe_pack_path(_sound_pack_dir(request), name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"语音包 '{name}' 不存在")
+    path.unlink()
+    return {"status": "deleted", "name": name}
+
+
+@router.get("/sound-packs/{name}/file")
+def sound_packs_file(name: str, request: Request) -> FileResponse:
+    path = _safe_pack_path(_sound_pack_dir(request), name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"语音包 '{name}' 不存在")
+    media_type = _SOUND_PACK_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media_type)

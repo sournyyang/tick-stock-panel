@@ -6,6 +6,7 @@
  */
 import type { ColumnConfig } from '@/lib/list-columns'
 import type { MinuteKlineRow } from '@/lib/api'
+import { cnDateTimeFromUtc } from '@/lib/format'
 
 // ===== 信号 =====
 
@@ -66,6 +67,13 @@ export function getSortValue(r: any, col: ColumnConfig): any {
     case 'pct':           return r.rt_pct ?? r.change_pct
     case 'change_amount': return r.change_amount
     case 'amplitude':     return r.amplitude
+    case 'open':          return r.open
+    case 'high':          return r.high
+    case 'low':           return r.low
+    case 'prev_close':    return r.prev_close
+    case 'limit_up_price': return r.limit_up_price
+    case 'limit_down_price': return r.limit_down_price
+    case 'volume':        return r.volume
     case 'turnover':      return r.turnover_rate
     case 'amount':        return r.rt_amount ?? r.amount
     case 'float_val':     return r.float_shares && (r.rt_price ?? r.close) ? r.float_shares * (r.rt_price ?? r.close) : null
@@ -101,7 +109,22 @@ export function getSortValue(r: any, col: ColumnConfig): any {
     case 'deviate_30d':  return r.deviate_30d
     case 'limit_ups':     return r.consecutive_limit_ups ?? 0
     case 'limit_downs':   return r.consecutive_limit_downs ?? 0
+    // 用北京时间的完整串排序而非原始 UTC: 与展示同口径。缺值返回 null 而非 '' ——
+    // useTableSort 会先试 Number(''), 空串会被当成 0 排到最前。
+    case 'added_at':      return r.added_at ? cnDateTimeFromUtc(r.added_at) : null
+    case 'pct_since_added': return r.pct_since_added
     case 'score':         return r.score
+    // 财务列: 之前缺 case, 导致这 10 列点击表头无法排序 (恒为 null 排最后)
+    case 'eps':           return r.eps
+    case 'bps':           return r.bps
+    case 'roe':           return r.roe
+    case 'pe_ttm':        return r.pe_ttm
+    case 'pb':            return r.pb
+    case 'gross_margin':  return r.gross_margin
+    case 'net_margin':    return r.net_margin
+    case 'revenue_yoy':   return r.revenue_yoy
+    case 'net_income_yoy':return r.net_income_yoy
+    case 'debt_ratio':    return r.debt_ratio
     default: return null
   }
 }

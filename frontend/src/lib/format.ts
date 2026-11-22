@@ -5,6 +5,24 @@ export function fmtPrice(v: number | null | undefined, digits = 2): string {
   return v.toFixed(digits)
 }
 
+/** 使用接口给出的资产类型, 不根据证券代码或价格大小猜测报价精度。 */
+export function pricePrecision(assetType?: string | null): 2 | 3 {
+  return assetType === 'etf' ? 3 : 2
+}
+
+export function roundPriceToTick(value: number, assetType?: string | null): number {
+  const scale = 10 ** pricePrecision(assetType)
+  const scaled = value * scale
+  // 消除运算产生的二进制尾差, 让半个报价单位按四舍五入处理。
+  const rounded = Math.round(scaled + Number.EPSILON * Math.max(1, Math.abs(scaled)) * 4) / scale
+  return rounded === 0 ? 0 : rounded
+}
+
+export function fmtAssetPrice(value: number | null | undefined, assetType?: string | null): string {
+  if (value == null || !Number.isFinite(value)) return '—'
+  return roundPriceToTick(value, assetType).toFixed(pricePrecision(assetType))
+}
+
 export function fmtPct(v: number | null | undefined, digits = 2): string {
   if (v == null || Number.isNaN(v)) return '—'
   const sign = v > 0 ? '+' : ''
@@ -39,6 +57,51 @@ export function fmtDate(s: string | Date | null | undefined): string {
   const d = typeof s === 'string' ? new Date(s) : s
   if (isNaN(d.getTime())) return String(s)
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/**
+ * 后端 naive UTC ISO 串 → 北京时间串; 空/非法返回 ''。
+ *
+ * 不能走 fmtDate: 后端落盘的这类时间戳无 Z 后缀, JS 会把它按**本地时区**解析 ——
+ * 非北京时区 (CI 的 UTC、欧美用户) 会显示错日, 北京时区则会把北京时间 00:00-08:00
+ * 的记录显示成前一天。必须显式按 UTC 解析再按 Asia/Shanghai 渲染。
+ *
+ * 与 kline.ts 的 cnToday/cnNowHHMM 分工不同: 那两个处理「当前时刻」, 这里处理任意时间戳。
+ */
+// options 固定, 提到模块级复用: 构造 Intl.DateTimeFormat 约 47µs, 而本函数会在排序
+// 比较里被调用 O(n·log n) 次。
+const CN_DATE_TIME = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hourCycle: 'h23',
+})
+const CN_DATE = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+})
+
+/** naive UTC 串 → Date; 空/非法返回 null。naive 串按 UTC 解析, 已带偏移的保持原样。 */
+function parseUtcNaive(utcIso: string | null | undefined): Date | null {
+  const raw = String(utcIso ?? '').trim()
+  if (!raw) return null
+  const d = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`)
+  return isNaN(d.getTime()) ? null : d
+}
+
+/** naive UTC ISO 串 → 北京日期 'YYYY-MM-DD'; 空/非法返回 ''。 */
+export function cnDateFromUtc(utcIso: string | null | undefined): string {
+  const d = parseUtcNaive(utcIso)
+  return d ? CN_DATE.format(d) : ''
+}
+
+/** naive UTC ISO 串 → 北京日期时间 'YYYY-MM-DD HH:mm:ss'; 空/非法返回 ''。 */
+export function cnDateTimeFromUtc(utcIso: string | null | undefined): string {
+  const d = parseUtcNaive(utcIso)
+  if (!d) return ''
+  const parts = CN_DATE_TIME.formatToParts(d)
+  const pick = (type: string) => parts.find(p => p.type === type)?.value ?? ''
+  return `${pick('year')}-${pick('month')}-${pick('day')} ${pick('hour')}:${pick('minute')}:${pick('second')}`
 }
 
 // ===== Data 页面工具函数 =====

@@ -1,12 +1,31 @@
-import type { ComponentType } from 'react'
+import type { ComponentType, ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
+import type { PluginDataSourceItem } from '@/lib/api'
+import type { BrandIconProps } from '@/components/BrandIcons'
 
 export const FRONTEND_EXTENSION_API_VERSION = 1 as const
 
 export interface FrontendSlotContextMap {
+  'settings.data-sources.toolbar': {
+    refresh: () => void
+    selectSource: (name: string) => void
+  }
+  'settings.data-sources.detail-actions': {
+    plugin: PluginDataSourceItem
+    refresh: () => void
+  }
   'layout.navigation.extra': {
     collapsed: boolean
     pathname: string
+  }
+  /** 侧栏头部快捷行 (数据源/AI 配置行下方) — 扩展注册快捷入口行, 行内自带顶部发丝线 */
+  'layout.header.quick': Record<string, never>
+  /** 设置→系统「界面」区尾部 — 扩展注册系统级开关行 (样式与核心 ToggleRow 同款) */
+  'settings.system.section': Record<string, never>
+  /** 个股详情顶部标签，选中时在主内容区挂载组件 */
+  'stock-preview.tabs': {
+    symbol: string
+    name: string | null
   }
   /** 个股详情对话框底部扩展区 (日K/分时图表下方) */
   'stock-preview.footer': {
@@ -27,12 +46,12 @@ export interface FrontendSlotContextMap {
 
 export type FrontendSlotName = keyof FrontendSlotContextMap
 
-export type FrontendSlotRegistration<K extends FrontendSlotName = FrontendSlotName> = {
+export type FrontendSlotRegistration<K extends FrontendSlotName = FrontendSlotName> = K extends FrontendSlotName ? {
   name: K
   id: string
   order?: number
   component: ComponentType<FrontendSlotContextMap[K]>
-}
+} & (K extends 'stock-preview.tabs' ? { label: string } : unknown) : never
 
 export interface FrontendExtensionRoute {
   id: string
@@ -44,7 +63,8 @@ export interface FrontendExtensionNavigation {
   id: string
   routeId: string
   label: string
-  icon: LucideIcon
+  /** lucide 图标或侧栏品牌图标族 (BrandIcons) — 与 Layout NavIcon 同口径 */
+  icon: LucideIcon | ((props: BrandIconProps) => ReactNode)
   order?: number
   badge?: string
 }

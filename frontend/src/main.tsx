@@ -1,8 +1,32 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { RouterProvider } from 'react-router-dom'
-import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query'
+import { QueryClient, QueryCache } from '@tanstack/react-query'
+import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
 import { initializeFrontendExtensions } from './extensions/bootstrap'
+import { installTspExtBridge, loadRuntimePageExtensions } from './extensions/runtime'
+import { stockPreviewUi } from './lib/stockPreviewStore'
+import { api, ApiError } from './lib/api'
+import { retryDelay } from './lib/refreshPolicy'
+import { QK } from './lib/queryKeys'
+import { cn } from './lib/cn'
+import * as format from './lib/format'
+import { createAppPersister, shouldPersistQuery, PERSIST_BUSTER } from './lib/queryPersist'
+import { hydrateUiPrefs } from './lib/uiPrefs'
+import { applyPageZoom, getPageZoom } from './lib/pageZoom'
+import { applyTheme, getTheme } from './lib/theme'
+// 字体自托管 (@fontsource): 替代 rsms.me / Google Fonts 渲染阻塞外链,
+// 内网/离线部署不再白屏等字体。权重覆盖 tailwind 全部用量 (300-900)。
+import '@fontsource/inter/300.css'
+import '@fontsource/inter/400.css'
+import '@fontsource/inter/500.css'
+import '@fontsource/inter/600.css'
+import '@fontsource/inter/700.css'
+import '@fontsource/inter/900.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
+import '@fontsource/jetbrains-mono/600.css'
+import '@fontsource/jetbrains-mono/700.css'
 import './index.css'
 
 // 全局认证拦截: 任何 query/mutation 收到 401 (未登录/会话过期) → 跳登录页。
@@ -35,6 +59,7 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5_000,           // 5s 内复用,与 §4.2 Repository 不变量一致
       refetchOnWindowFocus: false,
+      retryDelay: (attempt, error) => retryDelay(attempt, error instanceof ApiError ? error.retryAfterMs : undefined),
     },
     mutations: {
       onError: (err) => _redirectToLogin(err),
@@ -43,13 +68,34 @@ const queryClient = new QueryClient({
 })
 
 async function bootstrap() {
+  // 界面偏好回填: 桌面版启动端口从 3018 起递增, 端口一变 origin 就变, 只存
+  // localStorage 的设置 (通知/声效/语音/外链模板/缩放) 会读不到。后端保存权威
+  // 副本，回填后重放主题与缩放，更新已挂载的界面和图表。首帧仍由内联脚本应用缓存。
+  // 不 await: 网络慢时不能拖住首屏。
+  void hydrateUiPrefs().then(() => {
+    applyPageZoom(getPageZoom())
+    applyTheme(getTheme())
+  })
   await initializeFrontendExtensions()
+  // 页面插件能力桥: 共享 api/QK/cn/format 和宿主 UI 操作，不复制弹窗状态。
+  installTspExtBridge({ api, QK, cn, format, ui: stockPreviewUi })
+  // 运行时页面插件: 必须在 router 模块求值(finalize + 建路由表)之前挂载
+  await loadRuntimePageExtensions()
   const { router } = await import('./router')
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
-      <QueryClientProvider client={queryClient}>
+      <PersistQueryClientProvider
+        client={queryClient}
+        persistOptions={{
+          persister: createAppPersister(),
+          buster: PERSIST_BUSTER,
+          // 恢复超过 1 天的缓存直接丢弃 (慢变族一天内必然后台刷新过)
+          maxAge: 24 * 60 * 60 * 1000,
+          dehydrateOptions: { shouldDehydrateQuery: shouldPersistQuery },
+        }}
+      >
         <RouterProvider router={router} />
-      </QueryClientProvider>
+      </PersistQueryClientProvider>
     </React.StrictMode>,
   )
 }

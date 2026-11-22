@@ -38,11 +38,12 @@ from app.backtest.strategy import (
 )
 from app.strategy.engine import StrategyEngine
 
-_BUILTIN = Path(__file__).resolve().parents[1] / "app" / "strategy" / "builtin"
+_FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "strategies"
+_RESEARCH = Path(__file__).resolve().parents[1] / "app" / "strategy" / "research"
 
 
 def _engine() -> StrategyEngine:
-    return StrategyEngine(strategy_dirs=[_BUILTIN, _BUILTIN.parent / "custom"])
+    return StrategyEngine(strategy_dirs=[_FIXTURES, _RESEARCH, _FIXTURES.parent / "custom"])
 
 
 def _resolve_research_plan(engine: StrategyEngine, asset_type: str = "stock"):
@@ -281,7 +282,8 @@ def test_basic_filter_for_asset_neutralizes_stock_only_runtime_keys() -> None:
     # 与资产类型无关的键保留原值
     assert sanitized["amount_min"] == DEFAULT_BASIC_FILTER["amount_min"]
     assert sanitized["exclude_st"] is True
-    assert sanitized["exclude_new_days"] == 30
+    # ETF 维表没有上市日期, 股票新股排除不得要求该字段或清空 ETF 候选。
+    assert sanitized["exclude_new_days"] is None
 
     # 股票口径完全不变
     stock = _basic_filter_for_asset(dict(DEFAULT_BASIC_FILTER), "stock")

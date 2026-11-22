@@ -130,7 +130,7 @@ def test_market_breadth_mask_uses_only_valid_assets_on_each_date():
 
 
 def test_builtin_registry_loads_chip_peak_strategy_without_errors():
-    builtin_dir = Path(__file__).resolve().parents[2] / "app" / "strategy" / "builtin"
+    builtin_dir = Path(__file__).resolve().parents[2] / "app" / "strategy" / "seeds"
     engine = StrategyEngine(strategy_dirs=[builtin_dir])
 
     assert engine.has("chip_peak_breakout")

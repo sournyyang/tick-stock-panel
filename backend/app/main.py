@@ -8,8 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app import __version__
 from app.api import (
@@ -17,40 +16,61 @@ from app.api import (
     alerts,
     analysis,
     backtest,
+    config_backup,
     data,
+    definitions,
+    events,
     ext_data,
+    ext_pages,
+    factors,
     financials,
+    guardian,
+    import_center,
     indices,
     intraday,
     kline,
+    lab,
     lots,
     market_recap,
     mining,
     monitor_rules,
     overview,
+    pages_admin,
+    paper,
     pipeline,
+    position_policies,
     regime,
     rps,
     screener,
+    sector_rotation,
     signals,
     stock_analysis,
     strategy,
+    strategy_pool,
+    task_registry,
     watchlist,
 )
 from app.api import auth as auth_api
 from app.api import settings as settings_api
+from app.api import upgrade_guard as upgrade_guard_api
 from app.api.routes import router as core_router
 from app.config import settings
+from app.data_providers.base import ProviderRequestError
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.extensions.loader import (
     configure_backend_extensions,
     current_extension_context,
     start_backend_extensions,
 )
+from app.frontend_static import FrontendStaticFiles, frontend_file_response
 from app.jobs import daily_pipeline
+from app.services.daily_health import DailyIntegrityError
+from app.services.heavy_job_limiter import HeavyJobLimitTimeoutError
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
-from app.services.mining_process_lock import MiningProcessLock
+from app.services.mining_process_lock import MiningProcessLock, MiningProcessLockError
 from app.services.quote_service import QuoteService
+from app.services.shared_work import WorkBusyError
+from app.startup_diagnostics import startup_phase
 from app.tickflow import client as tf_client
 from app.tickflow.policy import detect_capabilities
 from app.tickflow.repository import DataStore, KlineRepository
@@ -63,25 +83,13 @@ logger = logging.getLogger(__name__)
 
 # 追加文件日志: uvicorn (含 --reload 开发模式) 默认只有 StreamHandler, 同步/管道等
 # 运行时日志仅出现在 dev 终端, 关掉或滚屏后即丢失, 排查「同步后日志没落」时无处可查。
-# 落盘到 data/backend.log 与桌面版 (desktop.py:_setup_logging → desktop.log) 行为对齐,
-# 事后可查。桌面版 (frozen) 已由 desktop.py 写 desktop.log, 此处跳过避免重复落盘。
-# RotatingFileHandler 防止长期运行/频繁 reload 导致文件无限增长。
+# 落盘到 data/logs/backend.log 与桌面版 (desktop.py:_setup_logging → logs/desktop.log)
+# 行为对齐, 事后可查。桌面版 (frozen) 已由 desktop.py 写 desktop.log, 此处跳过避免
+# 重复落盘; 大小切割与旧位置迁移见 app/logfile.py。
 if not getattr(sys, "frozen", False):
-    try:
-        from logging.handlers import RotatingFileHandler
+    from app.logfile import attach_rotating_log
 
-        _log_path = settings.data_dir / "backend.log"
-        _log_path.parent.mkdir(parents=True, exist_ok=True)
-        _file_handler = RotatingFileHandler(
-            _log_path, maxBytes=10 * 1024 * 1024, backupCount=3,
-            mode="a", encoding="utf-8", errors="replace",
-        )
-        _file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(_file_handler)
-    except Exception as _e:  # noqa: BLE001
-        logger.warning("文件日志初始化失败, 仅输出到终端: %s", _e)
+    attach_rotating_log("backend.log", max_mb=10, backup_count=3)
 
 
 @asynccontextmanager
@@ -91,30 +99,89 @@ async def _application_lifespan(app: FastAPI):
         __version__, tf_client.current_mode(),
     )
 
+    # 同步路由线程池容量: Starlette 默认 40, 本地多标签页/自动刷新与长计算
+    # 路由并存时容易排队。调大只影响空闲线程上限 (按需创建), 无常驻代价。
+    try:
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = (
+            settings.api_sync_thread_pool
+        )
+        logger.info("sync route thread pool: %d", settings.api_sync_thread_pool)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("thread pool resize failed (ignored): %s", e)
+
     # 首次启动: 若配置了 AUTH_PASSWORD 环境变量且未设过密码, 用它初始化。
     # 公网部署免 SSH 端口转发; 已设过密码则不覆盖 (改密码走 UI)。
     try:
-        from app.services import auth as auth_service
-        auth_service.bootstrap_from_env()
+        with startup_phase(logger, "auth bootstrap"):
+            from app.services import auth as auth_service
+            auth_service.bootstrap_from_env()
     except Exception as e:  # noqa: BLE001
         logger.warning("auth bootstrap failed: %s", e)
 
     # 数据层
-    store = DataStore()
-    repo = KlineRepository(store)
+    with startup_phase(logger, "data store initialization"):
+        store = DataStore()
+    with startup_phase(logger, "repository initialization"):
+        repo = KlineRepository(store)
     app.state.datastore = store
     app.state.repo = repo
-    from app.services.mining_manager import MiningJobManager
+    # 去内置化种子迁移必须赶在下方 refresh_cache 之前: enriched 缓存构建时
+    # 编译自定义信号表达式, 晚种会让本次启动的看板/梯队引用的 signal_limit_*
+    # 列缺失 (跌停恒 0、连板梯队无数据), 直到下一次缓存刷新才自愈。
+    _seeded_signals = 0
+    try:
+        with startup_phase(logger, "signal seeding"):
+            from app.strategy import custom_signals as _cs_seed
 
-    mining_manager = MiningJobManager(store.data_dir)
-    recovered_mining_runs = mining_manager.recover_interrupted()
+            _seeded_signals = _cs_seed.seed_if_empty(store.data_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("signal seeding failed (ignored): %s", e)
+    # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)
+    with startup_phase(logger, "custom factor module import"):
+        from app.factors.store import load_runtime_registry
+
+    try:
+        with startup_phase(logger, "custom factor registration"):
+            loaded_factors = load_runtime_registry(store.data_dir)
+        if loaded_factors:
+            logger.info("custom factors loaded: %s", len(loaded_factors))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("custom factors load failed: %s", exc)
+    with startup_phase(logger, "mining manager initialization"):
+        from app.services.mining_jobs import MiningRunStore
+        from app.services.mining_manager import MiningJobManager
+
+        mining_manager = MiningJobManager(store.data_dir)
+    # A degraded instance must never rewrite another owner's live run manifests.
+    with startup_phase(logger, "mining run recovery"):
+        recovered_mining_runs = (
+            mining_manager.recover_interrupted() if app.state.mining_lock_acquired else 0
+        )
     app.state.mining_manager = mining_manager
     if recovered_mining_runs:
         logger.warning("recovered %d interrupted mining runs", recovered_mining_runs)
+    # 策略守护复验: 复用挖掘的任务编排 (线程 + spawn 子进程 + 持久 run store),
+    # 独立 namespace 存 run 记录; 与挖掘共用 heavy 槽 (避免双份全市场矩阵)。
+    with startup_phase(logger, "guardian manager initialization"):
+        guardian_manager = MiningJobManager(
+            store.data_dir,
+            kind="guardian",
+            store=MiningRunStore(store.data_dir, namespace="guardian"),
+        )
+    with startup_phase(logger, "guardian run recovery"):
+        recovered_guardian_runs = guardian_manager.recover_interrupted()
+    app.state.guardian_manager = guardian_manager
+    if recovered_guardian_runs:
+        logger.warning(
+            "recovered %d interrupted guardian runs", recovered_guardian_runs
+        )
     # 在接受回测请求前固定 managed generation，避免首批并发 worker 各自创建版本。
     if settings.backtest_matrix_disk_cache_enabled:
         try:
-            repo.get_matrix_data_generation("stock")
+            with startup_phase(logger, "enriched generation initialization"):
+                repo.get_matrix_data_generation("stock")
         except EnrichedGenerationUnavailableError as exc:
             logger.warning("enriched generation requires a full rebuild: %s", exc)
     # 指标异步预热标志: enriched 缓存在后台线程构建, 完成后置 True
@@ -125,11 +192,6 @@ async def _application_lifespan(app: FastAPI):
     # instruments/index/ETF 仍同步 (毫秒级)。应用立即 ready, 指标算完后自动替换。
     repo.refresh_cache(background=True)
 
-    # 能力探测
-    capset = detect_capabilities()
-    app.state.capabilities = capset
-    logger.info("ready; %d capabilities active", len(capset.all()))
-
     # 自定义数据源配置(可选): 失败只记录错误, 不影响 TickFlow 基准路径。
     try:
         from app.data_providers import custom as custom_sources
@@ -137,6 +199,37 @@ async def _application_lifespan(app: FastAPI):
         logger.info("custom data sources loaded: %d", len(custom_sources.list_sources()))
     except Exception as e:  # noqa: BLE001
         logger.warning("custom data sources init failed: %s", e)
+
+    # 自定义源必须先注册,能力探测才能补充其数据集能力。
+    capset = detect_capabilities()
+    app.state.capabilities = capset
+    logger.info("ready; %d capabilities active", len(capset.all()))
+    # 各能力的生效源与可用性: 切换数据源后一眼看出路由落点, 无需回设置页对照
+    try:
+        from app.data_providers.capabilities import resolve_capability_sources
+
+        for row in resolve_capability_sources():
+            logger.info(
+                "  能力路由 | %-8s ← %-12s %s",
+                row["label"],
+                row["source_display"],
+                "可用" if row["usable"] else "不可用",
+            )
+    except Exception as e:  # noqa: BLE001 — 仅日志, 失败不影响启动
+        logger.warning("能力路由日志输出失败: %s", e)
+
+    # 发布完整冻结快照后再启动行情与监控线程，避免首批事件使用未完成的注册表。
+    from app.extensions.packages import start_managed_extensions
+    start_managed_extensions(
+        app, current_extension_context(data_dir=store.data_dir, repository=repo),
+    )
+
+    # 二次开发升级保护: 后台常备备份用户修改的程序文件 (无清单时自动停用)
+    from app.services.upgrade_guard import UpgradeGuard
+
+    upgrade_guard = UpgradeGuard(store.data_dir)
+    app.state.upgrade_guard = upgrade_guard
+    upgrade_guard.start_background_scan()
 
     # 全局行情服务
     qs = QuoteService()
@@ -197,6 +290,21 @@ async def _application_lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("integrity boot check scheduling failed: %s", e)
 
+    # 启动自愈: 上次进程异常退出可能残留 enriched 发布标记 (state=publishing),
+    # 会让所有读写持续报"数据正在发布", 且停止实时行情后没有写入方来接管。
+    # 本进程刚启动、不可能持有活跃发布, 因此可直接判定残留并在锁内恢复。
+    try:
+        from app.enriched_generation import recover_stale_publications
+
+        recovered_publications = recover_stale_publications(store.data_dir)
+        if recovered_publications:
+            logger.warning(
+                "已恢复上次中断的 enriched 发布标记: %s",
+                ", ".join(recovered_publications),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("enriched 发布标记自愈失败 (不影响启动): %s", e)
+
     # 企业微信智能机器人长连接(可选通道, 失败不阻断启动)
     try:
         from app.services.wecom_bot_service import WecomBotService
@@ -228,16 +336,30 @@ async def _application_lifespan(app: FastAPI):
     financial_scheduler.start(store.data_dir, capset)
     app.state.financial_scheduler = financial_scheduler
 
+    # 自愈看门狗: 探测 polars 闸与写锁, 僵死时退出交由 supervisor 拉起 (兜底层)。
+    from app.watchdog import start_watchdog
+    app.state.watchdog = start_watchdog(app.state, repo)
+
     # 策略引擎
-    from app.strategy.engine import StrategyEngine
-    from app.strategy import config as strategy_config
-    from app.strategy.monitor import StrategyMonitorService
     from app.services.screener import ScreenerService
+    from app.strategy import config as strategy_config
+    from app.strategy.engine import StrategyEngine
+    from app.strategy.monitor import StrategyMonitorService
 
     _screener_svc = ScreenerService(repo)
     _etf_screener_svc = ScreenerService(repo, asset_type="etf")
+    # 去内置化补全(仅升级用户): 原内置策略按 ID 补回 custom (一次性,
+    # 已自行迁移的不覆盖; 新装无旧版使用痕迹, 跳过保持策略库为空)。
+    # 必须在 StrategyEngine 创建前完成, 否则首载拿不到刚补回的文件。
+    _seeded_strategies = 0
+    try:
+        from app.strategy.strategy_seeds import seed_missing_builtins
+
+        _seeded_strategies = seed_missing_builtins(store.data_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("strategy seeding failed (ignored): %s", e)
     strategy_dirs = [
-        Path(__file__).resolve().parent / "strategy" / "builtin",
+        Path(__file__).resolve().parent / "strategy" / "research",
         store.data_dir / "strategies" / "custom",
         store.data_dir / "strategies" / "ai",
         store.data_dir / "strategies" / "composite",
@@ -246,6 +368,28 @@ async def _application_lifespan(app: FastAPI):
         strategy_dirs=strategy_dirs,
         override_loader=lambda sid: strategy_config.load_override(store.data_dir, sid),
     )
+    # 去内置化一次性迁移: ①信号目录缺种子时补入 20 个默认定义;
+    # ②内置残留类加载失败 (composite 断链 / import 已删模块) 的策略文件
+    #   自动归档出扫描目录并重载。摘要挂到 app.state 供前端提示一次。
+    legacy_migration: dict = {}
+    try:
+        from app.strategy.legacy_migrate import archive_unloadable_strategies
+
+        if _seeded_signals:
+            legacy_migration["seeded_signals"] = _seeded_signals
+            logger.info("legacy migrate: seeded %d default signals", _seeded_signals)
+        if _seeded_strategies:
+            legacy_migration["seeded_strategies"] = _seeded_strategies
+            logger.info("legacy migrate: seeded %d builtin strategies", _seeded_strategies)
+        archived = archive_unloadable_strategies(strategy_engine.load_errors())
+        if archived:
+            strategy_engine.reload()
+            legacy_migration["archived_files"] = archived
+            logger.info("legacy migrate: archived %d unloadable files", len(archived))
+        if legacy_migration:
+            app.state.legacy_migration = legacy_migration
+    except Exception as e:  # noqa: BLE001
+        logger.warning("legacy migrate failed (ignored): %s", e)
     app.state.strategy_engine = strategy_engine
     logger.info("strategy engine loaded: %d strategies", len(strategy_engine.list_strategies()))
 
@@ -274,7 +418,7 @@ async def _application_lifespan(app: FastAPI):
                     return
 
                 with shared_heavy_job_limiter.slot(
-                    "normal",
+                    "exclusive",
                     cancel_event=matrix_prewarm_owner.cancel_event,
                 ):
                     result = prewarm_matrix_cache(
@@ -299,17 +443,17 @@ async def _application_lifespan(app: FastAPI):
         _schedule_matrix_cache_prewarm()
 
     # 通用监控规则引擎: 启动时 reload 规则到内存态 (修复重启后告警失效)
-    from app.strategy.monitor import MonitorRuleEngine
-    from app.strategy import monitor_rules as mr_store
     from app.services import preferences
     from app.services.sector_monitor import SectorMonitorService
+    from app.strategy import monitor_rules as mr_store
+    from app.strategy.monitor import MonitorRuleEngine
     monitor_engine = MonitorRuleEngine()
     sector_monitor_service = SectorMonitorService(repo)
     monitor_engine.set_strategy_engine(strategy_engine)
     monitor_engine.set_data_dir(store.data_dir)
     monitor_engine.set_sector_monitor_service(sector_monitor_service)
     # 复用 ScreenerService 的历史窗口加载器 (三级缓存, 启动预计算命中 ~0ms),
-    # 让声明 filter_history 的策略 (如反包) 也能在实时监控里跑选股 → 盘中触发通知。
+    # 让声明 filter_history 的策略 (如反包) 也能在实时监控里跑策略 → 盘中触发通知。
     monitor_engine.set_history_loader(_screener_svc._load_enriched_history)
     # ETF 版历史加载器: asset_type=etf 的 strategy 型规则用 (读 kline_etf_enriched)。
     monitor_engine.set_history_loader_etf(_etf_screener_svc._load_enriched_history)
@@ -331,6 +475,15 @@ async def _application_lifespan(app: FastAPI):
         logger.info("monitor engine loaded: %d rules", monitor_engine.rule_count)
     except Exception as e:  # noqa: BLE001
         logger.warning("monitor engine load failed: %s", e)
+    # 模拟盘「绑定即评估」: 把账户绑定但无监控规则的策略注入评估循环
+    # (set_rules 全量覆盖, 必须在其后注入; 失败不阻断启动)。
+    try:
+        from app.strategy import paper_watch
+
+        synced = paper_watch.sync(store.data_dir, monitor_engine, strategy_engine)
+        logger.info("paper watch synced at startup: %d strategies", len(synced["watching"]))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("paper watch sync failed (ignored): %s", e)
     app.state.monitor_engine = monitor_engine
     app.state.sector_monitor_service = sector_monitor_service
 
@@ -340,16 +493,21 @@ async def _application_lifespan(app: FastAPI):
         current_extension_context(data_dir=store.data_dir, repository=repo),
         extension_registry,
     )
-
     try:
         yield
     finally:
         repo._on_refresh_done = None  # noqa: SLF001
+        wd = getattr(app.state, "watchdog", None)
+        if wd:
+            await wd.stop()
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
         mmanager = getattr(app.state, "mining_manager", None)
         if mmanager:
             mmanager.shutdown()
+        gmanager = getattr(app.state, "guardian_manager", None)
+        if gmanager:
+            gmanager.shutdown()
         if app.state.scheduler:
             app.state.scheduler.shutdown(wait=False)
         ps = getattr(app.state, "pull_scheduler", None)
@@ -370,26 +528,52 @@ async def _application_lifespan(app: FastAPI):
         mrs = getattr(app.state, "minute_refresh", None)
         if mrs:
             mrs.stop()
+        # webhook/系统通知投递线程池: 放弃排队投递并关闭, 避免通知静默丢失在 daemon 线程里
+        from app.services.quote_service import shutdown_delivery_executors
+
+        shutdown_delivery_executors()
         logger.info("shutdown")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     mining_process_lock = MiningProcessLock(settings.data_dir)
-    mining_process_lock.acquire()
+    lock_acquired = True
+    try:
+        mining_process_lock.acquire()
+    except MiningProcessLockError:
+        # 撞锁不再让整个后端起不来 (典型: 旧实例挂死在 shutdown 持锁不放):
+        # 面板以降级模式启动 — 挖掘启动入口返回 409, 用户可在挖掘页查看
+        # 持有者并 (满足陈旧判定时) 强制释放, 之后自动恢复。
+        lock_acquired = False
+        logger.warning(
+            "挖掘锁被其他进程占用, 面板以降级模式启动 (挖掘功能暂不可用; "
+            "可在挖掘页查看锁状态并强制释放)"
+        )
+    app.state.mining_process_lock = mining_process_lock
+    app.state.mining_lock_acquired = lock_acquired
     try:
         async with _application_lifespan(app):
             yield
     finally:
-        mining_process_lock.release()
+        # 用 lock.acquired 而非启动时的 flag: 强制释放接管后同样要在退出时释放
+        if mining_process_lock.acquired:
+            mining_process_lock.release()
 
 
 app = FastAPI(
     title="Tick Stock Panel",
     version=__version__,
-    description="A 股选股 + 回测面板 — TickFlow 适配",
+    description="A 股策略 + 回测面板 — TickFlow 适配",
     lifespan=lifespan,
 )
+
+@app.exception_handler(WorkBusyError)
+@app.exception_handler(HeavyJobLimitTimeoutError)
+async def shared_work_busy_handler(request: Request, exc: WorkBusyError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": str(exc), "code": "work_busy"},
+                        headers={"Retry-After": "3"})
+
 
 # CORS: 允许局域网访问 (自托管场景, 放开所有来源)
 # 注: allow_credentials=True 与 allow_origins=['*'] 不能共存 (浏览器规范),
@@ -412,7 +596,35 @@ app.add_middleware(
 #   3. 已设密码              → 检查 session, 无效则 401(前端跳登录)
 # 白名单: /api/auth/* (设密码/登录本身)、/health 等探活。
 _AUTH_WHITELIST_PREFIX = ("/api/auth/",)
-_AUTH_WHITELIST_EXACT = ("/health", "/api/health", "/openapi.json", "/docs", "/redoc")
+_AUTH_WHITELIST_EXACT = (
+    "/health",
+    "/api/health",
+    "/openapi.json",
+    "/api/openapi.json",
+    "/docs",
+    "/redoc",
+    # SSE 事件流: EventSource 带不了 Authorization 头, 凭证即 query 里的
+    # 一次性票据, 端点内校验 (api/events.py); POST /api/events/ticket 不在
+    # 白名单, 仍走网关 Bearer 通道
+    "/api/events",
+)
+
+
+@app.middleware("http")
+async def workload_middleware(request: Request, call_next):
+    import time
+
+    from app.services.workload import workload
+
+    group = next((name for name in ("screener", "kline", "overview", "watchlist", "backtest")
+                  if request.url.path == f"/api/{name}" or request.url.path.startswith(f"/api/{name}/")), None)
+    if group is None:
+        return await call_next(request)
+    started = time.perf_counter()
+    try:
+        return await call_next(request)
+    finally:
+        workload.record(f"http.{group}", "request", elapsed_s=time.perf_counter() - started)
 
 
 @app.middleware("http")
@@ -421,9 +633,36 @@ async def auth_middleware(request: Request, call_next):
     # 仅 /api/ 走认证; 静态资源(前端页面/assets)放行, 由前端处理跳转
     if not path.startswith("/api/"):
         return await call_next(request)
+    # CORS 预检不带凭据, 直接放行 (CORSMiddleware 在外层应答)
+    if request.method == "OPTIONS":
+        return await call_next(request)
     # 白名单放行(设密码/登录/探活本身不拦)
     if path.startswith(_AUTH_WHITELIST_PREFIX) or path in _AUTH_WHITELIST_EXACT:
         return await call_next(request)
+
+    # ── API Token 通道 (外部调用方; 与密码会话并行, 见 open-platform-plan §4) ──
+    authz = request.headers.get("authorization", "")
+    if authz.startswith("Bearer "):
+        from app.services import api_gateway
+        # 网络门禁先行: 默认仅本机/内网可调 Token 通道 (API_TOKEN_LOCAL_ONLY=0 放开);
+        # 先于 evaluate 拦截 → 不消耗限流额度, 公网探测者也拿不到 Token 有效性信号
+        gate = api_gateway.token_network_verdict(auth_api._client_ip(request))
+        if gate is not None:
+            return JSONResponse(
+                status_code=gate["status"], content={"detail": gate["detail"]},
+            )
+        verdict = api_gateway.evaluate(
+            settings.data_dir, request.method, path, authz[len("Bearer "):].strip(),
+        )
+        if verdict["status"] is not None:
+            return JSONResponse(
+                status_code=verdict["status"], content={"detail": verdict["detail"]},
+                headers=verdict["headers"],
+            )
+        response = await call_next(request)
+        for k, v in verdict["headers"].items():
+            response.headers[k] = v
+        return response
 
     from app.services import auth as auth_service
     # 情况 1+2: 未设密码
@@ -455,26 +694,41 @@ app.include_router(kline.router)
 app.include_router(watchlist.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
+app.include_router(factors.router)
+app.include_router(definitions.router)
 app.include_router(mining.router)
+app.include_router(guardian.router)
+app.include_router(lab.router)
 app.include_router(intraday.router)
 app.include_router(indices.router)
 app.include_router(overview.router)
+app.include_router(pages_admin.router)
+app.include_router(paper.router)
 app.include_router(abnormal.router)
 app.include_router(regime.router)
 app.include_router(analysis.router)
 app.include_router(pipeline.router)
+app.include_router(position_policies.router)
 app.include_router(data.router)
 app.include_router(ext_data.router)
+app.include_router(ext_pages.router)
+app.include_router(task_registry.router)
 app.include_router(financials.router)
 app.include_router(stock_analysis.router)
 app.include_router(market_recap.router)
 app.include_router(settings_api.router)
+app.include_router(upgrade_guard_api.router)
 app.include_router(strategy.router)
+app.include_router(strategy_pool.router)
 app.include_router(signals.router)
 app.include_router(monitor_rules.router)
+app.include_router(config_backup.router)
+app.include_router(import_center.router)
 app.include_router(lots.router)
 app.include_router(alerts.router)
+app.include_router(events.router)
 app.include_router(rps.router)
+app.include_router(sector_rotation.router)
 
 # 二次开发路由与小粒度策略在所有核心路由后注册, 禁止覆盖核心路径。
 extension_registry, extension_load_errors = configure_backend_extensions(app)
@@ -487,7 +741,34 @@ app.state.extension_load_errors = extension_load_errors
 # 若不注册 handler 会冒泡成 500 Internal Server Error,对前端不友好且语义错误。
 from fastapi import Request
 from fastapi.responses import JSONResponse
+
 from app.tickflow.capabilities import CapabilityDenied
+
+
+@app.get("/api/openapi.json", include_in_schema=False)
+async def openapi_contract_view(tier: str = "a"):
+    """Tier A 契约视图: 只保留对外开放 (Token 可达) 的端点 = 稳定承诺面。
+
+    开放清单的权威来源是 api_gateway 的规则表 — 规则表即契约, 单源维护。
+    二开方以此生成客户端; 未出现在此视图的端点属内部实现, 随时变化。
+    """
+    spec = app.openapi()
+    if tier == "a":
+        from app.services import api_gateway
+
+        kept_paths: dict = {}
+        for path, ops in spec.get("paths", {}).items():
+            kept_ops = {}
+            for method, op in ops.items():
+                if method in ("get", "post", "put", "delete", "patch") and api_gateway.required_scope(
+                    method.upper(), path,
+                ):
+                    kept_ops[method] = op
+            if kept_ops:
+                kept_paths[path] = kept_ops
+        spec["paths"] = kept_paths
+        spec["x-tier"] = "a"
+    return JSONResponse(spec)
 
 
 @app.exception_handler(CapabilityDenied)
@@ -497,23 +778,51 @@ async def capability_denied_handler(request: Request, exc: CapabilityDenied) -> 
         content={"detail": str(exc), "suggestion": exc.suggestion},
     )
 
+
+@app.exception_handler(DailyIntegrityError)
+async def daily_integrity_error_handler(request: Request, exc: DailyIntegrityError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc), "code": "daily_integrity"})
+
+
+@app.exception_handler(ProviderRequestError)
+async def provider_request_error_handler(request: Request, exc: ProviderRequestError) -> JSONResponse:
+    return JSONResponse(status_code=502, content={"detail": str(exc), "code": "provider_request"})
+
 # 生产期静态文件(前端 dist)
-_static = Path(settings.static_dir)
-if _static.exists():
-    if (_static / "assets").exists():
-        app.mount("/assets", StaticFiles(directory=_static / "assets"), name="assets")
+def _register_static_routes(target: FastAPI, static_dir: Path) -> None:
+    """挂载前端构建产物: /assets 走静态服务, 根级文件直出, 其余回退 SPA。
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def spa_fallback(full_path: str):  # noqa: ARG001
-        """所有未匹配路径回退到 index.html — React Router 接管。
+    根级静态文件 (favicon.svg / donate-wechat.jpg 等) 必须原样返回。此前所有
+    未匹配路径都回退 index.html, 浏览器把 HTML 当图标解析失败, Docker 与桌面
+    安装包的浏览器页签因此没有图标。
+    """
+    # 旧客户端可能缓存了 text/plain 的 JS/CSS。使用版本化资源地址，连带
+    # 相对路径动态 import 的分块一起绕过旧缓存；保留 /assets 兼容旧链接。
+    asset_base = f"/_static/{__version__}/assets"
+    if (static_dir / "assets").exists():
+        assets = FrontendStaticFiles(directory=static_dir / "assets")
+        target.mount("/assets", assets, name="assets")
+        target.mount(asset_base, assets, name="versioned-assets")
 
-        index.html 禁止缓存 (Cache-Control: no-store), 确保浏览器每次拿到
-        最新版本引用的 JS/CSS 文件名 (assets 带 hash, 可长缓存)。
-        """
-        index = _static / "index.html"
+    @target.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # 只直出 dist 根目录文件 (单段路径); index.html 仍走下方 no-store 分支。
+        if full_path and "/" not in full_path and full_path not in (".", ".."):
+            asset = static_dir / full_path
+            if full_path != "index.html" and asset.is_file():
+                return frontend_file_response(asset)
+        index = static_dir / "index.html"
         if index.exists():
-            return FileResponse(
-                index,
+            markup = index.read_text(encoding="utf-8")
+            for quote in ('"', "'"):
+                markup = markup.replace(f"{quote}/assets/", f"{quote}{asset_base}/")
+            return HTMLResponse(
+                markup,
                 headers={"Cache-Control": "no-store, must-revalidate"},
             )
         return {"error": "frontend not built"}
+
+
+_static = Path(settings.static_dir)
+if _static.exists():
+    _register_static_routes(app, _static)

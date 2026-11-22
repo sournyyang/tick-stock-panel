@@ -1,0 +1,288 @@
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
+
+import polars as pl
+import pytest
+
+from app.backtest.matrix import build_market_data_matrix
+from app.custom.close_watch.service import CloseWatchService, watch_phase
+from app.market_time import CN_TZ
+from app.services import alert_store
+from app.strategy.engine import StrategyEngine
+
+DAY = date(2026, 11, 20)
+NOW = datetime(2026, 11, 20, 14, 51, tzinfo=CN_TZ)
+
+@pytest.mark.parametrize('now,expected', [
+    (NOW.replace(hour=14,minute=49),None),(NOW,'preview'),
+    (NOW.replace(hour=15,minute=0),'confirmed'),(NOW.replace(day=21),None),
+    (NOW.astimezone(UTC),'preview'),
+])
+def test_phase_uses_beijing_trading_session(now,expected):
+    assert watch_phase(now,'14:50')==expected
+
+@pytest.fixture
+def env(tmp_path):
+    folder = tmp_path / 'strategies' / 'custom'
+    folder.mkdir(parents=True)
+    path = folder / 'demo.py'
+    path.write_text('''import numpy as np
+from app.backtest.matrix import make_signal_matrix
+META = {'id':'demo','name':'测试策略','asset_types':['stock'],'timeframes':['1d'],'params':[],'scoring':{},'order_by':'score','descending':True,'backtest_defaults':{'max_positions':2}}
+BASIC_FILTER = {'enabled':False}
+EXECUTION_BACKEND = 'matrix_native'
+ENTRY_SIGNALS = ['signal_triple_volume_breakout']
+EXIT_SIGNALS = ['signal_close_below_ma3']
+MAX_HOLD_DAYS = 8
+class Native:
+ def required_fields(self): return frozenset({'open','high','low','close','volume','raw_close'})
+ def required_warmup_bars(self,p): return 20
+ def entry_candidate_limit(self,p): return 1
+ def compute_signals(self,m,p):
+  entry=(m.close>=m.open*1.025).astype(np.uint8)
+  return make_signal_matrix(m.shape,entry=entry,exit=(m.close<10).astype(np.uint8),score=m.volume,
+    entry_signal_code=np.where(entry,0,-1).astype(np.int16),entry_signal_ids=tuple(ENTRY_SIGNALS),
+    exit_signal_code=np.where(m.close<10,0,-1).astype(np.int16),exit_signal_ids=tuple(EXIT_SIGNALS),
+    entry_close_floor=(m.close*.97).astype(np.float32))
+MATRIX_STRATEGY=Native()
+''')
+    engine = StrategyEngine([folder])
+    days = [DAY - timedelta(days=i) for i in range(34, -1, -1) if (DAY-timedelta(days=i)).weekday()<5]
+    frame = pl.DataFrame([{'date':d,'symbol':s,'open':10.,'close':10.4,'high':10.8,'low':9.8,
+        'volume':v,'raw_close':10.4,'quote_ts':int(NOW.timestamp()*1000)}
+        for d in days for s,v in [('000001.SZ',100.),('600000.SH',200.)]])
+    market = build_market_data_matrix(frame, field_columns={'raw_close'})
+    current = frame.filter(pl.col('date')==DAY)
+    quotes = SimpleNamespace(
+        status=lambda:{'mode':'full_market','quote_age_ms':0,'last_fetch_ms':NOW.timestamp()*1000,
+            'final_sync_done':False,'final_sync_failed':None,'symbol_count':2},
+        get_enriched_today=lambda:(current, DAY), pushed=[],
+    )
+    quotes.push_alerts=lambda events:quotes.pushed.extend(events)
+    repo = SimpleNamespace(get_instruments_asset=lambda asset:pl.DataFrame({'symbol':['000001.SZ','600000.SH']}))
+    screener = SimpleNamespace(repo=repo)
+    service = CloseWatchService(tmp_path, engine, screener, quotes)
+    service._market=lambda *args,**kwargs:market
+    service.configure('demo', True, '14:50')
+    return SimpleNamespace(root=tmp_path,service=service,engine=engine,quotes=quotes,
+        market=market,current=current,history=frame,days=days,path=path)
+
+
+def tracked(env, index=-5, symbol='600000.SH'):
+    state=env.service._load()
+    state.update(seeded=True,tracks=[env.service._track(symbol,env.days[index].isoformat(),symbol)])
+    env.service._save(state)
+    return state['tracks'][0]
+
+
+def changed_market(env,value):
+    close=env.market.close.copy()
+    close[-1,1]=value
+    raw=env.market.field('raw_close').copy()
+    raw[-1,1]=value
+    return replace(env.market,close=close,fields={**env.market.fields,'raw_close':raw},_valid_bars=None)
+
+
+def confirmed(env,price=10.4):
+    later=NOW.replace(hour=15,minute=1)
+    env.quotes.status=lambda:{'mode':'full_market','quote_age_ms':0,'final_sync_done':True,'symbol_count':2}
+    env.quotes.get_enriched_today=lambda:(env.current.with_columns(
+        pl.lit(int(later.timestamp()*1000)).alias('quote_ts'),
+        pl.when(pl.col('symbol')=='600000.SH').then(price).otherwise(pl.col('raw_close')).alias('raw_close')),DAY)
+    return later
+
+
+def test_preview_today_then_confirmation_and_restart_dedupe(env):
+    env.service.tick(NOW)
+    env.service.tick(NOW+timedelta(seconds=20))
+    state=env.service.get()
+    assert len(state['events'])==1 and state['events'][0]['type']=='buy_signal'
+    assert state['events'][0]['phase']=='preview'
+    assert '当天信号' in state['events'][0]['message']
+    assert '等待下个交易日' not in state['events'][0]['message']
+    assert all(t['signal_date']<str(DAY) for t in state['tracks'])
+    later=confirmed(env)
+    env.service.tick(later)
+    assert len(env.service.get()['events'])==2
+    restarted=CloseWatchService(env.root,env.engine,env.service.screener,env.quotes)
+    restarted._market=env.service._market
+    restarted.tick(later)
+    assert len(restarted.get()['events'])==2
+    assert not list(env.root.rglob('orders*'))
+
+
+def test_new_confirmed_buy_starts_observation_without_assuming_a_fill(env):
+    close=env.market.close.copy()
+    close[:-1]=10.
+    raw=env.market.field('raw_close').copy()
+    raw[:-1]=10.
+    market=replace(env.market,close=close,fields={**env.market.fields,'raw_close':raw},_valid_bars=None)
+    env.service._market=lambda *a,**k:market
+    env.service.tick(NOW)
+    assert env.service.get()['tracks']==[]
+    env.service.tick(confirmed(env))
+    state=env.service.get()
+    assert len(state['tracks'])==1
+    assert state['tracks'][0]['signal_date']==str(DAY)
+    assert not any('entry_date' in t or 'qty' in t for t in state['tracks'])
+    assert state['watch_status'][0]['signal_age']==0
+    assert abs(state['watch_status'][0]['floor_price']-10.4*.97)<1e-5
+    assert not any(e['type']=='sell_signal' for e in state['events'])
+
+
+def test_later_buy_signal_never_resets_original_observation_floor(env):
+    track=tracked(env)
+    env.service.tick(NOW)
+    assert env.service.get()['tracks'][0]['signal_date']==track['signal_date']
+    market=changed_market(env,9.9)
+    env.service._market=lambda *a,**k:market
+    env.quotes.get_enriched_today=lambda:(env.current.with_columns(
+        pl.when(pl.col('symbol')=='600000.SH').then(9.9).otherwise(pl.col('raw_close')).alias('raw_close')),DAY)
+    env.service.tick(NOW)
+    row=env.service.get()['watch_status'][0]
+    assert any('防守线' in r for r in row['reasons'])
+    assert abs(row['floor_price']-10.4*.97)<1e-5
+    market=replace(market,close=market.close*.5,open=market.open*.5,high=market.high*.5,low=market.low*.5,_valid_bars=None)
+    env.service._market=lambda *a,**k:market
+    env.service.tick(NOW)
+    assert abs(env.service.get()['watch_status'][0]['floor_price']-row['floor_price'])<1e-5
+
+
+def test_only_bought_signal_observations_emit_sell_and_expiry(env):
+    tracked(env,index=-9)
+    env.service.tick(NOW)
+    sells=[e for e in env.service.get()['events'] if e['type']=='sell_signal']
+    assert len(sells)==1 and sells[0]['symbol']=='600000.SH'
+    assert '买点后已过8个市场交易日' in sells[0]['message']
+    assert env.service.get()['watch_status'][0]['signal_age']==8
+
+
+def test_sell_preview_can_clear_before_close_without_ending_observation(env):
+    tracked(env)
+    env.service._market=lambda *a,**k:changed_market(env,9.9)
+    env.quotes.get_enriched_today=lambda:(env.current.with_columns(
+        pl.when(pl.col('symbol')=='600000.SH').then(9.9).otherwise(pl.col('raw_close')).alias('raw_close')),DAY)
+    env.service.tick(NOW)
+    assert env.service.get()['tracks']
+    env.service._market=lambda *a,**k:env.market
+    env.service.tick(confirmed(env))
+    state=env.service.get()
+    assert state['tracks']
+    assert any(e['type']=='pool_exit' and '卖出预警未获收盘确认' in e['message'] for e in state['events'])
+
+
+def test_confirmed_sell_ends_observation_not_actual_position(env):
+    tracked(env)
+    env.service._market=lambda *a,**k:changed_market(env,9.9)
+    env.service.tick(confirmed(env,9.9))
+    state=env.service.get()
+    assert not any(t['symbol']=='600000.SH' for t in state['tracks'])
+    assert state['watch_status'][0]['ended'] is True
+    assert len([e for e in state['events'] if e['type']=='sell_signal'])==1
+    assert not list(env.root.rglob('orders*'))
+
+
+def test_stale_top_candidate_does_not_promote_lower_rank(env):
+    env.quotes.get_enriched_today=lambda:(env.current.with_columns(
+        pl.when(pl.col('symbol')=='600000.SH').then(0).otherwise(pl.col('quote_ts')).alias('quote_ts')),DAY)
+    env.service.tick(NOW)
+    state=env.service.get()
+    assert state['candidates']==[] and state['events']==[]
+    assert '未确认' in state['message']
+
+
+def test_missing_stale_and_unconfirmed_data_never_emit(env):
+    env.quotes.status=lambda:{'mode':'full_market','quote_age_ms':999999,'final_sync_done':False}
+    env.service.tick(NOW)
+    assert env.service.get()['events']==[]
+    env.quotes.status=lambda:{'mode':'full_market','quote_age_ms':0,'final_sync_done':False}
+    env.service.tick(NOW.replace(hour=15,minute=1))
+    assert env.service.get()['events']==[]
+    assert '确认' in env.service.get()['message']
+
+
+def test_strategy_change_and_bad_state_fail_closed(env):
+    env.path.write_text(env.path.read_text()+'\n# changed\n')
+    env.service.tick(NOW)
+    assert env.service.get()['status']=='blocked' and not env.service.get()['events']
+    env.service.path.write_text('{"version":99}')
+    with pytest.raises(ValueError,match='版本'):
+        env.service.get()
+
+
+def test_edit_during_slow_evaluation_wins(env):
+    def market(*a,**k):
+        env.service.configure('demo',False,'14:50')
+        return env.market
+    env.service._market=market
+    env.service.tick(NOW)
+    assert env.service.get()['enabled'] is False
+    assert not env.service.get()['events']
+
+
+def test_append_checkpoint_crash_recovers_without_duplicate(env,monkeypatch):
+    append=alert_store.append_many
+    def crash(root,events):
+        append(root,events)
+        raise OSError('simulated crash after append')
+    monkeypatch.setattr(alert_store,'append_many',crash)
+    with pytest.raises(OSError):
+        env.service.tick(NOW)
+    monkeypatch.setattr(alert_store,'append_many',append)
+    restarted=CloseWatchService(env.root,env.engine,env.service.screener,env.quotes)
+    restarted._market=env.service._market
+    restarted.tick(NOW)
+    assert len(alert_store.list_recent(env.root,days=30,source='strategy'))==1
+    assert len(restarted.get()['events'])==1
+
+
+def test_realtime_history_reused_until_repair_generation(env,monkeypatch):
+    from app.services import daily_health
+    from app.strategy.engine import StrategyDataContext
+    builds=[]
+    def context(engine,day,ids,**kwargs):
+        builds.append(day)
+        return StrategyDataContext('stock','1d',day,current=kwargs['current'],history=env.history,cache_key=kwargs['cache_key'])
+    screener=SimpleNamespace(repo=env.service.screener.repo,build_strategy_context=context)
+    service=CloseWatchService(env.root,env.engine,screener,env.quotes)
+    monkeypatch.setattr(daily_health,'revision',lambda *a:'first')
+    service.tick(NOW)
+    service.tick(NOW+timedelta(seconds=20))
+    assert builds==[DAY]
+    assert env.engine.realtime_matrix_stats('close-watch:demo')['build_count']==1
+    monkeypatch.setattr(daily_health,'revision',lambda *a:'repaired')
+    service.tick(NOW+timedelta(seconds=40))
+    assert builds==[DAY,DAY]
+
+
+def test_router_only_controls_signal_monitor_not_positions(env):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.custom.close_watch.routes import build_router
+    app=FastAPI()
+    app.state.repo=SimpleNamespace(store=SimpleNamespace(data_dir=env.root))
+    app.state.strategy_engine=env.engine
+    app.state.quote_service=env.quotes
+    app.include_router(build_router())
+    with TestClient(app) as client:
+        root='/api/custom/close-watch'
+        assert client.get(root+'/state').status_code==200
+        result=client.put(root+'/config',json={'strategy_id':'demo','enabled':False,'start_time':'14:50'})
+        assert result.status_code==200
+        assert client.put(root+'/config',json={'strategy_id':'demo','enabled':True,'start_time':'09:30'}).status_code==422
+        assert client.post(root+'/positions',json={}).status_code==404
+
+
+
+def test_verified_close_is_kept_without_recomputing_all_night(env):
+    env.service.tick(NOW)
+    later = confirmed(env)
+    env.service.tick(later)
+    before = env.service.get()
+    def unexpected(*args, **kwargs):
+        raise AssertionError('already confirmed close must not recompute')
+    env.service._evaluate = unexpected
+    env.service.tick(later.replace(hour=22))
+    assert env.service.get() == before

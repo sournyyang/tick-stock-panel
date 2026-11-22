@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion'
-import { Loader2, CheckCircle2, Settings, Table2 } from 'lucide-react'
+import { Loader2, CheckCircle2, Settings, Table2, Download } from 'lucide-react'
 import { formatNumber } from '@/lib/format'
 import { fmtDate } from '@/lib/format'
 import { MissingCapChip } from '@/lib/capability-labels'
@@ -94,6 +94,7 @@ export function StatCard({
   active = false, done = false, skipped = false, stagePct = 0,
   tierKey, capLimits, customProvider,
   auto, onSettings, onShowFields, settingsOpen, subLabel, localBadgeSuffix, fieldTabs,
+  onPull, pullTitle, statusNote,
 }: {
   title: string
   hint: string
@@ -112,10 +113,14 @@ export function StatCard({
   settingsOpen?: boolean
   auto?: boolean
   subLabel?: string
+  statusNote?: string
   localBadgeSuffix?: string
   // 多表字段入口: [{label: '维表', table: 'index_instruments'}, ...]
   // 提供时渲染多个图标按钮(每个对应一张表的字段说明); 否则回退到单个 onShowFields
   fieldTabs?: FieldTab[]
+  /** 提供时在齿轮左侧渲染拉取入口 (用于不在盘后管道内的数据集, 如财务) */
+  onPull?: () => void
+  pullTitle?: string
 }) {
   const empty = loading || !stats || (stats.rows === 0 && !stats.trading_days && !stats.fields)
   const borderCls = active
@@ -225,6 +230,16 @@ export function StatCard({
               本次跳过
             </span>
           )}
+          {onPull && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onPull() }}
+              className="rounded p-0.5 text-secondary transition-colors hover:bg-elevated hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+              title={pullTitle ?? '手动拉取'}
+              aria-label={pullTitle ?? '手动拉取'}
+            >
+              <Download className="h-3.5 w-3.5" />
+            </button>
+          )}
           {onSettings && (
             <button
               onClick={(e) => { e.stopPropagation(); onSettings() }}
@@ -285,6 +300,7 @@ export function StatCard({
         )}
       </div>
 
+      {statusNote && !loading && <p className="px-4 pb-2 text-[11px] text-secondary leading-relaxed">{statusNote}</p>}
       <div className="mt-auto px-4 pb-4 pt-2 border-t border-border space-y-0.5">
         {loading ? (
           <>

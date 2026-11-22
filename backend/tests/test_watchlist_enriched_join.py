@@ -5,13 +5,15 @@
   (新股 / 冷门股 / 新用户未同步). 缺失标的的指标字段为 null, 前端渲染为 "—".
 
 旧 bug: `df_e.filter(is_in(stock_symbols))` 以 enriched 为主表, 会把不在缓存
-universe 里的自选股静默丢弃.
+universe 里的自选静默丢弃.
 """
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 
 import polars as pl
+import pytest
 
 from app.api import watchlist as wl_api
 
@@ -21,7 +23,8 @@ class _FakeRepo:
 
     def __init__(self, enriched_df, enriched_date, etf_df=None, etf_date=None,
                  instruments_df=None, name_map=None, etf_set=None,
-                 index_df=None, index_date=None, index_set=None):
+                 index_df=None, index_date=None, index_set=None,
+                 history_span=None, hist_df=None, history_raises=False):
         self._enriched = enriched_df
         self._enriched_date = enriched_date
         self._etf = etf_df
@@ -32,6 +35,24 @@ class _FakeRepo:
         self._name_map = name_map or {}
         self._etf_set = etf_set or set()
         self._index_set = index_set or set()
+        # 加入后涨跌幅基准价所需的内存历史缓存 (未注入时端点按 null 降级)
+        self._history_span = history_span
+        self._hist = hist_df if hist_df is not None else pl.DataFrame()
+        self._history_raises = history_raises
+
+    def get_enriched_history_span(self):
+        return self._history_span
+
+    def get_enriched_range(self, start, end, symbols=None, columns=None):
+        if self._history_raises:
+            raise RuntimeError("history cache exploded")
+        if self._hist.is_empty():
+            return self._hist
+        # 与真实实现同语义: 按日期区间 + symbol 过滤
+        return self._hist.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end)
+            & pl.col("symbol").is_in(list(symbols or []))
+        )
 
     def get_enriched_latest(self):
         return self._enriched, self._enriched_date
@@ -120,7 +141,7 @@ def test_all_watchlist_missing_from_enriched(monkeypatch):
 
 
 def test_partial_coverage_preserves_count(monkeypatch):
-    """多只自选, 部分覆盖: 返回行数必须 == 自选股票数."""
+    """多只自选, 部分覆盖: 返回行数必须 == 自选只数."""
     syms = ["600519", "000001", "999888", "888999"]
     monkeypatch.setattr(wl_api.watchlist, "list_symbols",
                         lambda: [{"symbol": s} for s in syms])
@@ -264,3 +285,425 @@ def test_watchlist_enriched_index_branch(monkeypatch):
     assert rows["510300.SH"]["asset_type"] == "etf"
     # as_of == min(三类缓存日期)
     assert res["as_of"] == "2026-07-23"
+
+
+def _quote_df(rows):
+    """rows: [(symbol, close, prev_close, volume, open, high, low), ...]"""
+    return pl.DataFrame(
+        [{"symbol": s, "close": c, "prev_close": pc, "volume": v,
+          "open": o, "high": h, "low": lo, "amount": 1e9, "change_pct": 1.0}
+         for s, c, pc, v, o, h, lo in rows],
+        schema_overrides={k: pl.Float64 for k in
+                          ("close", "prev_close", "volume", "open", "high", "low",
+                           "amount", "change_pct")},
+    )
+
+
+def test_watchlist_enriched_limit_prices_and_quote_cols(monkeypatch):
+    """昨收/成交量透传; 股票行涨跌停价按板块现算 (划断后 ST=10%), ETF 行置 null。
+
+    涨停价口径: prev_close x (1+pct) 整数分半进位 (polars_limit_price)。
+      - 600519.SH 主板 10%: 1800.0 → 涨停 1980.00 / 跌停 1620.00
+      - 300001.SZ 创业 20%: 10.0 → 12.00 / 8.00
+      - 600029.SH 主板 ST (2026-07-08 ≥ 划断日) 10%: 10.0 → 11.00 / 9.00
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": s} for s in
+                                 ("600519.SH", "300001.SZ", "600029.SH", "510300.SH")])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([
+            ("600519.SH", 1900.0, 1800.0, 123456.0, 1810.0, 1950.0, 1799.0),
+            ("300001.SZ", 10.5, 10.0, 88_000.0, 10.1, 10.8, 9.9),
+            ("600029.SH", 10.6, 10.0, 55_000.0, 10.0, 10.9, 9.7),
+        ]),
+        enriched_date="2026-07-08",
+        etf_df=_quote_df([("510300.SH", 4.1, 4.0, 900_000.0, 4.0, 4.2, 3.9)]),
+        etf_date="2026-07-08",
+        etf_set={"510300.SH"},
+        name_map={
+            "600519.SH": "贵州茅台", "300001.SZ": "特锐德", "600029.SH": "ST 南航",
+            "510300.SH": "沪深300ETF",
+        },
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    # 昨收/成交量 透传 (此前被 _WATCHLIST_COLS 裁掉)
+    row = rows["600519.SH"]
+    assert row["prev_close"] == 1800.0
+    assert row["volume"] == 123456.0
+    assert row["open"] == 1810.0 and row["high"] == 1950.0 and row["low"] == 1799.0
+
+    # 股票行涨跌停价
+    assert rows["600519.SH"]["limit_up_price"] == 1980.0
+    assert rows["600519.SH"]["limit_down_price"] == 1620.0
+    assert rows["300001.SZ"]["limit_up_price"] == 12.0
+    assert rows["300001.SZ"]["limit_down_price"] == 8.0
+    # 主板 ST 在 2026-07-06 划断后恢复 10%
+    assert rows["600029.SH"]["limit_up_price"] == 11.0
+    assert rows["600029.SH"]["limit_down_price"] == 9.0
+
+    # ETF 行: prev_close/volume 正常透传, 涨跌停价置 null
+    etf = rows["510300.SH"]
+    assert etf["prev_close"] == 4.0 and etf["volume"] == 900_000.0
+    assert etf["limit_up_price"] is None
+    assert etf["limit_down_price"] is None
+
+
+def test_watchlist_enriched_limit_prices_legacy_st(monkeypatch):
+    """数据日在 2026-07-06 划断之前: 主板 ST 涨跌幅为 5% 老规则, 非 ST 不受影响。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": s} for s in ("600029.SH", "600519.SH")])
+    repo = _FakeRepo(
+        enriched_df=_quote_df([
+            ("600029.SH", 10.2, 10.0, 66_000.0, 10.0, 10.4, 9.8),
+            ("600519.SH", 1900.0, 1800.0, 123456.0, 1810.0, 1950.0, 1799.0),
+        ]),
+        enriched_date="2026-07-01",
+        name_map={"600029.SH": "ST 南航", "600519.SH": "贵州茅台"},
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    assert rows["600029.SH"]["limit_up_price"] == 10.5
+    assert rows["600029.SH"]["limit_down_price"] == 9.5
+    assert rows["600519.SH"]["limit_up_price"] == 1980.0
+
+
+# ===== 加入日期 / 加入后涨跌幅 =====
+
+def _hist_df(rows):
+    """rows: [(symbol, date, close), ...]"""
+    return pl.DataFrame(
+        [{"symbol": s, "date": d, "close": c} for s, d, c in rows],
+        schema={"symbol": pl.Utf8, "date": pl.Date, "close": pl.Float64},
+    )
+
+
+def _entries(*pairs):
+    """(symbol, added_at) 对 → list_symbols 返回值"""
+    return [{"symbol": s, "added_at": a} for s, a in pairs]
+
+
+def _span():
+    return (date(2026, 9, 1), date(2026, 9, 18))
+
+
+def test_pct_since_added_baseline_is_added_day_close(monkeypatch):
+    """正常路径: 基准 = 加入日收盘 (<= 语义), 结果为小数口径, added_at 原样透传。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-10T03:21:07")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 9), 9.0),
+                          ("600519.SH", date(2026, 9, 10), 10.0),
+                          ("600519.SH", date(2026, 9, 11), 10.5)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    row = res["rows"][0]
+
+    # 基准取 09-10 收盘 10.0 (不是更早的 9.0, 也不是更晚的 10.5)
+    assert row["pct_since_added"] == pytest.approx(11.0 / 10.0 - 1.0)
+    # 小数口径: 10% 存 0.1 而非 10 (与 momentum_* 一致, 前端 fmtPct 期望小数)
+    assert row["pct_since_added"] == pytest.approx(0.1)
+    assert row["pct_since_added"] < 1, "必须是小数口径, 不能写成百分数"
+    # added_at 原样透传 (前端负责 UTC→北京换算)
+    assert row["added_at"] == "2026-09-10T03:21:07"
+    # 中间量不得泄漏到响应
+    assert "base_close" not in row
+
+
+def test_pct_since_added_snaps_back_to_previous_trading_day(monkeypatch):
+    """周末/节假日加入: 基准回落到 <= 加入日的最近交易日 (周五), 而非无值。"""
+    # 2026-09-19 是周六 (北京时间), 无 bar
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-19T02:00:00")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 13.2, 1.0, 1e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 17), 10.0),
+                          ("600519.SH", date(2026, 9, 18), 12.0)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    assert res["rows"][0]["pct_since_added"] == pytest.approx(13.2 / 12.0 - 1.0)
+
+
+def test_pct_since_added_uses_beijing_date_not_utc(monkeypatch):
+    """added_at 是 naive UTC: 北京时间 09-19 04:30 加入的, 基准必须取 09-19 收盘。
+
+    该字符串的 UTC 日期是 09-18 —— 若按 UTC 日取基准会错取到 10.0 (结果 1.2),
+    正确结果 0.1。两者可区分, 故本用例能捕捉口径回归。
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-18T20:30:00")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 22.0, 1.0, 1e9)]),
+        enriched_date="2026-09-19",
+        history_span=(date(2026, 9, 1), date(2026, 9, 19)),
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 18), 10.0),
+                          ("600519.SH", date(2026, 9, 19), 20.0)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    pct = res["rows"][0]["pct_since_added"]
+    assert pct == pytest.approx(22.0 / 20.0 - 1.0), \
+        f"基准应取北京日 09-19 的收盘 20.0; 按 UTC 日会得到 1.2, 实际 {pct}"
+
+
+@pytest.mark.parametrize("history_span,history_raises,keeps_added_at", [
+    (None, False, True),      # 历史缓存不可用 (冷启动/预热中): 只降级涨跌幅
+    (_span(), True, False),   # 取数抛异常: 整个装饰块降级
+])
+def test_pct_since_added_degrades_without_breaking_rows(
+    monkeypatch, history_span, history_raises, keeps_added_at,
+):
+    """装饰列取不到时不得 fail 整个请求: 返回完整 rows, 新列为 null。"""
+    syms = ["600519.SH", "000001.SZ"]
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-10T03:00:00"),
+                                         ("000001.SZ", "2026-09-11T03:00:00")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9),
+                                  ("000001.SZ", 15.0, 0.3, 2e9)]),
+        enriched_date="2026-09-18",
+        history_span=history_span,
+        history_raises=history_raises,
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+
+    assert [r["symbol"] for r in res["rows"]] == syms
+    assert all(r["pct_since_added"] is None for r in res["rows"])
+    assert all(bool(r["added_at"]) is keeps_added_at for r in res["rows"])
+    # 中间量不得残留在响应里
+    assert all("base_close" not in r for r in res["rows"])
+    # 主表数据完好
+    assert res["rows"][0]["close"] == 11.0
+
+
+def test_pct_since_added_null_when_added_before_history_span(monkeypatch):
+    """加入日早于可查询历史范围 (约 300 天) 的标的显式降级, 同表其它标的不受影响。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-10T03:00:00"),
+                                         ("000001.SZ", "2025-01-05T03:00:00")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9),
+                                  ("000001.SZ", 15.0, 0.3, 2e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),       # 只覆盖 2026-09-01 起
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 10), 10.0)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    rows = {r["symbol"]: r for r in res["rows"]}
+
+    assert rows["000001.SZ"]["pct_since_added"] is None, "超窗应降级为 null"
+    assert rows["000001.SZ"]["added_at"] == "2025-01-05T03:00:00", "加入日期仍应返回"
+    assert rows["600519.SH"]["pct_since_added"] == pytest.approx(0.1), \
+        "一只超窗不得拖垮同表其它标的"
+
+
+def test_added_at_empty_string_normalized_to_null(monkeypatch):
+    """老 schema 迁移补的空串归一为 null, 不抛异常也不渲染成空日期。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 10), 10.0)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    row = res["rows"][0]
+    assert row["added_at"] is None
+    assert row["pct_since_added"] is None
+
+
+def test_pct_since_added_null_for_etf_row(monkeypatch):
+    """ETF 显式降级: 加入日期正常返回, 加入后涨跌幅为 null。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("510300.SH", "2026-09-10T03:00:00")))
+    repo = _FakeRepo(
+        enriched_df=pl.DataFrame(schema={"symbol": pl.Utf8}),
+        enriched_date=None,
+        etf_df=_enriched_df([("510300.SH", 4.0, 0.5, 1e8)]),
+        etf_date="2026-09-18",
+        etf_set={"510300.SH"},
+        history_span=_span(),
+        hist_df=_hist_df([("510300.SH", date(2026, 9, 10), 3.8)]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    row = res["rows"][0]
+    assert row["added_at"] == "2026-09-10T03:00:00"
+    assert row["pct_since_added"] is None, "ETF 无历史缓存, 显式降级为 —"
+
+
+def test_pct_since_added_null_for_invalid_baseline(monkeypatch):
+    """基准价非正/NaN 时返回 null, 不得产出 inf 或 NaN 这类会污染前端排序的值。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: _entries(("600519.SH", "2026-09-10T03:00:00"),
+                                         ("000001.SZ", "2026-09-10T03:00:00")))
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9),
+                                  ("000001.SZ", 15.0, 0.3, 2e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),
+        hist_df=_hist_df([("600519.SH", date(2026, 9, 10), 0.0),
+                          ("000001.SZ", date(2026, 9, 10), float("nan"))]),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    for row in res["rows"]:
+        assert row["pct_since_added"] is None, f"{row['symbol']} 应降级为 null"
+
+
+def test_empty_watchlist_returns_no_rows(monkeypatch):
+    """空自选: 保持既有早退契约, 不因新字段改变响应结构。"""
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols", lambda: [])
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 11.0, 1.0, 1e9)]),
+        enriched_date="2026-09-18",
+        history_span=_span(),
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    assert res == {"rows": [], "as_of": None, "elapsed_ms": 0,
+                   "dates": {"stock": None, "etf": None, "index": None}}
+
+
+# ===== 按资产类型行情日期 (dates) =====
+
+def test_dates_reports_per_asset_type_quote_dates(monkeypatch):
+    """dates 契约: 股票当日实时 / ETF 停在旧日 (未开实时拉退回旧日K缓存)。
+
+    前端分时缩略图续画只对 dates[asset_type] == 当日 的标的用行情 close 拼尾K;
+    ETF 旧日期 (如 09-24 收盘 1.105) 不得被拼进当日 1.03x 的分钟序列尾部。
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": "600519.SH"}, {"symbol": "510300.SH"}])
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 1900.0, 1.2, 1e9)]),
+        enriched_date="2026-10-08",
+        etf_df=_enriched_df([("510300.SH", 4.0, 0.5, 1e8)]),
+        etf_date="2026-09-29",
+        etf_set={"510300.SH"},
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+
+    assert res["dates"] == {"stock": "2026-10-08", "etf": "2026-09-29", "index": None}
+    # 全局 as_of 取 min, 与分类型 dates 各自独立 (as_of 分不清哪类过期)
+    assert res["as_of"] == "2026-09-29"
+
+
+def test_dates_etf_none_when_no_etf_in_watchlist(monkeypatch):
+    """自选无 ETF 时不触发 ETF 缓存懒加载 → dates.etf = None (前端按不新鲜处理)。
+
+    锁定端点「仅自选真的含 ETF 才去加载」的懒加载契约不被 dates 字段破坏。
+    """
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols",
+                        lambda: [{"symbol": "600519.SH"}])
+    repo = _FakeRepo(
+        enriched_df=_enriched_df([("600519.SH", 1900.0, 1.2, 1e9)]),
+        enriched_date="2026-10-08",
+        # etf_df 有数据但自选无 ETF: 端点不应调用 get_enriched_latest_asset("etf")
+        etf_df=_enriched_df([("510300.SH", 4.0, 0.5, 1e8)]),
+        etf_date="2026-09-29",
+    )
+
+    res = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+
+    assert res["dates"]["stock"] == "2026-10-08"
+    assert res["dates"]["etf"] is None
+
+
+@pytest.mark.parametrize("date_columns", ["both", "none", "latest_only"])
+def test_legacy_instrument_files_keep_one_watchlist_row(monkeypatch, tmp_path, date_columns):
+    from app.config import settings
+    from app.services import watchlist
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    symbol = "600327.SH"
+    folder = tmp_path / "instruments"
+    folder.mkdir()
+    old = {"symbol": [symbol], "name": ["旧名称"], "float_shares": [100.0]}
+    new = {"symbol": [symbol], "name": ["新名称"], "float_shares": [200.0]}
+    if date_columns != "none":
+        new["as_of"] = [date(2026, 11, 11)]
+    if date_columns == "both":
+        old["as_of"] = [date(2026, 11, 10)]
+    legacy_path = folder / ("a-legacy.parquet" if date_columns == "latest_only" else "part.parquet")
+    pl.DataFrame(old).write_parquet(legacy_path)
+    pl.DataFrame(new).write_parquet(folder / "instruments.parquet")
+    repo = KlineRepository(DataStore(tmp_path))
+    repo._etf_instruments_cache = pl.DataFrame()
+    repo._index_instruments_cache = pl.DataFrame()
+    repo._enriched_cache = _enriched_df([(symbol, 6.53, 0.0993, 1e8)])
+    repo._enriched_cache_date = date(2026, 11, 11)
+    watchlist.add(symbol)
+
+    result = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+
+    assert repo.get_instruments().height == 1
+    row, = result["rows"]
+    assert row["symbol"] == symbol and row["close"] == 6.53
+    if date_columns != "none":
+        assert row["name"] == "新名称" and row["float_shares"] == 200.0
+    assert legacy_path.exists()
+    assert (folder / "instruments.parquet").exists()
+
+
+@pytest.mark.parametrize("asset", ["stock", "etf", "index"])
+def test_duplicate_quote_rows_use_latest_complete_row(monkeypatch, asset):
+    from datetime import datetime
+
+    from app.market_time import CN_TZ
+
+    symbol = {"stock": "600327.SH", "etf": "510300.SH", "index": "000001.SH"}[asset]
+    pending = "999999.SH"
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols", lambda: [{"symbol": pending}, {"symbol": symbol}])
+    ts = int(datetime(2026, 11, 11, 10, 30, tzinfo=CN_TZ).timestamp() * 1000)
+    quotes = pl.DataFrame({
+        "symbol": [symbol] * 3,
+        "date": [date(2026, 11, 10), date(2026, 11, 11), date(2026, 11, 11)],
+        "quote_ts": [ts - 86400000, ts, ts - 1000],
+        "close": [5.0, 6.53, 6.50], "amount": [10.0, 30.0, 20.0],
+    })
+    repo = _FakeRepo(
+        enriched_df=quotes if asset == "stock" else pl.DataFrame(),
+        enriched_date=date(2026, 11, 11),
+        etf_df=quotes if asset == "etf" else None,
+        index_df=quotes if asset == "index" else None,
+        etf_date=date(2026, 11, 11), index_date=date(2026, 11, 11),
+        etf_set={symbol} if asset == "etf" else set(),
+        index_set={symbol} if asset == "index" else set(),
+    )
+    result = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)
+    assert [r["symbol"] for r in result["rows"]] == [pending, symbol]
+    row = result["rows"][1]
+    assert (row["close"], row["amount"], row["quote_ts"]) == (6.53, 30.0, ts)
+    assert row["asset_type"] == asset
+    assert quotes.height == 3
+
+
+def test_duplicate_prepared_rows_cannot_expand_watchlist(monkeypatch):
+    symbol = "600327.SH"
+    monkeypatch.setattr(wl_api.watchlist, "list_symbols", lambda: [{"symbol": symbol}])
+    repo = _FakeRepo(pl.DataFrame(), None)
+    repo.get_prepared_daily = lambda *args: pl.DataFrame({
+        "symbol": [symbol, symbol], "date": [date(2026, 11, 10), date(2026, 11, 11)],
+        "close": [6.0, 6.53],
+    })
+    row, = wl_api.watchlist_enriched(_make_request(repo), ext_columns=None)["rows"]
+    assert row["symbol"] == symbol and row["close"] == 6.53
+    assert row["prepared_daily"] is True

@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import re
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+
+from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,23 @@ def _invalidate_cache() -> None:
     global _cache, _cache_sig
     _cache = None
     _cache_sig = None
+
+
+def data_source_stamp() -> tuple:
+    """Opaque config version; routine last-fetch persistence must not invalidate pulls."""
+    from app.config import settings
+
+    data = load()
+    data.pop("last_fetch_ms", None)
+    result = [hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()]
+    for name in ("secrets.json",):
+        path = settings.data_dir / "user_data" / name
+        try:
+            stat = path.stat()
+            result.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            result.append(None)
+    return (str(settings.data_dir.resolve()), *result)
 
 
 def load() -> dict:
@@ -55,7 +76,14 @@ def load() -> dict:
     return copy.deepcopy(_cache)
 
 
-_SAVE_LOCK = threading.Lock()
+_SAVE_LOCK = threading.RLock()
+
+
+@contextmanager
+def mutation():
+    """Serialize multi-step preference changes with ordinary merge-writes."""
+    with _SAVE_LOCK:
+        yield
 
 
 def save(updates: dict) -> dict:
@@ -67,8 +95,8 @@ def save(updates: dict) -> dict:
     with _SAVE_LOCK:
         current = load()
         current.update(updates)
-        _path().write_text(
-            json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
+        atomic_write_text(
+            _path(), json.dumps(current, indent=2, ensure_ascii=False),
         )
         _invalidate_cache()
     return current
@@ -88,13 +116,12 @@ def get_realtime_quote_interval() -> float:
 
 
 def set_realtime_quote_interval(interval: float) -> float:
-    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。"""
-    current = load()
-    current["realtime_quote_interval"] = interval
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-    _invalidate_cache()
+    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。
+
+    走 save() 而不是自己 load + write_text: 锁外的 read-modify-write 会用旧快照
+    整体覆盖文件, 把并发写入的另一个偏好丢掉 (见 save 的 docstring)。
+    """
+    save({"realtime_quote_interval": interval})
     return interval
 
 
@@ -248,7 +275,7 @@ def get_data_source_long_job_timeout_s() -> int:
 
 
 def get_minute_batch_compress() -> bool:
-    """分时批量响应是否启用 gzip 传输压缩。默认开启 (公网部署传输是大头);
+    """分时详情与批量响应是否启用 gzip 传输压缩。默认开启 (公网部署传输是大头);
     本机/内网可关闭省服务端 CPU。每次请求即时读取, 开关保存后立即生效。
     """
     raw = load().get("minute_batch_compress", True)
@@ -256,9 +283,77 @@ def get_minute_batch_compress() -> bool:
 
 
 def get_daily_batch_compress() -> bool:
-    """日K批量响应是否启用 gzip 传输压缩 (与分时各自独立配置)。默认开启。"""
+    """日K详情与批量响应是否启用 gzip 传输压缩 (与分时各自独立配置)。默认开启。"""
     raw = load().get("daily_batch_compress", True)
     return bool(raw)
+
+
+# ===== 批量端点单请求标的数上限 (daily-batch / minute-batch) =====
+# 这两个上限是「单请求成本」的闸门, 不是业务契约: 成本 ≈ 标的数 × 每只根数
+# (日K 约 12 根, 分时约 240 根, 差 20 倍), 所以两档独立配置而非共用一个数。
+# 上限同时也是前端的单批分块大小 —— 前端读同一偏好分块, 不会发出必然被拒的
+# 请求 (此前 400/300/300 三处硬编码, 任一处不一致即全站 400)。
+def get_daily_batch_symbols() -> int:
+    """daily-batch 单请求标的数上限。默认 2000, 范围 [50, 5000]。"""
+    raw = load().get("daily_batch_symbols", 400)
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        size = 400
+    return max(50, min(5000, size))
+
+
+def set_daily_batch_symbols(size: int) -> int:
+    size = max(50, min(5000, int(size)))
+    save({"daily_batch_symbols": size})
+    return size
+
+
+def get_minute_batch_symbols() -> int:
+    """minute-batch 单请求标的数上限。默认 400, 范围 [50, 2000]。
+
+    分时每只回 ~240 根 (日K ~12 根), 同样的标的数内存/传输量高一个量级,
+    因此上限与推荐区间都比日K保守。
+    """
+    raw = load().get("minute_batch_symbols", 400)
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        size = 400
+    return max(50, min(2000, size))
+
+
+def set_minute_batch_symbols(size: int) -> int:
+    size = max(50, min(2000, int(size)))
+    save({"minute_batch_symbols": size})
+    return size
+
+
+# ===== 回测/优化 worker RSS 上限 (GiB) =====
+# 环境变量 TICK_WORKER_RSS_LIMIT_BYTES 仍是更高优先级的部署级覆盖 (见
+# app/backtest/worker.py 的解析顺序); 这里只承接设置页的界面化配置。
+_BACKTEST_RSS_LIMIT_GIB_DEFAULT = 6
+_BACKTEST_RSS_LIMIT_GIB_MAX = 64
+
+
+def get_backtest_worker_rss_limit_gib() -> int:
+    """回测/优化独立 worker 的 RSS 上限 (GiB)。默认 6, 范围 [0, 64], 0 = 不限制。
+
+    单位是 GiB 而非字节: 界面与报错文案均以 GiB 呈现, 换算只发生在
+    worker.py 的字节级解析处, 避免两套单位并存。
+    """
+    raw = load().get("backtest_worker_rss_limit_gib", _BACKTEST_RSS_LIMIT_GIB_DEFAULT)
+    try:
+        gib = int(raw)
+    except (TypeError, ValueError):
+        gib = _BACKTEST_RSS_LIMIT_GIB_DEFAULT
+    return max(0, min(_BACKTEST_RSS_LIMIT_GIB_MAX, gib))
+
+
+def set_backtest_worker_rss_limit_gib(gib: int) -> int:
+    gib = max(0, min(_BACKTEST_RSS_LIMIT_GIB_MAX, int(gib)))
+    save({"backtest_worker_rss_limit_gib": gib})
+    return gib
 
 
 def _allowed_data_providers() -> set[str]:
@@ -269,40 +364,54 @@ def _allowed_data_providers() -> set[str]:
         return set(_ALLOWED_DATA_PROVIDERS)
 
 
+def _validated_provider(raw: str, pref_key: str) -> str:
+    """数据源偏好白名单校验。非法/已卸载的源回退 tickflow 并告警。
+
+    静默回退曾让「配了 fuyao 却全程走免费档」无从排查 (fuyao 事件的
+    定位难点之一): 回退必须留痕。
+    """
+    if raw in _allowed_data_providers():
+        return raw
+    logger.warning(
+        "数据源偏好 %s=%r 不在可用列表 %s, 回退 tickflow",
+        pref_key, raw, sorted(_allowed_data_providers()))
+    return "tickflow"
+
+
 def get_daily_data_provider() -> str:
     provider = str(load().get("daily_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "daily_data_provider")
 
 
 def get_adj_factor_provider() -> str:
     # 「跟随日K」(same_as_daily) 特殊值已下线: 存量配置里的旧值按非法值回退 tickflow
     provider = str(load().get("adj_factor_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "adj_factor_provider")
 
 
 def get_minute_data_provider() -> str:
     provider = str(load().get("minute_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "minute_data_provider")
 
 
 def get_full_minute_data_provider() -> str:
     provider = str(load().get("full_minute_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "full_minute_data_provider")
 
 
 def get_depth5_data_provider() -> str:
     provider = str(load().get("depth5_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "depth5_data_provider")
 
 
 def get_realtime_data_provider() -> str:
     provider = str(load().get("realtime_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "realtime_data_provider")
 
 
 def get_financial_provider() -> str:
     provider = str(load().get("financial_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _validated_provider(provider, "financial_data_provider")
 
 
 # ===== 盘后管道拉取内容开关 (A股 / ETF / 指数 独立控制) =====
@@ -434,6 +543,38 @@ def get_mainline_filter_config() -> dict:
     }
 
 
+def get_emotion_score_config() -> dict | None:
+    """情绪评分口径配置 (维度权重/子项权重与区间/档位阈值)。
+
+    返回原始 dict 或 None (未自定义 = 用出厂口径)。**不在此处做结构校验与补全** ——
+    合并与归一化统一由 emotion_score.merge_config 负责, 避免两处各写一套默认值而漂移。
+    """
+    v = load().get("emotion_score_config")
+    return v if isinstance(v, dict) else None
+
+
+def set_emotion_score_config(cfg: dict | None) -> dict | None:
+    """保存情绪评分口径。传 None 或 {} = 恢复出厂口径 (清除该键)。
+
+    只做形状校验, 值的合法性 (负数权重/区间倒置/阈值乱序) 由 emotion_score 层
+    在每次计算时归一化 —— 存进去什么由用户负责, 算出来一定安全。
+    """
+    from app.services.emotion_score import merge_config
+
+    if not cfg:
+        with _SAVE_LOCK:
+            current = load()
+            current.pop("emotion_score_config", None)
+            atomic_write_text(_path(), json.dumps(current, indent=2, ensure_ascii=False))
+            _invalidate_cache()
+        return None
+
+    # 落盘前过一遍 merge_config: 校验形状并剔除未知字段, 避免脏配置长期驻留
+    normalized = merge_config(cfg)
+    save({"emotion_score_config": normalized})
+    return normalized
+
+
 def set_mainline_filter_config(cfg: dict) -> dict:
     """保存主线过滤配置(白名单字段, 部分更新)。修改后需重算主线生效。"""
     updates: dict = {}
@@ -487,17 +628,23 @@ def set_pipeline_index_symbols(symbols: str) -> str:
 
 
 def get_pipeline_schedule() -> dict:
-    """返回盘后管道调度时间 {"hour": 15, "minute": 30}。"""
-    d = load().get("pipeline_schedule", {"hour": 15, "minute": 30})
-    return {"hour": d.get("hour", 15), "minute": d.get("minute", 30)}
+    """返回盘后管道调度时间 {"hour": 15, "minute": 35}。
+
+    默认 15:35 而非 15:30 整: 盘后固定价交易 15:30 才彻底结束, 且供应商
+    聚合含盘后量的官方日K需要时间 —— 整点即拉可能写入不含盘后成交的
+    日线, 也与 quote 定版重试窗口终点 (15:30) 精确重合。留 5 分钟缓冲。
+    """
+    d = load().get("pipeline_schedule", {"hour": 15, "minute": 35})
+    return {"hour": d.get("hour", 15), "minute": d.get("minute", 35)}
 
 
 def set_pipeline_schedule(hour: int, minute: int) -> dict:
     h = max(0, min(23, hour))
     m = max(0, min(59, minute))
-    # 盘后不早于 15:00
-    if h * 60 + m < 15 * 60:
-        h, m = 15, 0
+    # 盘后管道不早于 15:35: 15:30 盘后固定价才终止 (量/额此前仍会变),
+    # 且供应商官方日线定稿需要缓冲 —— 更早启动可能固化不含盘后量的当日分区
+    if h * 60 + m < 15 * 60 + 35:
+        h, m = 15, 35
     save({"pipeline_schedule": {"hour": h, "minute": m}})
     return {"hour": h, "minute": m}
 
@@ -580,21 +727,23 @@ def set_depth_finalize_time(hour: int, minute: int) -> dict:
     return {"hour": h, "minute": m}
 
 
-# 复盘推送可选渠道白名单 (企业微信已实现, 与飞书并列)
+# 监控与复盘共用的外部推送渠道白名单。
 # 多选: 不推送 = 空数组, 而非 'none'
-REVIEW_PUSH_CHANNELS = {"feishu", "wecom"}
+PUSH_CHANNELS = {"feishu", "wecom", "dingtalk", "custom", "email"}
 
 
 def get_review_schedule() -> dict:
-    """定时复盘调度 {"enabled": False, "hour": 15, "minute": 10}。默认关闭。
+    """定时复盘调度 {"enabled": False, "hour": 15, "minute": 40}。默认关闭。
 
-    A股 15:00 收盘, 默认时间设为 15:10(收盘后即时复盘), 强制下限 15:00。
+    默认 15:40: 盘后管道默认 15:35 启动, 留 5 分钟缓冲, 复盘使用管道
+    产出的最终口径数据 (含盘后量校正的日K/enriched)。强制下限 15:00 —
+    偏好收盘后即时复盘 (走实时快照缓存, 不等管道) 的用户可自行调早。
     """
-    d = load().get("review_schedule", {"enabled": False, "hour": 15, "minute": 10})
+    d = load().get("review_schedule", {"enabled": False, "hour": 15, "minute": 40})
     return {
         "enabled": bool(d.get("enabled", False)),
         "hour": d.get("hour", 15),
-        "minute": d.get("minute", 10),
+        "minute": d.get("minute", 40),
     }
 
 
@@ -610,6 +759,37 @@ def set_review_schedule(enabled: bool, hour: int, minute: int) -> dict:
         h, m = 15, 0
     save({"review_schedule": {"enabled": bool(enabled), "hour": h, "minute": m}})
     return {"enabled": bool(enabled), "hour": h, "minute": m}
+
+
+# 复盘系统提示词长度上限: 默认模板约 2.4k 字符, 留足自定义余量同时防止误存超长文本
+MARKET_RECAP_PROMPT_MAX_CHARS = 32_000
+
+
+def get_market_recap_system_prompt() -> str:
+    """用户自定义的复盘系统提示词。空串 = 未自定义 (market_recap 回退内置默认模板)。"""
+    v = load().get("market_recap_system_prompt")
+    return v.strip() if isinstance(v, str) else ""
+
+
+def set_market_recap_system_prompt(text: str | None) -> str:
+    """保存自定义复盘系统提示词。空串/None = 恢复默认模板 (删除该键)。
+
+    超过 MARKET_RECAP_PROMPT_MAX_CHARS 字符时抛 ValueError, 由 API 层转 400。
+    """
+    cleaned = text.strip() if isinstance(text, str) else ""
+    if not cleaned:
+        with _SAVE_LOCK:
+            current = load()
+            current.pop("market_recap_system_prompt", None)
+            atomic_write_text(_path(), json.dumps(current, indent=2, ensure_ascii=False))
+            _invalidate_cache()
+        return ""
+    if len(cleaned) > MARKET_RECAP_PROMPT_MAX_CHARS:
+        raise ValueError(
+            f"复盘提示词过长 ({len(cleaned)} > {MARKET_RECAP_PROMPT_MAX_CHARS} 字符)"
+        )
+    save({"market_recap_system_prompt": cleaned})
+    return cleaned
 
 
 MINING_BUDGET_PROFILES = frozenset({"balanced", "strict"})
@@ -649,6 +829,75 @@ def set_mining_schedule(enabled: bool, weekday: int, profile: str) -> dict:
     return result
 
 
+def get_guardian_schedule() -> dict:
+    """策略守护 (发布后持续复验) 配置。历史缺键时整体回退默认 (默认关闭)。"""
+    data = load()
+    enabled = data.get("guardian_schedule_enabled", False)
+    if not isinstance(enabled, bool):
+        enabled = False
+    watch = _guardian_pct(data.get("guardian_watch_pct"), 0.2)
+    retire = _guardian_pct(data.get("guardian_retire_pct"), 0.5)
+    if not 0.0 < watch < retire <= 1.0:
+        watch, retire = 0.2, 0.5
+    k_max = data.get("guardian_k_max", 4)
+    if isinstance(k_max, bool) or not isinstance(k_max, int) or not 2 <= k_max <= 4:
+        k_max = 4
+    slot_limit = data.get("lab_mined_slot_limit", 10)
+    if (
+        isinstance(slot_limit, bool)
+        or not isinstance(slot_limit, int)
+        or not 0 <= slot_limit <= 50
+    ):
+        slot_limit = 10
+    return {
+        "guardian_schedule_enabled": enabled,
+        "guardian_watch_pct": watch,
+        "guardian_retire_pct": retire,
+        "guardian_k_max": k_max,
+        "lab_mined_slot_limit": slot_limit,
+    }
+
+
+def set_guardian_schedule(
+    enabled: bool,
+    watch_pct: float,
+    retire_pct: float,
+    k_max: int,
+    lab_mined_slot_limit: int = 10,
+) -> dict:
+    """校验并一次写入守护/实验室配置整组 (阈值语义与 backtest.guardian 一致)。"""
+    from app.backtest.guardian import GuardianThresholds
+
+    thresholds = GuardianThresholds(
+        watch_pct=watch_pct, retire_pct=retire_pct, k_max=k_max
+    )
+    if (
+        isinstance(lab_mined_slot_limit, bool)
+        or not isinstance(lab_mined_slot_limit, int)
+        or not 0 <= lab_mined_slot_limit <= 50
+    ):
+        raise ValueError("lab mined slot limit must be between 0 and 50 (0 = unlimited)")
+    result = {
+        "guardian_schedule_enabled": bool(enabled),
+        "guardian_watch_pct": thresholds.watch_pct,
+        "guardian_retire_pct": thresholds.retire_pct,
+        "guardian_k_max": thresholds.k_max,
+        "lab_mined_slot_limit": lab_mined_slot_limit,
+    }
+    save(result)
+    return result
+
+
+def _guardian_pct(value, default: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0.0 < float(value) <= 1.0
+    ):
+        return default
+    return float(value)
+
+
 def get_review_push_channels() -> list[str]:
     """复盘推送渠道(多选) — 选定的外部工具列表, 复盘归档后逐个推送。
 
@@ -662,7 +911,7 @@ def get_review_push_channels() -> list[str]:
     d = load()
     raw = d.get("review_push_channels")
     if isinstance(raw, list):
-        return [c for c in raw if c in REVIEW_PUSH_CHANNELS]
+        return [c for c in raw if c in PUSH_CHANNELS]
     # 兼容老单选字符串
     if d.get("review_push_channel") == "feishu":
         return ["feishu"]
@@ -677,11 +926,31 @@ def set_review_push_channels(channels: list[str]) -> list[str]:
     seen: set[str] = set()
     cleaned: list[str] = []
     for c in channels or []:
-        if c in REVIEW_PUSH_CHANNELS and c not in seen:
+        if c in PUSH_CHANNELS and c not in seen:
             seen.add(c)
             cleaned.append(c)
     save({"review_push_channels": cleaned})
     return cleaned
+
+
+REVIEW_PUSH_MODES = frozenset({"auto", "manual"})
+
+
+def get_review_push_mode() -> str:
+    """复盘推送触发方式: auto=归档后自动推; manual=仅显式 push。默认 manual。
+
+    定时复盘与手动保存复盘共用此开关。manual 时定时路径只归档不推送,
+    手动路径需 save_report 显式传 push=True 才推。
+    """
+    mode = load().get("review_push_mode", "manual")
+    return mode if mode in REVIEW_PUSH_MODES else "manual"
+
+
+def set_review_push_mode(mode: str) -> str:
+    """保存复盘推送触发方式, 白名单外的值回退 manual。"""
+    mode = mode if mode in REVIEW_PUSH_MODES else "manual"
+    save({"review_push_mode": mode})
+    return mode
 
 
 
@@ -797,6 +1066,82 @@ def set_wecom_webhook_url(url: str) -> str:
     return get_wecom_webhook_url()
 
 
+def get_dingtalk_webhook_url() -> str:
+    """钉钉群自定义机器人的原始 Webhook URL。"""
+    return str(load().get("dingtalk_webhook_url") or "")
+
+
+def set_dingtalk_webhook_url(url: str) -> str:
+    value = str(url or "").strip()
+    save({"dingtalk_webhook_url": value})
+    return value
+
+
+def get_custom_webhook_url() -> str:
+    """Generic third-party JSON Webhook URL shared by enabled rules and reviews."""
+    return str(load().get("custom_webhook_url") or "")
+
+
+def set_custom_webhook_url(url: str) -> str:
+    """Persist or clear the generic third-party JSON Webhook URL."""
+    value = str(url or "").strip()
+    save({"custom_webhook_url": value})
+    return value
+
+
+_EMAIL_SMTP_DEFAULTS = {
+    "host": "",
+    "port": 465,
+    "security": "ssl",
+    "username": "",
+    "from_address": "",
+    "to_addresses": [],
+}
+
+
+def get_email_smtp_config() -> dict:
+    """Return non-secret SMTP settings for the email notification channel."""
+    raw = load().get("email_smtp_config")
+    if not isinstance(raw, dict):
+        raw = {}
+    security = raw.get("security", _EMAIL_SMTP_DEFAULTS["security"])
+    if security not in {"ssl", "starttls", "none"}:
+        security = _EMAIL_SMTP_DEFAULTS["security"]
+    try:
+        port = int(raw.get("port", _EMAIL_SMTP_DEFAULTS["port"]))
+    except (TypeError, ValueError):
+        port = _EMAIL_SMTP_DEFAULTS["port"]
+    if not 1 <= port <= 65535:
+        port = _EMAIL_SMTP_DEFAULTS["port"]
+    recipients = raw.get("to_addresses")
+    if not isinstance(recipients, list):
+        recipients = []
+    return {
+        "host": str(raw.get("host") or "").strip(),
+        "port": port,
+        "security": security,
+        "username": str(raw.get("username") or "").strip(),
+        "from_address": str(raw.get("from_address") or "").strip(),
+        "to_addresses": [str(item).strip() for item in recipients if str(item).strip()],
+    }
+
+
+def set_email_smtp_config(config: dict) -> dict:
+    """Atomically persist the non-secret SMTP configuration group."""
+    normalized = {
+        "host": str(config.get("host") or "").strip(),
+        "port": int(config.get("port", 465)),
+        "security": str(config.get("security") or "ssl"),
+        "username": str(config.get("username") or "").strip(),
+        "from_address": str(config.get("from_address") or "").strip(),
+        "to_addresses": [
+            str(item).strip() for item in config.get("to_addresses", []) if str(item).strip()
+        ],
+    }
+    save({"email_smtp_config": normalized})
+    return get_email_smtp_config()
+
+
 # ===== 企业微信智能机器人 (API 模式 / 长连接) =====
 
 
@@ -863,7 +1208,7 @@ def get_webhook_default_channels() -> list[str]:
     d = load()
     raw = d.get("webhook_default_channels")
     if isinstance(raw, list):
-        return [c for c in raw if c in REVIEW_PUSH_CHANNELS]
+        return [c for c in raw if c in PUSH_CHANNELS]
     # 兼容老布尔开关 (勾选即双推)
     if d.get("webhook_enabled_default") is True:
         return ["feishu", "wecom"]
@@ -875,7 +1220,7 @@ def set_webhook_default_channels(channels: list[str]) -> list[str]:
     seen: set[str] = set()
     cleaned: list[str] = []
     for c in channels or []:
-        if c in REVIEW_PUSH_CHANNELS and c not in seen:
+        if c in PUSH_CHANNELS and c not in seen:
             seen.add(c)
             cleaned.append(c)
     save({"webhook_default_channels": cleaned})
@@ -883,8 +1228,40 @@ def set_webhook_default_channels(channels: list[str]) -> list[str]:
 
 
 def get_screener_auto_run() -> bool:
-    """选股页进入时是否自动运行所有策略 (获取命中数)。默认开。"""
+    """策略页进入时是否自动运行所有策略 (获取命中数)。默认开。"""
     return load().get("screener_auto_run", True)
+
+
+def get_assistant_auto_approve_actions() -> bool:
+    """AI 助手的动作工具是否免确认直接执行。默认关。
+
+    默认关是安全底线: 打开后 create_signal_strategy / run_backtest /
+    add_to_watchlist / sync_data 会不经用户点按就执行 (写信号文件、改自选、
+    触发数据补全)。存量用户不能因为升级而静默变成全自动。
+    只影响动作确认, 不影响轮次检查点 (那是防跑飞的安全阀, 见 chat_service)。
+    """
+    return bool(load().get("assistant_auto_approve_actions", False))
+
+
+def set_assistant_auto_approve_actions(enabled: bool) -> bool:
+    """保存 AI 助手免确认开关。"""
+    save({"assistant_auto_approve_actions": bool(enabled)})
+    return bool(enabled)
+
+
+def get_assistant_mask_enabled() -> bool:
+    """AI 助手打开时是否在页面主体上盖毛玻璃遮罩 (点击遮罩关闭助手)。默认开。
+
+    纯前端视觉/交互偏好, 后端只负责持久化; 关闭后恢复非模态体验
+    (页面主体可正常交互, 边看行情边问)。
+    """
+    return bool(load().get("assistant_mask_enabled", True))
+
+
+def set_assistant_mask_enabled(enabled: bool) -> bool:
+    """保存 AI 助手毛玻璃遮罩开关。"""
+    save({"assistant_mask_enabled": bool(enabled)})
+    return get_assistant_mask_enabled()
 
 
 def get_strategy_monitor_ids() -> list[str]:
@@ -946,6 +1323,36 @@ def get_realtime_monitor_config() -> dict:
 def get_nav_order() -> list[str]:
     """返回左侧菜单的自定义排序（内置页面 path + 扩展分析菜单 id）。"""
     return load().get("nav_order", [])
+
+
+def get_nav_layout() -> dict | None:
+    from app.services.nav_layout import validate_nav_layout
+
+    raw = load().get("nav_layout")
+    if raw is None:
+        return None
+    try:
+        return validate_nav_layout(raw)
+    except ValueError:
+        return None
+
+
+def set_nav_layout(value: dict | None, hidden: list[str] | None = None) -> dict | None:
+    from app.services.nav_layout import flat_nav_order, validate_nav_layout
+
+    cleaned = validate_nav_layout(value) if value is not None else None
+    with mutation():
+        raw = load().get("nav_layout")
+        if isinstance(raw, dict) and raw.get("v", 1) != 1:
+            raise ValueError("导航布局由更高版本创建，请升级后再修改")
+        updates: dict = {"nav_layout": cleaned}
+        if cleaned is not None:
+            # 平铺副本供旧版本回退，归属和顺序始终在同一次原子写入中更新。
+            updates["nav_order"] = flat_nav_order(cleaned)
+        if hidden is not None:
+            updates["nav_hidden"] = list(dict.fromkeys(x for x in hidden if x != "/"))
+        save(updates)
+    return cleaned
 
 
 def set_nav_order(order: list[str]) -> list[str]:
@@ -1013,3 +1420,137 @@ def set_financial_sync_time(table: str, iso_ts: str) -> None:
     times = get_financial_sync_times()
     times[table] = iso_ts
     save({"financial_sync_times": times})
+
+
+# ---------------------------------------------------------------- 看板自定义布局
+# blob 形如 {"v": 1, "items": [{"i","t","x","y","w","h","p?"}, ...]}; None = 未自定义(前端用内置默认布局)。
+_DASHBOARD_LAYOUT_MAX_ITEMS = 40
+_DASHBOARD_LAYOUT_MAX_JSON = 64 * 1024
+
+
+def get_dashboard_layout() -> dict | None:
+    """看板自定义布局 blob; None = 未自定义。"""
+    raw = load().get("dashboard_layout")
+    return raw if isinstance(raw, dict) else None
+
+
+def _clamp_int(v: object, lo: int, hi: int, fallback: int) -> int:
+    try:
+        n = int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return max(lo, min(hi, n))
+
+
+def set_dashboard_layout(value: dict | None) -> dict | None:
+    """保存看板布局; None = 清除(回默认布局)。
+
+    护栏: items 数量、字段类型/取值范围、整体 JSON 体积;
+    前端渲染前还会再做一轮规范化(未知组件剔除等), 此处只防脏数据写盘。
+    """
+    if value is None:
+        save({"dashboard_layout": None})
+        return None
+    items = value.get("items") if isinstance(value, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError("布局须为 {v:1, items:[...]}; 恢复默认请传 null")
+    cleaned: list[dict] = []
+    for it in items[:_DASHBOARD_LAYOUT_MAX_ITEMS]:
+        if not isinstance(it, dict):
+            continue
+        row: dict = {
+            "i": str(it.get("i") or "")[:64],
+            "t": str(it.get("t") or "")[:32],
+            "x": _clamp_int(it.get("x"), 0, 11, 0),
+            "y": _clamp_int(it.get("y"), 0, 100_000, 0),
+            "w": _clamp_int(it.get("w"), 1, 12, 4),
+            "h": _clamp_int(it.get("h"), 1, 30, 8),
+        }
+        if not row["i"] or not row["t"]:
+            continue
+        if isinstance(it.get("p"), dict):
+            row["p"] = {str(k)[:32]: str(v)[:500] for k, v in it["p"].items()}
+        cleaned.append(row)
+    if not cleaned:
+        raise ValueError("布局 items 无有效项")
+    blob = {"v": 1, "items": cleaned}
+    if len(json.dumps(blob, ensure_ascii=False)) > _DASHBOARD_LAYOUT_MAX_JSON:
+        raise ValueError("布局数据过大 (>64KB)")
+    save({"dashboard_layout": blob})
+    return blob
+
+
+# ---------------------------------------------------------------------------
+# 界面偏好 (UI prefs) — 原先只存浏览器 localStorage 的设置
+# ---------------------------------------------------------------------------
+
+# 这些键历史上只存 localStorage: 浏览器按 origin (协议+主机+端口) 隔离存储,
+# 桌面版端口从 3018 起递增, 换端口后旧值全部读不到, 表现为「设置保存了重开又变回去」。
+# 改存 preferences.json 并与 localStorage 双向同步: 后端是权威副本 (跨端口/多端一致),
+# localStorage 保留为同步读取的本地缓存 (通知/语音/缩放等在非 React 路径即时读取)。
+_UI_PREFS_KEYS = (
+    "alert_toast_enabled",
+    "alert_toast_max",
+    "alert_sound_enabled",
+    "alert_sound",
+    "voice_broadcast_enabled",
+    "voice_broadcast_voice",
+    "voice_broadcast_rate",
+    "stock_external_template",
+    "page_zoom",
+    # 界面局部状态的跨端副本 (随配置备份迁移): 监控徽标/设置页收起/回测列表高度/导航形态
+    "monitor_badge_enabled",
+    "settings_nav_collapsed",
+    "bt_strategy_list_maxh",
+    "nav_state",
+    "nav_groups",
+    # AI 助手悬浮球显隐 (assistant.fab.enabled 的后端副本) — 同样受端口漂移影响
+    "assistant_fab_enabled",
+    # JSON 文本沿用标量契约，保存统一策略池的 ID 顺序与显式空选择。
+    "strategy_pool",
+    "theme",
+)
+_UI_PREFS_MAX_JSON = 16 * 1024
+
+
+def get_ui_prefs() -> dict:
+    """返回界面偏好 (只含用户显式设置过的键; 未涉及的键不出现, 前端用自身默认值)。"""
+    raw = load().get("ui_prefs")
+    if not isinstance(raw, dict):
+        return {}
+    return {k: raw[k] for k in _UI_PREFS_KEYS if k in raw}
+
+
+def set_ui_prefs(updates: dict) -> dict:
+    """合并保存界面偏好; 未知键忽略, 只接受 JSON 标量。
+
+    白名单 + 类型护栏: 该 blob 由前端自由读写, 不让它成为写任意结构的入口。
+    值为 None 表示删除该项 (回前端默认)。
+    """
+    if not isinstance(updates, dict):
+        raise ValueError("ui_prefs 需为对象")
+    # 多项界面设置可同时写入，整个 blob 的读改写须与普通偏好保存共用锁。
+    with mutation():
+        current = get_ui_prefs()
+        for key, value in updates.items():
+            if key not in _UI_PREFS_KEYS:
+                continue
+            if key == "theme" and value not in ("light", "dark", None):
+                raise ValueError("ui_prefs.theme 仅接受 light / dark")
+            if key == "strategy_pool" and value is not None:
+                try:
+                    pool = json.loads(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("ui_prefs.strategy_pool 须为策略 ID 列表的 JSON 文本") from exc
+                if not isinstance(pool, list) or any(not isinstance(item, str) for item in pool):
+                    raise ValueError("ui_prefs.strategy_pool 须为策略 ID 列表的 JSON 文本")
+            if value is None:
+                current.pop(key, None)
+            elif isinstance(value, (bool, int, float, str)):
+                current[key] = value
+            else:
+                raise ValueError(f"ui_prefs.{key} 只接受标量")
+        if len(json.dumps(current, ensure_ascii=False)) > _UI_PREFS_MAX_JSON:
+            raise ValueError("ui_prefs 数据过大 (>16KB)")
+        save({"ui_prefs": current})
+    return current

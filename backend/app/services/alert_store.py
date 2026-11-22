@@ -8,7 +8,7 @@
 设计:
   - JSONL 每行一个 JSON 对象,便于增量追加和流式读取
   - 清理策略: 追加后按需 prune (按 ts 删旧),避免文件无限膨胀
-  - 读时全量加载到内存过滤 (记录量受上限约束, 5000 条量级无压力)
+  - 读取时按时间和来源过滤,记录总量受滚动保留上限约束
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # 保留策略
-MAX_DAYS = 7
-MAX_RECORDS = 5000
+MAX_DAYS = 30
+MAX_RECORDS = 100_000
 # 每隔多少次写入触发一次清理 (避免每次写都 prune)
 PRUNE_EVERY = 20
 
@@ -47,6 +47,7 @@ def append(data_dir: Path, event: dict) -> None:
         if _write_count >= PRUNE_EVERY:
             _write_count = 0
             _prune_locked(p)
+    _publish_events([event])
 
 
 def append_many(data_dir: Path, events: list[dict]) -> None:
@@ -63,6 +64,18 @@ def append_many(data_dir: Path, events: list[dict]) -> None:
         if _write_count >= PRUNE_EVERY:
             _write_count = 0
             _prune_locked(p)
+    _publish_events(events)
+
+
+def _publish_events(events: list[dict]) -> None:
+    """落盘成功后广播到事件总线 (SSE 出口); 广播失败不影响落盘。"""
+    try:
+        from app.services.events import bus
+
+        for ev in events:
+            bus.publish("alert", ev, scope="read:analysis")
+    except Exception:  # noqa: BLE001 — 事件通道绝不反噬主流程
+        logger.debug("alert 事件广播失败 (忽略)", exc_info=True)
 
 
 def list_recent(

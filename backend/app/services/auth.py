@@ -22,6 +22,8 @@ import threading
 import time
 from pathlib import Path
 
+from app.services.fs_utils import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 # PBKDF2 参数(NIST 推荐, 单次校验 ~100ms, 兼顾安全与响应)
@@ -60,11 +62,9 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     p = _path()
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except OSError:
-        pass
+    atomic_write_text(
+        p, json.dumps(data, indent=2, ensure_ascii=False), mode=0o600,
+    )
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -89,6 +89,17 @@ def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
 # ================================================================
 # 密码管理
 # ================================================================
+
+def invalidate_runtime_caches() -> None:
+    """auth.json 被外部写入后 (配置备份导入) 失效进程内缓存。
+
+    密码判定缓存 + 会话内存态都基于旧文件; 导入覆盖后必须重读,
+    否则新设备恢复的密码/会话在本进程内不可见。
+    """
+    global _configured_cache
+    _configured_cache = None
+    _restore_sessions()
+
 
 def is_configured() -> bool:
     """是否已设置访问密码 (带缓存)。

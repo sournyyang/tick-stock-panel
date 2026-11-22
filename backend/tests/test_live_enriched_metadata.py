@@ -64,6 +64,27 @@ def test_live_enriched_cache_keeps_instrument_metadata_without_persisting_it(tmp
     assert "listing_date" not in persisted.columns
 
 
+def test_live_enriched_flush_keeps_one_row_per_symbol_and_date(tmp_path):
+    repo = _repo(tmp_path)
+    duplicate = pl.concat([
+        _live_row("600000.SH", 10.0),
+        _live_row("600000.SH", 10.1),
+    ])
+
+    repo.flush_live_enriched_asset("stock", duplicate)
+
+    cached, _ = repo.get_enriched_latest()
+    persisted = pl.read_parquet(
+        tmp_path / "kline_daily_enriched" / f"date={cn_today().isoformat()}" / "part.parquet"
+    )
+    assert cached.select("symbol", "close").to_dicts() == [
+        {"symbol": "600000.SH", "close": 10.1},
+    ]
+    assert persisted.select("symbol", "close").to_dicts() == [
+        {"symbol": "600000.SH", "close": 10.1},
+    ]
+
+
 def test_history_strategy_monitor_keeps_live_row_with_exclude_st_enabled(tmp_path):
     strategy_dir = tmp_path / "strategies"
     strategy_dir.mkdir()

@@ -1,0 +1,219 @@
+"""回归: exit_fill=close_t 时收盘封死跌停(非一字)不得按收盘价卖出。
+
+涨停拒买的镜像问题: _can_sell 只拦「一字跌停」, 尾盘封板股按跌停收盘价
+"卖出" — 现实中收盘封死的卖队排不出去, 亏损被系统性低估。修复后:
+- close_t 计划出场(信号/到期/期末)遇收盘封跌停 → 拦截并经 pending_exit
+  递延到下一可卖日;
+- 日内风控线(止损/移动止损/止盈, override 盘中价)不受收盘封板影响;
+- 期末仍被递延的持仓不再静默丢弃, 按末日价格强制记录平仓
+  (blocked_exit_days>0 保留"曾受阻"痕迹);
+- open_t+1 按次日开盘卖出, 保持既有行为。
+"""
+from __future__ import annotations
+
+from dataclasses import asdict
+from datetime import date, timedelta
+
+import polars as pl
+import pytest
+
+from app.backtest.engine import BacktestEngine, MatcherConfig
+
+START = date(2024, 1, 1)
+
+
+def _day(i: int, o: float, h: float, l: float, c: float, *, ld: bool = False) -> dict:
+    return {
+        "symbol": "A", "date": START + timedelta(days=i),
+        "open": o, "high": h, "low": l, "close": c,
+        "volume": 100_000,
+        "signal_limit_up": False, "signal_limit_down": ld,
+    }
+
+
+def _normal(i: int) -> dict:
+    px = 10.0 + i * 0.05
+    return _day(i, px, px + 0.02, px - 0.02, px)
+
+
+def _panel(days: list[dict]) -> pl.DataFrame:
+    return pl.DataFrame(days).sort(["symbol", "date"])
+
+
+def _run(panel: pl.DataFrame, entry_days: list[int], exit_days: list[int], *, method="simulate_independent_candidates", **matcher):
+    dates = [r["date"] for r in panel.select(["symbol", "date"]).iter_rows(named=True)]
+    entry_set, exit_set = set(entry_days), set(exit_days)
+    entry_mask = pl.Series([(dt - START).days in entry_set for dt in dates], dtype=pl.Boolean)
+    exit_mask = pl.Series([(dt - START).days in exit_set for dt in dates], dtype=pl.Boolean)
+    kw: dict = {"matching": "close_t", "fees_pct": 0, "slippage_bps": 0}
+    kw.update(matcher)
+    cfg = MatcherConfig(**kw)
+    return getattr(BacktestEngine(repo=None), method)(panel, entry_mask, exit_mask, cfg)
+
+
+def _normal_panel(n: int, *, sealed: dict[int, dict] | None = None) -> list[dict]:
+    sealed = sealed or {}
+    days = []
+    for i in range(n):
+        if i in sealed:
+            spec = sealed[i]
+            days.append(_day(i, spec["o"], spec["h"], spec["l"], spec["c"], ld=True))
+        else:
+            days.append(_normal(i))
+    return days
+
+
+def test_close_t_exit_deferred_past_sealed_limit_down():
+    """收盘封跌停当日的计划出场被拦截, 递延到下一可卖日成交。"""
+    days = _normal_panel(8, sealed={3: {"o": 10.10, "h": 10.12, "l": 9.09, "c": 9.09}})
+    result = _run(_panel(days), entry_days=[0], exit_days=[3])
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.entry_date == "2024-01-01"
+    assert trade.exit_date == "2024-01-05"  # 封板日次日, 而非封板日 01-04
+    assert trade.exit_reason == "signal"
+    assert trade.blocked_exit_days == 1
+
+
+def test_close_t_exit_on_normal_day_fills_same_day():
+    """正常日计划出场不受影响(防过度拦截)。"""
+    days = _normal_panel(8)
+    result = _run(_panel(days), entry_days=[0], exit_days=[3])
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.exit_date == "2024-01-04"
+    assert trade.blocked_exit_days == 0
+
+
+def test_intraday_stop_loss_not_blocked_by_sealed_close():
+    """日内止损线在封板前已穿越, 按线价当日成交 — 收盘封板不得误拦盘中出场。"""
+    days = _normal_panel(6, sealed={2: {"o": 9.70, "h": 9.72, "l": 9.30, "c": 9.00}})
+    result = _run(_panel(days), entry_days=[0], exit_days=[], stop_loss_pct=0.05)
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.exit_date == "2024-01-03"  # 触发当日
+    assert trade.exit_reason == "stop_loss"
+    assert trade.exit_price == 9.5  # 止损线价(10.0 × 0.95), 非跌停收盘价
+    assert trade.blocked_exit_days == 0
+
+
+def test_open_t1_exit_after_sealed_limit_down_signal_day():
+    """open_t+1 按次日开盘卖出: 信号日收盘封板不改变次日开盘出场。"""
+    days = _normal_panel(8, sealed={2: {"o": 10.10, "h": 10.12, "l": 9.09, "c": 9.09}})
+    result = _run(_panel(days), entry_days=[0], exit_days=[2], matching="open_t+1")
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.entry_date == "2024-01-02"  # 次日开盘建仓
+    assert trade.exit_date == "2024-01-04"  # 信号次日开盘出场
+    assert trade.blocked_exit_days == 0
+
+
+def test_stuck_position_at_window_end_is_recorded():
+    """期末仍被封板递延的持仓不再被静默丢弃, 按末日价格强制落账。"""
+    days = _normal_panel(8, sealed={7: {"o": 10.30, "h": 10.32, "l": 9.27, "c": 9.27}})
+    result = _run(_panel(days), entry_days=[0], exit_days=[7])
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.exit_date == "2024-01-08"  # 末日
+    assert trade.exit_reason == "signal"
+    assert trade.blocked_exit_days >= 1
+    assert trade.exit_price == 9.27  # 末日(封板)收盘价
+
+
+@pytest.mark.parametrize("method", ["simulate_portfolio", "simulate_portfolio_legacy"])
+def test_portfolio_close_exit_waits_for_sellable_day(method):
+    days = _normal_panel(8, sealed={3: {"o": 10.10, "h": 10.12, "l": 9.09, "c": 9.09}})
+    result = _run(_panel(days), [0], [3], method=method)
+    trade, = result.trades
+    assert str(trade.exit_date) == "2024-01-05"
+    assert trade.blocked_exit_days == 1
+    assert result.stats["execution"]["sell_limit_down"] == 1
+
+
+@pytest.mark.parametrize("method", ["simulate_portfolio", "simulate_portfolio_legacy"])
+@pytest.mark.parametrize("target", [0.15, 0.20])
+def test_portfolio_full_take_profit_uses_actual_entry_and_respects_t1(method, target):
+    target_price = 10.0 * (1 + target)
+    days = [
+        _day(0, 10, 10.2, 9.9, 10),
+        # T+1: 买入当天即使触价也不允许卖。
+        _day(1, 10, target_price + 0.1, 9.9, 10),
+        _day(2, 10.1, target_price + 0.1, 10.0, 10.5),
+        _normal(3),
+    ]
+    result = _run(_panel(days), [0], [], method=method, matching="open_t+1",
+                  take_profit_pct=target, max_positions=1)
+    trade, = result.trades
+    assert str(trade.entry_date) == "2024-01-02"
+    assert str(trade.exit_date) == "2024-01-03"
+    assert trade.exit_reason == "take_profit"
+    assert trade.exit_price == pytest.approx(target_price)
+    assert trade.pnl_pct == pytest.approx(target)
+    assert result.equity_curve[-1]["positions"] == 0
+
+
+def test_close_t_exit_deferred_past_sealed_limit_down_portfolio_mode():
+    """组合(position)模式同口径: 收盘封跌停当日的计划出场递延到下一可卖日。
+
+    _simulate_portfolio_matrix 的 _can_sell 此前只有一字板检查, 缺少独立/legacy
+    路径都有的 exit_fill=close_t 封板拦截 — 尾盘封死的跌停股按跌停价当日"成交",
+    亏损被系统性低估。
+    """
+    days = _normal_panel(8, sealed={3: {"o": 10.10, "h": 10.12, "l": 9.09, "c": 9.09}})
+    panel = _panel(days)
+    dates = [r["date"] for r in panel.select(["symbol", "date"]).iter_rows(named=True)]
+    entry_mask = pl.Series([(dt - START).days in {0} for dt in dates], dtype=pl.Boolean)
+    exit_mask = pl.Series([(dt - START).days in {3} for dt in dates], dtype=pl.Boolean)
+    cfg = MatcherConfig(matching="close_t", fees_pct=0, slippage_bps=0)
+    result = BacktestEngine(repo=None).simulate_portfolio(  # type: ignore[arg-type]
+        panel, entry_mask, exit_mask, cfg,
+    )
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.exit_date == "2024-01-05"  # 封板日次日, 而非封板日 01-04
+    assert trade.blocked_exit_days == 1
+
+
+def test_intraday_stop_loss_not_blocked_by_sealed_close_portfolio_mode():
+    """组合模式: 日内止损线(override 盘中价)不受收盘封板拦截影响。"""
+    days = _normal_panel(6, sealed={2: {"o": 9.70, "h": 9.72, "l": 9.30, "c": 9.00}})
+    panel = _panel(days)
+    dates = [r["date"] for r in panel.select(["symbol", "date"]).iter_rows(named=True)]
+    entry_mask = pl.Series([(dt - START).days in {0} for dt in dates], dtype=pl.Boolean)
+    exit_mask = pl.Series([False for _ in dates], dtype=pl.Boolean)
+    cfg = MatcherConfig(matching="close_t", fees_pct=0, slippage_bps=0, stop_loss_pct=0.05)
+    result = BacktestEngine(repo=None).simulate_portfolio(  # type: ignore[arg-type]
+        panel, entry_mask, exit_mask, cfg,
+    )
+    assert result.stats.get("n_trades") == 1
+    trade = result.trades[0]
+    assert trade.exit_date == "2024-01-03"  # 触发当日
+    assert trade.exit_reason == "stop_loss"
+    assert trade.exit_price == 9.5  # 止损线价, 非跌停收盘价
+    assert trade.blocked_exit_days == 0
+
+
+def test_stuck_position_at_window_end_is_recorded_portfolio_mode():
+    """组合模式: 期末仍被封板递延的持仓同样强制落账 (与独立路径同口径),
+    不再只进 pending_exit_positions 而在交易记录里消失。"""
+    days = _normal_panel(8, sealed={7: {"o": 10.30, "h": 10.32, "l": 9.27, "c": 9.27}})
+    panel = _panel(days)
+    dates = [r["date"] for r in panel.select(["symbol", "date"]).iter_rows(named=True)]
+    entry_mask = pl.Series([(dt - START).days in {0} for dt in dates], dtype=pl.Boolean)
+    exit_mask = pl.Series([(dt - START).days in {7} for dt in dates], dtype=pl.Boolean)
+    cfg = MatcherConfig(matching="close_t", fees_pct=0, slippage_bps=0)
+    engine = BacktestEngine(repo=None)  # type: ignore[arg-type]
+
+    matrix_result = engine.simulate_portfolio(panel, entry_mask, exit_mask, cfg)
+    assert matrix_result.stats.get("n_trades") == 1
+    trade = matrix_result.trades[0]
+    assert trade.exit_date == "2024-01-08"  # 末日强制落账
+    assert trade.exit_reason == "signal"    # 递延原因保留
+    assert trade.blocked_exit_days >= 1
+    assert trade.exit_price == 9.27
+    assert matrix_result.stats.get("pending_exit_positions") == 1  # 观测信号保留
+
+    # legacy 组合路径 parity
+    legacy_result = engine.simulate_portfolio_legacy(panel, entry_mask, exit_mask, cfg)
+    assert [asdict(t) for t in legacy_result.trades] == [asdict(t) for t in matrix_result.trades]
+    assert legacy_result.stats["pending_exit_positions"] == 1

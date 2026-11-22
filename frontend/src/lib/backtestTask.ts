@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import type { StrategyBacktestResult } from './api'
+import { fetchRunningTask, reportTaskFinished, reportTaskRunning } from './taskRegistry'
 
 /**
  * 全局回测任务管理 (SSE 模式 + 任务缓存 + 重连支持)。
@@ -38,6 +39,17 @@ let taskSeq = 0
 let eventSource: EventSource | null = null
 
 const RECONNECT_KEY = 'backtest_reconnect'
+
+// 跨设备接回: 启动时上报注册表, 终态关闭; 其他设备 tryReconnect 无本地键时
+// 从注册表回填。重连/SSE 逻辑本身零改动。
+const TASK_KIND = 'backtest' as const
+
+/** 终态: 关闭注册表项 (其他设备不再视为进行中) 并清本地重连键。 */
+function finishTaskRegistry() {
+  const qs = localStorage.getItem(RECONNECT_KEY)
+  if (qs) reportTaskFinished(TASK_KIND, { qs })
+  localStorage.removeItem(RECONNECT_KEY)
+}
 
 function emit() {
   listeners.forEach(fn => fn())
@@ -88,7 +100,7 @@ async function connectSSE(url: string): Promise<void> {
       if (current?.id === id) {
         current = { ...current, isPending: false, error: message, reconnecting: false }
         emit()
-        localStorage.removeItem(RECONNECT_KEY)
+        finishTaskRegistry()
       }
       return
     }
@@ -136,7 +148,7 @@ async function connectSSE(url: string): Promise<void> {
     }
     es.close()
     eventSource = null
-    localStorage.removeItem(RECONNECT_KEY)
+    finishTaskRegistry()
   })
 
   es.addEventListener('error', (e: MessageEvent) => {
@@ -153,7 +165,7 @@ async function connectSSE(url: string): Promise<void> {
       }
       es.close()
       eventSource = null
-      localStorage.removeItem(RECONNECT_KEY)
+      finishTaskRegistry()
       return
     }
     // 无 data: 连接异常断开。EventSource 会自动重连, 但需给出可见状态并有界放弃,
@@ -202,13 +214,14 @@ export function startBacktest(params: {
   asset_type?: 'stock' | 'etf'
   minute_fill?: boolean
   regime_filter?: { states?: string[]; min_score?: number } | null
+  /** 忽略服务端同参数任务的结果缓存 (5 分钟), 必然重新计算; 重连/取消按 qs 对齐同一任务 */
+  force?: boolean
 }): void {
-  // 取消之前的任务状态
+  // 关闭旧 SSE 连接 (断开不取消, 后端任务继续跑)
   if (eventSource) {
     eventSource.close()
     eventSource = null
   }
-
   const id = ++taskSeq
   current = { id, isPending: true, result: null, progress: null, error: null, reconnecting: false }
   emit()
@@ -236,10 +249,27 @@ export function startBacktest(params: {
     asset_type: params.asset_type,
     minute_fill: params.minute_fill,
     regime_filter: params.regime_filter ? JSON.stringify(params.regime_filter) : undefined,
+    force: params.force ? 1 : undefined,
   })
 
-  // 存 reconnect 信息 (刷新后用)
+  // 键上还挂着旧任务且新任务参数不同 (不同 job_key): 先取消旧任务, 否则它会
+  // 占着重任务槽一直跑到自然结束。不看 prevPending — 重连放弃 (give-up) 分支
+  // 不清 RECONNECT_KEY 也不调 finishTaskRegistry, 后端任务仍在跑, 此时同样要
+  // 取消。参数相同 (同参重跑) 时跳过 — 后端按同 key 复用运行中任务 / force
+  // 重建已完成任务, 先取消反而会误杀刚接上的任务 (已结束任务的 cancel 是无害
+  // no-op, 但同 key 场景必须在覆盖键前区分开)。
+  const prevQs = localStorage.getItem(RECONNECT_KEY)
+  if (prevQs && prevQs !== qs) {
+    void fetch('/api/backtest/strategy/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qs: prevQs }),
+    }).catch(() => {})
+  }
+
+  // 存 reconnect 信息 (刷新后用) + 上报注册表 (其他设备可接回)
   localStorage.setItem(RECONNECT_KEY, qs)
+  reportTaskRunning(TASK_KIND, { qs }, params.strategy_id)
 
   connectSSE(`/api/backtest/strategy/stream?${qs}`)
 }
@@ -271,7 +301,7 @@ export async function stopBacktest(): Promise<void> {
     current = { ...current, isPending: false, error: '已取消', reconnecting: false }
     emit()
   }
-  localStorage.removeItem(RECONNECT_KEY)
+  finishTaskRegistry()
 }
 
 /** 清除任务状态 (隐藏提示) */
@@ -280,10 +310,24 @@ export function clearBacktest(): void {
   emit()
 }
 
-/** 恢复: 从 localStorage 读取 reconnect 信息, 重新连接 (刷新后调用) */
+/** 换设备接回: 本地无键时从服务端注册表找 running 任务, 回填本地键并走原有重连。 */
+async function adoptFromServer() {
+  if (current && !current.error && !current.result) return // 本机已有活动任务
+  const task = await fetchRunningTask(TASK_KIND)
+  const qs = typeof task?.payload?.qs === 'string' ? task.payload.qs : ''
+  if (!qs || localStorage.getItem(RECONNECT_KEY)) return
+  localStorage.setItem(RECONNECT_KEY, qs)
+  tryReconnect()
+}
+
+/** 恢复: 从 localStorage 读取 reconnect 信息, 重新连接 (刷新后调用);
+ *  本地无键时异步尝试从服务端注册表接回 (换设备场景)。 */
 export function tryReconnect(): boolean {
   const qs = localStorage.getItem(RECONNECT_KEY)
-  if (!qs) return false
+  if (!qs) {
+    void adoptFromServer()
+    return false
+  }
   // 有未完成的任务, 重连
   const id = ++taskSeq
   current = { id, isPending: true, result: null, progress: null, error: null, reconnecting: false }

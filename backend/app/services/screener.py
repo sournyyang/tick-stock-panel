@@ -11,6 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -19,9 +20,63 @@ from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
 
+# 常用指标 (MA5/10/20、BOLL(20)、量比等) 的近似最小暖机窗口。
+# 用于没有精确回看需求的场景 (自定义 SQL 筛选、盘后管道) 的数据充足性提示 (#303);
+# 策略运行用 engine.required_history_bars 的精确值。
+MIN_INDICATOR_WARMUP_DAYS = 30
+
+
+def enriched_history_days(data_dir, asset_type: str = "stock", as_of: date | None = None) -> int:
+    """本地 enriched 在 as_of 及之前覆盖的交易日数 (#303)。
+
+    按 date=* 分区目录名计数 (目录列举 O(天数)), 不读 parquet 内容 —
+    只做数据充足性提示, 不进入指标计算路径。
+    """
+    from app.tickflow.repository import enriched_dirname
+
+    root = Path(data_dir) / enriched_dirname(asset_type)
+    if not root.exists():
+        return 0
+    days = [d.name[5:] for d in root.glob("date=*") if d.is_dir() and len(d.name) > 5]
+    if as_of is not None:
+        as_of_s = as_of.isoformat()
+        days = [d for d in days if d <= as_of_s]
+    return len(days)
+
+
 # ── 进程级历史数据缓存 (避免 run_all 每次重新扫描 parquet + 计算指标) ──
 _history_cache: dict[tuple[str, date, int], tuple[float, pl.DataFrame]] = {}
 _HISTORY_CACHE_TTL = 120.0  # 秒
+
+# load_prior_consecutive 最多回看多少个已存在的日分区 (缺列时继续往前找的上限)
+_PRIOR_PARTITION_SCAN = 10
+
+
+def _join_instruments(df: pl.DataFrame, instruments: pl.DataFrame) -> pl.DataFrame:
+    if instruments.is_empty():
+        return df
+    columns = [c for c in ["name", "listing_date", "total_shares", "float_shares"]
+               if c in instruments.columns and c not in df.columns]
+    if columns:
+        df = df.join(instruments.select("symbol", *columns), on="symbol", how="left")
+    if "name" not in instruments.columns:
+        return df
+    missing = pl.col("name").is_null() | (pl.col("name").cast(pl.Utf8).str.strip_chars() == "")
+    if not df.select(missing.any()).item():
+        return df
+    # 实时/历史缓存可能已有 name 列却只有部分名称，按行补齐且保持缓存本身不变。
+    return (
+        df.join(
+            instruments.select("symbol", pl.col("name").alias("_instrument_name")),
+            on="symbol", how="left", maintain_order="left",
+        )
+        .with_columns(
+            pl.when(missing).then(
+                pl.col("_instrument_name").cast(pl.Utf8).str.strip_chars().replace("", None)
+            ).otherwise(pl.col("name")).alias("name")
+        )
+        .drop("_instrument_name")
+    )
 
 
 @dataclass
@@ -41,12 +96,24 @@ class ScreenerService:
         self._enriched_dirname = enriched_dirname(asset_type)
 
     @staticmethod
-    def clear_history_cache() -> None:
+    def clear_history_cache(asset_type: str | None = None) -> None:
         """清空进程级 _history_cache (TTL 缓存)。
 
         清除数据后调用, 避免内存里的旧历史窗口残留导致策略/看板仍命中旧数据。
         """
-        _history_cache.clear()
+        if asset_type is None:
+            _history_cache.clear()
+        else:
+            for key in list(_history_cache):
+                if key[0] == asset_type:
+                    _history_cache.pop(key, None)
+
+    def _assert_integrity(self, end: date, *, enriched_only=False) -> None:
+        from app.services.daily_health import assert_usable
+
+        root = getattr(getattr(self.repo, "store", None), "data_dir", None)
+        if root is not None:
+            assert_usable(root, self.asset_type, end=end, enriched_only=enriched_only)
 
     def _load_enriched_for_date(self, target_date: date) -> pl.DataFrame:
         """从 enriched parquet 读取指定日期的基础数据并即时计算完整指标+信号。
@@ -54,21 +121,11 @@ class ScreenerService:
         enriched parquet 仅存 14 列。读取后需要即时计算 ma/ema/macd/kdj/rsi/boll/momentum/signal 等列。
         对于最新日, 优先使用内存缓存 (已包含完整指标)。
         """
+        self._assert_integrity(target_date, enriched_only=True)
         # 优先使用 repo 最新日缓存
         cache, cache_date = self.repo.get_enriched_latest_asset(self.asset_type)
         if cache is not None and not cache.is_empty() and cache_date == target_date:
-            df = cache
-            # JOIN instruments
-            df_i = self.repo.get_instruments_asset(self.asset_type)
-            if not df_i.is_empty():
-                inst_cols = [
-                    c
-                    for c in ["name", "listing_date", "total_shares", "float_shares"]
-                    if c in df_i.columns and c not in df.columns
-                ]
-                if inst_cols:
-                    df = df.join(df_i.select("symbol", *inst_cols), on="symbol", how="left")
-            return df
+            return _join_instruments(cache, self.repo.get_instruments_asset(self.asset_type))
 
         # 尝试从 repo 级预计算历史缓存中提取目标日期 (仅 stock: 该缓存为股票专用)
         if self.asset_type == "stock":
@@ -77,21 +134,7 @@ class ScreenerService:
                 df = cached_hist.filter(pl.col("date") == target_date)
                 if not df.is_empty():
                     logger.debug("_load_enriched_for_date: repo history cache for %s", target_date)
-                    # JOIN instruments
-                    df_i = self.repo.get_instruments_asset(self.asset_type)
-                    if not df_i.is_empty():
-                        inst_cols = [
-                            c
-                            for c in ["name", "listing_date", "total_shares", "float_shares"]
-                            if c in df_i.columns and c not in df.columns
-                        ]
-                        if inst_cols:
-                            df = df.join(
-                                df_i.select("symbol", *inst_cols),
-                                on="symbol",
-                                how="left",
-                            )
-                    return df
+                    return _join_instruments(df, self.repo.get_instruments_asset(self.asset_type))
 
         # 历史日期: 从 parquet 读取 14 列, 即时计算指标 (慢路径)
         enriched_dir = self.repo.store.data_dir / self._enriched_dirname
@@ -121,15 +164,14 @@ class ScreenerService:
         可直接从 parquet 读取, 无需 _load_enriched_for_date 的全量指标重算
         (历史日期该慢路径最坏会触发 9 次全市场 compute_enriched_full)。
 
-        选取逻辑与旧循环等价: 在 as_of 前 1~9 天内找到第一个存在的日分区
-        (即前一交易日), 读取其 symbol + consec_col。存储列的值与重算值逐位一致
-        (连板计数为 run-length, 150 天 warmup 完全覆盖 A 股最长连板, 二者相等)。
+        由近到远取 as_of 之前已存在的日分区 (即前一交易日), 读取其
+        symbol + consec_col。存储列的值与重算值逐位一致 (连板计数为 run-length,
+        150 天 warmup 完全覆盖 A 股最长连板, 二者相等)。
 
         返回列: symbol, prev_consec。找不到前一交易日时返回空 DataFrame。
         """
         enriched_dir = self.repo.store.data_dir / self._enriched_dirname
-        for delta in range(1, 10):
-            candidate = as_of - timedelta(days=delta)
+        for candidate in self._prior_partition_dates(as_of, _PRIOR_PARTITION_SCAN):
             target_parquet = enriched_dir / f"date={candidate.isoformat()}" / "part.parquet"
             if not target_parquet.exists():
                 continue
@@ -151,6 +193,32 @@ class ScreenerService:
                 logger.warning("load_prior_consecutive read failed for %s: %s", candidate, e)
                 return pl.DataFrame()
         return pl.DataFrame()
+
+    def _prior_partition_dates(self, as_of: date, limit: int) -> list[date]:
+        """enriched 目录里早于 as_of 的分区日期, 由近到远最多 limit 个。
+
+        枚举分区目录而不是按自然日回看固定天数: 春节长假连着调休周末,
+        相邻两个交易日能隔 10~11 个自然日 (如 2024-02-08 → 2024-02-19),
+        固定窗口会整段落空。与 auction_benchmark._prev_trading_day
+        「本地日K分区日期 = 已知交易日集合」同口径。
+        """
+        enriched_dir = self.repo.store.data_dir / self._enriched_dirname
+        days: list[date] = []
+        try:
+            entries = list(enriched_dir.iterdir())
+        except OSError:
+            return []
+        for part in entries:
+            if not part.name.startswith("date="):
+                continue
+            try:
+                day = date.fromisoformat(part.name[5:])
+            except ValueError:
+                continue
+            if day < as_of:
+                days.append(day)
+        days.sort(reverse=True)
+        return days[:limit]
 
     def _compute_enriched_full(self, df_target: pl.DataFrame, target_date: date) -> pl.DataFrame:
         """从 14 列基础数据即时计算完整 enriched (含全部指标和信号)。
@@ -205,19 +273,7 @@ class ScreenerService:
         # 只保留目标日期
         df_result = df_full.filter(pl.col("date") == target_date)
 
-        # JOIN instruments (name, total_shares, float_shares)
-        if not instruments.is_empty():
-            inst_cols = [
-                c
-                for c in ["name", "listing_date", "total_shares", "float_shares"]
-                if c in instruments.columns and c not in df_result.columns
-            ]
-            if inst_cols:
-                df_result = df_result.join(
-                    instruments.select("symbol", *inst_cols), on="symbol", how="left"
-                )
-
-        return df_result
+        return _join_instruments(df_result, instruments)
 
     def _load_enriched_history(self, target_date: date, lookback_days: int) -> pl.DataFrame:
         """读取目标日期之前的基础行情数据, 供历史窗口策略使用。
@@ -225,6 +281,7 @@ class ScreenerService:
         优先从 repo 内存缓存获取 (启动时已预计算), 命中时 0ms。
         缓存 miss 时走 scan_parquet + compute_indicators 慢路径。
         """
+        self._assert_integrity(target_date, enriched_only=True)
         # 优先级 1: repo 级预计算缓存 (启动时 _refresh_enriched 已计算完整历史; 仅 stock)
         t0 = time.perf_counter()
         if self.asset_type == "stock":
@@ -332,10 +389,15 @@ class ScreenerService:
                     target_date, lookback_days, elapsed, len(df_full))
 
         _history_cache[cache_key] = (now, df_full)
+        # TTL 先清一轮; 仍超上限时按最旧无条件淘汰 — 否则两分钟内出现 >10 个
+        # 不同 (asset_type, date, lookback) 键时全部新鲜、零逐出, 数 GB 宽帧驻留
         if len(_history_cache) > 10:
             expired = [k for k, (ts, _) in _history_cache.items() if now - ts > _HISTORY_CACHE_TTL]
             for k in expired:
                 del _history_cache[k]
+            while len(_history_cache) > 10:
+                oldest = min(_history_cache, key=lambda k: _history_cache[k][0])
+                del _history_cache[oldest]
 
         return df_full
 
@@ -347,11 +409,12 @@ class ScreenerService:
         limit: int = 30,
         pool: list[str] | None = None,
     ) -> ScreenerResult:
-        """自定义 SQL 条件选股。
+        """自定义 SQL 条件筛选。
 
         先通过 Polars 即时计算完整指标, 再用 DuckDB 做 SQL WHERE 过滤。
         kline_enriched DuckDB 视图只有 14 列, 不能直接用于指标过滤。
         """
+        self._assert_integrity(as_of)
         t0 = time.perf_counter()
 
         if not conditions:
@@ -423,6 +486,7 @@ class ScreenerService:
         """按调用方要求装配标准策略数据上下文，不解释策略公式。"""
         from app.strategy.engine import StrategyDataContext
 
+        self._assert_integrity(as_of)
         if current is None:
             current = self._load_enriched_for_date(as_of)
         if timeframe == "1m":
@@ -454,6 +518,12 @@ class ScreenerService:
         history = None
         if history_bars > 1:
             history = self._load_enriched_history(as_of, history_bars)
+        # enriched 换代号: 供 engine.build_shared_matrix 的矩阵缓存做失效指纹
+        # (取不到时 None → 缓存 fail-closed 不启用)
+        try:
+            data_generation = self.repo.get_matrix_data_generation(self.asset_type)
+        except Exception:  # noqa: BLE001
+            data_generation = None
         return StrategyDataContext(
             asset_type=self.asset_type,
             timeframe=timeframe,
@@ -462,6 +532,7 @@ class ScreenerService:
             history=history,
             market=market,
             cache_key=cache_key,
+            data_generation=data_generation,
         )
 
     def _load_minute_history(self, as_of: date, current: pl.DataFrame | None) -> pl.DataFrame:
@@ -507,3 +578,23 @@ class ScreenerService:
         except Exception:  # noqa: BLE001
             return None
         return None
+
+    def coverage_warnings(self, as_of: date, *, required_bars: int | None = None) -> list[str]:
+        """数据充足性提示 (#303): enriched 覆盖不足时返回用户可读警告, 充足返回 []。
+
+        空库首跑只拉到 1 个交易日时, 均线/动量/量比等指标暖机不足, 策略会静默
+        全 0 — 这里把"数据不够"显式说出来。required_bars 缺省用通用暖机窗口
+        (自定义 SQL 筛选); 策略运行传 engine.required_history_bars 的精确值。
+        available 为 0 时 enriched 为空, 上层 latest_date 已 400, 不重复提示。
+        """
+        available = enriched_history_days(self.repo.store.data_dir, self.asset_type, as_of)
+        if available == 0:
+            return []
+        need = required_bars if required_bars and required_bars > 0 else MIN_INDICATOR_WARMUP_DAYS
+        if available >= need:
+            return []
+        return [
+            f"本地数据仅覆盖 {available} 个交易日, 低于本次计算所需约 {need} 天暖机窗口 — "
+            "指标可能失真或全部落空 (策略命中 0)。建议先全量回填日K并重算指标 "
+            "(数据页「日K批量同步」, 符号需带交易所后缀)"
+        ]

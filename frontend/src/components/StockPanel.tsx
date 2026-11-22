@@ -2,13 +2,16 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { X } from 'lucide-react'
 import { type KlineRow, type FinancialMetricRecord } from '@/lib/api'
-import { klineDailyQueryOptions, klineMinuteQueryOptions, klineMinuteRangeQueryOptions, DEFAULT_INTRADAY_DAYS } from '@/lib/kline'
+import { klineDailyQueryOptions, klineMinuteQueryOptions, klineMinuteRangeQueryOptions, DEFAULT_INTRADAY_DAYS, cnToday } from '@/lib/kline'
+import { useQuoteSubscription } from '@/lib/useQuoteSubscription'
 import { StockInfoBar } from '@/components/StockInfoBar'
 import { StockDailyKChart, getDefaultRange, toOHLC } from '@/components/StockDailyKChart'
 import { StockIntradayChart } from '@/components/StockIntradayChart'
 import { financialMetricsQueryOptions, useFinancialMetrics } from '@/lib/useFinancials'
 import { useCapabilities } from '@/lib/useSharedQueries'
-import type { ChartMarker, ChartPriceLine, ChartRange } from '@/components/EChartsCandlestick'
+import { scheduleNeighborPrefetch } from '@/lib/neighborPrefetch'
+import type { ChartMarker, ChartPriceLine, ChartRange, ChartRenderer } from '@/lib/chart-types'
+import { dailyChartHeight } from '@/lib/chart-layout'
 import {
   loadInfoFields,
   saveInfoFields,
@@ -18,11 +21,18 @@ import {
 
 interface Props {
   symbol: string
+  onAssetType?: (assetType: 'stock' | 'etf' | 'index') => void
+  renderer?: ChartRenderer
+  /** 详情顶栏已有名称时可隐藏报价条的重复身份；独立面板默认保留。 */
+  showQuoteIdentity?: boolean
   height?: number
   showIntraday?: boolean
   className?: string
   /** 当用户点击蜡烛选中日期时回调（用于外部自动开启分时图）。 */
   onSelectDate?: (date: string) => void
+  /** 回放等场景可控制分时日期；未传时沿用自动选择最新日的行为。 */
+  selectedDate?: string | null
+  onIntradayClose?: () => void
   /** 外部传入的日期范围 */
   dateRange?: { start: string; end: string }
   markers?: ChartMarker[]
@@ -50,16 +60,23 @@ interface Props {
   dailyKlineFlex?: string
   /** 初始可见蜡烛根数 (默认 60); 'all' = 初始适配显示全部数据 (用于全区间回放) */
   visibleBars?: number | 'all'
+  /** 加入自选日 (北京时间 YYYY-MM-DD); 有值时日K主图绘制「自选」竖虚线 */
+  addedDate?: string | null
 }
 
 export { getDefaultRange }
 
 export function StockPanel({
   symbol,
+  onAssetType,
+  renderer = 'echarts',
+  showQuoteIdentity = true,
   height = 520,
   showIntraday = true,
   className,
   onSelectDate,
+  selectedDate: controlledSelectedDate,
+  onIntradayClose,
   dateRange: externalDateRange,
   markers,
   ranges,
@@ -78,9 +95,12 @@ export function StockPanel({
   intradayDays = DEFAULT_INTRADAY_DAYS,
   dailyKlineFlex = 'flex-1',
   visibleBars,
+  addedDate,
 }: Props) {
   const [linkedPrice, setLinkedPrice] = useState<number | null>(null)
-  const [selectedDate, setSelectedDate] = useState<string | null>(null)
+  const [internalSelectedDate, setSelectedDate] = useState<string | null>(null)
+  const selectedDate = controlledSelectedDate === undefined ? internalSelectedDate : controlledSelectedDate
+  const dateSelectedByUser = useRef(false)
   const [intradayDismissed, setIntradayDismissed] = useState(false)
   // 信息条指标配置提升到此层：同时供 StockInfoBar 渲染与 StockDailyKChart 请求 ext 数据
   const [fields, setFields] = useState<ColumnConfig[]>(loadInfoFields)
@@ -102,7 +122,11 @@ export function StockPanel({
   )
   const financials = useFinancialMetrics(hasFinanceField && hasFinancialCap ? symbol : undefined)
 
-  const dateRange = externalDateRange ?? getDefaultRange()
+  const defaultDateRange = getDefaultRange()
+  const rangeStart = externalDateRange?.start ?? defaultDateRange.start
+  const rangeEnd = externalDateRange?.end ?? defaultDateRange.end
+  const dateRange = useMemo(() => ({ start: rangeStart, end: rangeEnd }), [rangeStart, rangeEnd])
+  useQuoteSubscription(symbol, rangeEnd >= cnToday())
 
   // 日K查询由本组件持有 (与 StockDailyKChart 共享同一 cache key/配置, 只发一次请求)。
   // 信息条直接读 query data: 切股到已预取邻股时首帧即有数据, 配合 StockInfoBar 加载态占位,
@@ -113,48 +137,46 @@ export function StockPanel({
   const rows = useMemo(() => toOHLC(rawRows), [rawRows])
   const stockInfo = kline.data?.stock_info
   const name = kline.data?.name
+  useEffect(() => {
+    if (kline.data?.asset_type) onAssetType?.(kline.data.asset_type)
+  }, [kline.data?.asset_type, onAssetType])
 
   const handleDateClick = useCallback((date: string) => {
+    dateSelectedByUser.current = true
     setSelectedDate(date)
     setIntradayDismissed(false)
     onSelectDate?.(date)
   }, [onSelectDate])
 
-  // 邻近预取: 对切股导航的左右邻股提前拉取缓存, 切股瞬间免 loading。
+  // 当前日K就绪后, 等可见查询空闲再串行预取邻股, 避免首屏争抢公网带宽。
   // 日K/分时预取 staleTime 30s 防来回切换重复请求; 成为当前股后 useQuery(staleTime=0) 立即后台刷新,
   // SSE 也只按焦点股精准失效, 实时性不受影响。财务指标与正式查询同 staleTime, 5min 内不重复拉取。
   // prefetchKey 按内容 join: 自选页 navList 随行情 tick 重建但邻股集合通常不变, 避免 effect 每次 tick 重跑。
   const qc = useQueryClient()
   const prefetchKey = prefetchSymbols?.join(',') ?? ''
-  // 守卫快速连续切股: 旧链路上异步回来的日K不再级联预取 (避免串股/浪费)
-  const prefetchTickRef = useRef('')
   useEffect(() => {
-    if (!prefetchKey) return
-    prefetchTickRef.current = prefetchKey
-    for (const s of prefetchKey.split(',')) {
+    if (!symbol || !prefetchKey || !kline.isSuccess || kline.isPlaceholderData) return
+    const tasks: Array<() => Promise<unknown>> = []
+    for (const s of new Set(prefetchKey.split(',').filter(Boolean))) {
       if (s === symbol) continue
+      let lastDate: string | undefined
+      tasks.push(async () => {
+        const res = await qc.fetchQuery({ ...klineDailyQueryOptions(s, dateRange, extColumns), staleTime: 30_000 })
+        const date = res?.rows?.at(-1)?.date
+        lastDate = date ? String(date).slice(0, 10) : undefined
+      })
+      // 独立排队, 切股/关闭后的日K响应不会继续级联分钟请求。
+      tasks.push(async () => {
+        if (lastDate) await qc.prefetchQuery({ ...klineMinuteQueryOptions(s, lastDate, true), staleTime: 30_000 })
+      })
       if (hasFinanceField && hasFinancialCap) {
-        qc.prefetchQuery(financialMetricsQueryOptions(s))
+        tasks.push(() => qc.prefetchQuery(financialMetricsQueryOptions(s)))
       }
-      // 分时 tab 的多日分时 + 最新分时: 切股后分时图也免 loading (与日K并行预取)
-      qc.prefetchQuery({ ...klineMinuteRangeQueryOptions(s, intradayDays), staleTime: 30_000 })
-      // latest 当日分时同样 live=true: 预取与渲染同读实时源 (历史日期后端忽略 live)
-      qc.prefetchQuery({ ...klineMinuteQueryOptions(s, undefined, true), staleTime: 30_000 })
-      // 日K用 fetchQuery (返回数据) 以便级联预取分时; 邻股预取失败静默, 不影响切股。
-      void qc.fetchQuery({ ...klineDailyQueryOptions(s, dateRange, extColumns), staleTime: 30_000 })
-        .then((res) => {
-          if (prefetchTickRef.current !== prefetchKey) return
-          // 日K到货后级联预取其默认选中日的分时数据: 日K视图并排展示分时图(默认选中最后交易日)。
-          const lastDate = res?.rows?.at(-1)?.date
-          if (lastDate) {
-            const d = String(lastDate).slice(0, 10)
-            // 同上 live=true: 该日若为当日即命中实时源 (历史日期后端忽略 live)
-            qc.prefetchQuery({ ...klineMinuteQueryOptions(s, d, true), staleTime: 30_000 })
-          }
-        })
-        .catch(() => {})
+      tasks.push(() => qc.prefetchQuery({ ...klineMinuteRangeQueryOptions(s, intradayDays), staleTime: 30_000 }))
+      tasks.push(() => qc.prefetchQuery({ ...klineMinuteQueryOptions(s, undefined, true), staleTime: 30_000 }))
     }
-  }, [prefetchKey, symbol, dateRange, extColumns, hasFinanceField, hasFinancialCap, intradayDays, qc])
+    return scheduleNeighborPrefetch(qc, symbol, tasks)
+  }, [prefetchKey, symbol, dateRange, extColumns, hasFinanceField, hasFinancialCap, intradayDays, qc, kline.isSuccess, kline.isPlaceholderData])
 
   // symbol 变化时重置分时相关状态，避免切股后残留旧日期。
   // 日K信息直接读 query data (切股到已预取邻股首帧即有), 无需清空或门控。
@@ -162,23 +184,23 @@ export function StockPanel({
   useEffect(() => {
     if (prevSymbol.current === symbol) return
     prevSymbol.current = symbol
+    dateSelectedByUser.current = false
     setSelectedDate(null)
     setLinkedPrice(null)
   }, [symbol])
 
   // 当分时开启、无选中日期时，自动选中最新日期
   useEffect(() => {
-    if (showIntraday && !selectedDate && rows.length > 0) {
+    if (controlledSelectedDate === undefined && showIntraday && !dateSelectedByUser.current && rows.length > 0 && selectedDate !== rows[rows.length - 1].date) {
       setSelectedDate(rows[rows.length - 1].date)
     }
-  }, [showIntraday, selectedDate, rows])
+  }, [controlledSelectedDate, showIntraday, selectedDate, rows])
 
   const selectedIdx = selectedDate ? rows.findIndex(r => r.date === selectedDate) : -1
+  const selectedRow = selectedIdx >= 0 ? rows[selectedIdx] : undefined
   const prevClose = selectedIdx > 0
     ? rows[selectedIdx - 1].close
-    : rows.length >= 2
-      ? rows[rows.length - 2].close
-      : undefined
+    : undefined
   if (!symbol) return null
 
   // 财务指标最新一期（metrics 按 period_end 排序，取首项）
@@ -187,7 +209,10 @@ export function StockPanel({
   return (
     <div className={className}>
       <StockInfoBar
+        freshness={kline.data?.quote_freshness}
+        assetType={kline.data?.asset_type}
         symbol={symbol}
+        showIdentity={showQuoteIdentity}
         name={name}
         stockInfo={stockInfo}
         rows={rawRows}
@@ -199,14 +224,18 @@ export function StockPanel({
         onAddToWatchlist={onAddToWatchlist}
         onRemoveFromWatchlist={onRemoveFromWatchlist}
         watchlistPending={watchlistPending}
+        addedDate={addedDate}
       />
 
       {infoBarOnly ? null : (
-      <div className="flex gap-3 items-start">
+      <div className={renderer === 'lightweight'
+        ? `grid min-w-0 grid-cols-1 items-start overflow-hidden rounded-lg border border-border/70 ${showIntraday && selectedDate && !intradayDismissed ? 'xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]' : ''}`
+        : 'flex gap-3 items-start'}>
         <StockDailyKChart
           symbol={symbol}
+          renderer={renderer}
           height={height}
-          className={`${dailyKlineFlex} min-w-0`}
+          className={renderer === 'lightweight' ? 'min-w-0' : `${dailyKlineFlex} min-w-0`}
           dateRange={dateRange}
           markers={markers}
           ranges={ranges}
@@ -216,15 +245,16 @@ export function StockPanel({
           linkedPrice={linkedPrice}
           onDateClick={handleDateClick}
           onPriceDoubleClick={onPriceDoubleClick}
-          visibleBars={visibleBars ?? (showIntraday ? 40 : 60)}
+          visibleBars={visibleBars ?? (renderer === 'lightweight' ? undefined : showIntraday ? 40 : 60)}
           extColumns={extColumns}
+          addedDate={addedDate}
         />
 
         {showIntraday && selectedDate && !intradayDismissed && (
-          <div className="relative flex-1 min-w-0 border-l border-border pl-3">
+          <div className={renderer === 'lightweight' ? 'relative min-w-0 border-t border-border/60 xl:border-l xl:border-t-0' : 'relative flex-1 min-w-0 border-l border-border pl-3'}>
             <button
-              onClick={() => setIntradayDismissed(true)}
-              className="absolute -left-1.5 -top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-surface text-muted shadow-sm transition-colors hover:text-foreground hover:bg-elevated"
+              onClick={() => onIntradayClose ? onIntradayClose() : setIntradayDismissed(true)}
+              className={renderer === 'lightweight' ? 'absolute right-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded text-muted transition-colors hover:bg-elevated hover:text-foreground' : 'absolute -left-1.5 -top-1.5 z-10 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-surface text-muted shadow-sm transition-colors hover:text-foreground hover:bg-elevated'}
               title="收起分时图"
               aria-label="收起分时图"
             >
@@ -232,9 +262,11 @@ export function StockPanel({
             </button>
             <StockIntradayChart
               symbol={symbol}
+              renderer={renderer}
               date={selectedDate}
-              height={height}
+              height={renderer === 'lightweight' ? dailyChartHeight(height, 1) : height}
               prevClose={prevClose}
+              dailySummary={selectedRow}
               onPriceHover={setLinkedPrice}
               onPriceDoubleClick={onPriceDoubleClick}
               currentPrice={rows[rows.length - 1]?.close}

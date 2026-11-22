@@ -19,7 +19,13 @@ from typing import Literal
 import numpy as np
 import polars as pl
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult, SimulationOptions
+from app.backtest.engine import (
+    BacktestEngine,
+    MatcherConfig,
+    SimResult,
+    SimulationOptions,
+    history_load_start,
+)
 from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
 from app.backtest.matrix import (
     MarketDataMatrix,
@@ -28,12 +34,14 @@ from app.backtest.matrix import (
     MatrixPipelineConfig,
     MatrixPrewarmCancelledError,
     MatrixStrategyPipeline,
+    PanelMatrixEncoding,
     SignalMatrix,
     apply_time_masks,
     build_market_data_matrix,
     build_market_matrix,
+    build_market_matrix_from_encoding,
     build_market_matrix_from_signals,
-    rolling_mean,
+    encode_panel_matrix,
     slice_market_data_matrix,
     slice_signal_matrix,
 )
@@ -42,7 +50,10 @@ from app.backtest.minute_replay import (
     minute_panel_start,
     minute_replay_feature_plan,
 )
-from app.backtest.minute_trigger import unsupported_minute_exit_signals
+from app.backtest.minute_trigger import (
+    build_minute_entry_reference,
+    unsupported_minute_exit_signals,
+)
 from app.config import settings
 from app.indicators.pipeline import (
     ENRICHED_STORAGE_COLS,
@@ -70,6 +81,25 @@ _EXECUTION_COLUMNS = frozenset({
 })
 _LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high", "raw_low"})
 _INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares", "listing_date"})
+
+
+def validate_minute_backtest_coverage(
+    strategy: StrategyDef, repo, start: date, asset_type: str,
+) -> None:
+    """页面与 AI 工具共用分钟回测前置检查，不改变逐日回放的缺分区语义。"""
+    if strategy.execution_backend != "minute_filter":
+        return
+    if asset_type != "stock":
+        raise ValueError("分钟策略回测当前仅支持 A 股 (stock)")
+    if repo is None:
+        raise ValueError("行情仓库未注入，无法检查分钟K覆盖范围")
+    earliest = repo.earliest_minute_date()
+    if earliest is None or start < earliest:
+        have = f"最早到 {earliest}, " if earliest else ""
+        raise ValueError(
+            f"本地分钟K{have}无法覆盖回测起始日 {start}。"
+            "请先用「扩展分钟K历史」拉取更多数据, 或缩小回测区间"
+        )
 
 
 @dataclass(frozen=True)
@@ -100,8 +130,8 @@ def _merge_resolved_feature_plans(
     if not plans:
         raise ValueError("cannot merge an empty feature plan list")
     backends = {plan.execution_backend for plan in plans}
-    if backends != {"matrix_native"}:
-        raise ValueError("shared MarketDataMatrix preparation only supports matrix_native")
+    if len(backends) != 1:
+        raise ValueError("shared preparation requires a single execution backend")
 
     def _union(field: str) -> frozenset[str]:
         merged: set[str] = set()
@@ -118,9 +148,51 @@ def _merge_resolved_feature_plans(
         instrument_columns=_union("instrument_columns"),
         warmup_bars=max(plan.warmup_bars for plan in plans),
         full_feature_fallback=any(plan.full_feature_fallback for plan in plans),
-        execution_backend="matrix_native",
+        execution_backend=backends.pop(),
         fundamental_columns=_union("fundamental_columns"),
     )
+
+
+# 叠加条件 → numpy 元素级运算符 (与 custom_signals._OP_BUILDERS 同集;
+# matrix 路径在 float 数组上评估, NaN 一律视为不命中)
+_OVERLAY_NP_OPS = {
+    ">": np.greater, ">=": np.greater_equal,
+    "<": np.less, "<=": np.less_equal,
+    "==": np.equal, "!=": np.not_equal,
+}
+
+
+def _overlay_numeric_fields(overrides: dict) -> set[str]:
+    """叠加条件 (overlay_filter) 引用的数值字段集合, 含 field: 右值引用。
+
+    matrix 路径专用: 矩阵 fields 是 float 数组, 字符串扩展列进不了矩阵 —
+    引用字符串字段时抛 ValueError (保存期校验已拦, 这里是运行期双保险)。
+    """
+    conditions = (overrides or {}).get("overlay_filter")
+    if not isinstance(conditions, list) or not conditions:
+        return set()
+    from app.factors.ext_factors import ext_string_fields
+
+    string_fields = ext_string_fields()
+    fields: set[str] = set()
+    for i, c in enumerate(conditions):
+        if not isinstance(c, dict):
+            raise ValueError(f"第 {i+1} 个叠加条件格式错误")
+        left = str(c.get("left", ""))
+        if left in string_fields:
+            raise ValueError(
+                f"第 {i+1} 个叠加条件: matrix_native 策略不支持字符串字段 {left!r}"
+            )
+        fields.add(left)
+        right = c.get("right")
+        if isinstance(right, str) and right.startswith("field:"):
+            col = right[len("field:"):]
+            if col in string_fields:
+                raise ValueError(
+                    f"第 {i+1} 个叠加条件: matrix_native 策略不支持字符串字段引用 {col!r}"
+                )
+            fields.add(col)
+    return fields
 
 
 class StrategyDependencyResolver:
@@ -183,6 +255,9 @@ class StrategyDependencyResolver:
                 strategy.meta.get("id", "<unknown>"),
             )
             required_features.update(INDICATOR_COLUMNS)
+            # 动态依赖策略同样可能引用 instruments 股本列 (如 float_shares)
+            # — 全量兜底语义下一并加载, 代价是多两列 join。
+            required_features.update(_INSTRUMENT_COLUMNS - {"name"})
             required_signals.update(signal_dependencies)
             required_signals.update(LIMIT_SIGNAL_OUTPUTS)
 
@@ -194,7 +269,13 @@ class StrategyDependencyResolver:
 
         indicator_columns = frozenset(required_features & set(INDICATOR_COLUMNS))
         base_columns = _resolve_base_columns(required_features | set(_EXECUTION_COLUMNS))
-        if required_signals & set(LIMIT_SIGNAL_OUTPUTS):
+        # 涨跌停族: 显式请求连板/判定价列, 或引用了判定价的自定义信号
+        # (signal_limit_* 等迁移定义) → 统一加载不复权三价。
+        if (required_signals & set(LIMIT_SIGNAL_OUTPUTS)) or any(
+            signal_dependencies.get(sig, frozenset())
+            & {"limit_up_price", "limit_down_price"}
+            for sig in required_signals
+        ):
             base_columns = frozenset(set(base_columns) | set(_LIMIT_BASE_COLUMNS))
 
         instrument_columns = frozenset(required_features & set(_INSTRUMENT_COLUMNS))
@@ -259,6 +340,9 @@ class StrategyDependencyResolver:
         order_by = strategy.meta.get("order_by")
         if order_by and order_by != "score":
             required_features.add(str(order_by))
+        # 叠加条件字段并入矩阵列: 基础指标列来自 enriched 分区; ext_* 时序数值列
+        # 由引擎在矩阵加载后按 (日期, 标的) 对齐注入, 供入场掩码按 (时间, 标的) 评估。
+        overlay_fields = _overlay_numeric_fields(overrides)
 
         base_columns = _resolve_base_columns(required_features | set(_EXECUTION_COLUMNS))
         base_columns = frozenset(set(base_columns) | set(_LIMIT_BASE_COLUMNS))
@@ -270,7 +354,8 @@ class StrategyDependencyResolver:
             scoring_warmup_bars(scoring),
             scoring_warmup_bars(parameter_scoring),
         )
-        matrix_columns = set(base_columns) | set(instrument_columns) | {
+        ext_columns = {field for field in required_features if field.startswith("ext_")}
+        matrix_columns = set(base_columns) | set(instrument_columns) | overlay_fields | ext_columns | {
             "signal_limit_up",
             "signal_limit_down",
         }
@@ -347,10 +432,13 @@ def build_matrix_cache_profile(
     if not plans:
         raise ValueError(f"no matrix-native cache profile available for asset_type={asset_type!r}")
     merged = _merge_resolved_feature_plans(plans)
+    # 扩展字段按当前策略及其请求日期现场注入, 不属于共享 parquet/mmap 缓存。
     fields = frozenset(
-        set(merged.base_columns)
-        | set(merged.instrument_columns)
-        | set(merged.matrix_columns)
+        name
+        for name in (
+            set(merged.base_columns) | set(merged.instrument_columns) | set(merged.matrix_columns)
+        )
+        if not name.startswith("ext_")
     )
     generation_payload = json.dumps(
         {
@@ -395,8 +483,7 @@ def prewarm_matrix_cache(
         max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
     )
     formal_start = date(max(1, latest_date.year - years + 1), 1, 1)
-    warmup_days = max(120, int(max(profile.warmup_bars, 1) * 1.6))
-    coverage_start = formal_start - timedelta(days=warmup_days)
+    coverage_start = history_load_start(engine, formal_start, asset_type, profile.warmup_bars)
     prewarm_columns = frozenset({
         "symbol",
         "date",
@@ -510,6 +597,7 @@ _STOCK_ONLY_FILTER_KEYS = (
     "price_min",
     "price_max",
     "boards",
+    "exclude_new_days",
 )
 
 
@@ -567,7 +655,10 @@ class StrategyBacktestConfig:
     max_positions: int = 10
     max_exposure_pct: float = 1.0
     initial_capital: float = 1_000_000.0
-    position_sizing: Literal["equal", "score_weight"] = "equal"
+    position_sizing: Literal["equal", "score_weight", "policy"] = "equal"
+    # 自定义仓位策略: 注册表 id + 请求级参数覆盖 (合并 META 默认值后注入引擎)
+    position_policy: str | None = None
+    position_policy_params: dict | None = None
     mode: Literal["position", "full"] = "position"
     asset_type: str = "stock"
     holding_days: int = 5
@@ -584,6 +675,30 @@ class StrategyBacktestConfig:
             self.exit_fill = self.matching
 
 
+def _resolve_position_policy(
+    config: StrategyBacktestConfig,
+) -> tuple[Callable[..., object] | None, dict | None]:
+    """position_sizing="policy" 时解析用户仓位策略 → (compute, 合并参数)。
+
+    每次回测解析一次 (注册表有目录签名缓存); 策略不存在/不可用直接抛
+    ValueError — fail-closed 拒绝运行, 不静默回退等权 (见引擎侧兜底注释)。
+    """
+    if config.position_sizing != "policy" or not config.position_policy:
+        return None, None
+    from app.backtest import position_policies  # 按需导入: 默认路径零加载成本
+
+    policy = position_policies.get_policy(settings.data_dir, config.position_policy)
+    if policy is None:
+        raise ValueError(f"仓位策略不存在或不可用: {config.position_policy}")
+    defaults = {
+        str(p.get("id")): p.get("default")
+        for p in policy.params
+        if isinstance(p, dict) and p.get("id")
+    }
+    merged = {**defaults, **(config.position_policy_params or {})}
+    return policy.compute, merged
+
+
 @dataclass
 class StrategyBacktestResult:
     run_id: str
@@ -595,8 +710,10 @@ class StrategyBacktestResult:
     trades: list[dict] = field(default_factory=list)
     per_symbol_stats: list[dict] = field(default_factory=list)
     strategy_info: dict = field(default_factory=dict)
+    factor_attribution: dict | None = None
     elapsed_ms: float = 0.0
     error: str | None = None
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -615,7 +732,9 @@ class BacktestResultPolicy:
     @classmethod
     def optimizer_trial(cls, objective: str) -> BacktestResultPolicy:
         return cls(
-            required_stats=frozenset({str(objective)}),
+            # n_trades 恒保留: 引擎侧本就产出的计数 (include_trades 只裁交易列表),
+            # 优化器交易数门槛 (guards.trades_ok) 依赖它, 缺席会被 fail-closed 误杀。
+            required_stats=frozenset({str(objective), "n_trades"}),
             include_monte_carlo=str(objective).startswith("mc_maxdd_"),
             include_curves=False,
             include_trades=False,
@@ -659,6 +778,56 @@ class BacktestResultPolicy:
         return {key: value for key, value in stats.items() if key in keep}
 
 
+def _factor_attribution_summary(
+    snapshot: pl.DataFrame,
+    trades: list,
+) -> dict | None:
+    """v1 因子归因: 入场信号日因子快照 x 成交盈亏, 对比盈利/亏损单因子均值。
+
+    snapshot 来自 _apply_score 物化的候选行 (与评分同一条计算管线), 模拟结束后
+    按 (symbol, 信号日) 关联成交。快照缺失、无可关联行或因子列全空时返回 None,
+    归因失败不影响回测主结果。
+    """
+    factor_cols = [c for c in snapshot.columns if c not in ("symbol", "date")]
+    if not factor_cols or not trades:
+        return None
+    normalized = snapshot.with_columns(
+        pl.col("date").cast(pl.Utf8).str.slice(0, 10).alias("date")
+    )
+    symbols: list[str] = []
+    days: list[str] = []
+    pnls: list[float] = []
+    for trade in trades:
+        day = trade.entry_signal_date or trade.entry_date
+        if day is None:
+            continue
+        symbols.append(trade.symbol)
+        days.append(str(day)[:10])
+        pnls.append(float(trade.pnl_pct))
+    if not symbols:
+        return None
+    frame = pl.DataFrame({"symbol": symbols, "date": days, "pnl_pct": pnls})
+    joined = frame.join(normalized, on=["symbol", "date"], how="left")
+    win = joined.filter(pl.col("pnl_pct") > 0)
+    lose = joined.filter(pl.col("pnl_pct") <= 0)
+    factors: list[dict] = []
+    for col in factor_cols:
+        win_vals = win.get_column(col).drop_nulls().cast(pl.Float64)
+        lose_vals = lose.get_column(col).drop_nulls().cast(pl.Float64)
+        if win_vals.is_empty() and lose_vals.is_empty():
+            continue
+        factors.append({
+            "factor": col,
+            "win_mean": round(float(win_vals.mean()), 6) if not win_vals.is_empty() else None,
+            "lose_mean": round(float(lose_vals.mean()), 6) if not lose_vals.is_empty() else None,
+            "win_n": int(win_vals.len()),
+            "lose_n": int(lose_vals.len()),
+        })
+    if not factors:
+        return None
+    return {"factors": factors, "n_win": win.height, "n_lose": lose.height}
+
+
 @dataclass(frozen=True)
 class PreparedMatrixBacktest:
     """Job-scoped immutable market data reused by every optimizer trial."""
@@ -676,6 +845,30 @@ class PreparedMatrixBacktest:
     reference_price: np.ndarray | None
     prepare_timing_ms: dict[str, float]
     compute_cache: MatrixComputeCache
+
+
+def _panel_backend(execution_backend: str) -> bool:
+    """该执行后端走 polars 面板路径 (run 的 else 分支): polars_expr 与
+    python_history_legacy (动态 filter_history) 等一切非矩阵/复合/分钟后端。"""
+    return execution_backend not in ("matrix_native", "composite", "minute_filter")
+
+
+@dataclass(frozen=True)
+class PreparedPanelBacktest:
+    """polars_expr 参数网格的共享特征面板 (P2a) — 一次加载, 全部试算复用。
+
+    面板列是全部参数组依赖计划的并集; run 逐组做子集校验 (fail-closed),
+    缺列直接报错而不是静默回退加载 — 静默回退会掩盖计划漂移, 且优化器
+    正在拿"部分组快、部分组慢"的混合结果, 不如整批显式失败。"""
+
+    signature: tuple
+    panel: pl.DataFrame
+    columns: frozenset[str]
+    load_start: date
+    load_end: date
+    sim_end: date
+    # sim 半边的参数无关矩阵编码 (P2a-2); None = 未启用 (回退逐组建矩阵)
+    sim_encoding: PanelMatrixEncoding | None = None
 
 
 class StrategyBacktestService:
@@ -892,10 +1085,8 @@ class StrategyBacktestService:
             requested_forward_bars=full_horizon_days,
             max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
         )
-        warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
-        load_start = first.start - timedelta(days=warmup_days)
-        cache_warmup_days = max(120, int(max(cache_profile.warmup_bars, 1) * 1.6))
-        coverage_start = first.start - timedelta(days=cache_warmup_days)
+        load_start = history_load_start(self.engine, first.start, first.asset_type, feature_plan.warmup_bars)
+        coverage_start = history_load_start(self.engine, first.start, first.asset_type, cache_profile.warmup_bars)
         load_end = first.end
         coverage_end = first.end
         if first.mode == "full":
@@ -983,7 +1174,7 @@ class StrategyBacktestService:
         start_id = int(time_ids[0])
         stop_id = int(time_ids[-1]) + 1
         reference_price = (
-            rolling_mean(market_data.close, 5)[start_id:stop_id]
+            build_minute_entry_reference(market_data.close)[start_id:stop_id]
             if first.minute_fill
             else None
         )
@@ -1005,6 +1196,134 @@ class StrategyBacktestService:
             compute_cache=compute_cache,
         )
 
+    def prepare_panel_optimization(
+        self,
+        configs: list[StrategyBacktestConfig],
+    ) -> PreparedPanelBacktest:
+        """polars_expr 参数网格的共享特征面板 (P2a): 逐组解析依赖计划取并集,
+        一次加载全组复用 — 消灭每组重复的 载盘/指标计算/信号注入。
+
+        与 prepare_matrix_optimization 同一套签名约束 (params 不入签名 — 参数
+        驱动的列差异由并集计划覆盖); load 窗口推导与 run() 完全同口径。
+        """
+        if not configs:
+            raise ValueError("optimizer preparation requires at least one backtest config")
+
+        signature = self._matrix_prepare_signature(configs[0])
+        if any(self._matrix_prepare_signature(config) != signature for config in configs[1:]):
+            raise ValueError("optimizer trials must share strategy, universe, range and overrides")
+
+        first = configs[0]
+        strategy = self.strategy_engine.get(first.strategy_id)
+        if not _panel_backend(strategy.execution_backend):
+            raise ValueError("shared feature panel preparation requires a panel-path strategy")
+        StrategyEngine.validate_context(
+            strategy,
+            StrategyDataContext(
+                asset_type=first.asset_type,
+                timeframe="1d",
+                as_of=first.end,
+            ),
+        )
+
+        overrides = first.overrides or {}
+        basic_filter = _basic_filter_for_asset(
+            self._effective_basic_filter(strategy, overrides), first.asset_type
+        )
+        entry_signals = self._effective_signals(overrides, "entry_signals", strategy.entry_signals)
+        exit_signals = self._effective_signals(overrides, "exit_signals", strategy.exit_signals)
+        resolver = StrategyDependencyResolver()
+        plans: list[ResolvedFeaturePlan] = []
+        for config in configs:
+            params = self._normalize_params(config.params or {}, strategy)
+            plans.append(resolver.resolve(
+                strategy,
+                params=params,
+                basic_filter=basic_filter,
+                entry_signals=entry_signals,
+                exit_signals=exit_signals,
+                overrides=overrides,
+                minute_fill=config.minute_fill,
+                asset_type=config.asset_type,
+            ))
+        feature_plan = _merge_resolved_feature_plans(plans)
+
+        max_hold_days = self._override_value(overrides, "max_hold_days", strategy.max_hold_days)
+        full_horizon_days = max(int(max_hold_days or first.holding_days or 5), 1)
+        load_start = history_load_start(self.engine, first.start, first.asset_type, feature_plan.warmup_bars)
+        load_end = first.end
+        if first.mode == "full":
+            load_end = first.end + timedelta(days=(full_horizon_days + 5) * 2)
+        sim_end = load_end if first.mode == "full" else first.end
+
+        panel = self.engine.load_panel_for_backtest(
+            first.symbols, load_start, load_end, feature_plan, asset_type=first.asset_type,
+        )
+        if panel.is_empty():
+            raise ValueError("共享特征面板无数据，请检查日期范围或先运行盘后管道")
+
+        # sim 半边的参数无关编码 (P2a-2): 行情矩阵/轴/信号码一次构建,
+        # 试算只散布 score/entry/exit。sim 窗口与列选择和 run() 完全同口径;
+        # 构建失败不阻断 (回退逐组建矩阵, 只损失性能)。
+        sim_encoding = None
+        try:
+            sim_range = self._date_range_mask(panel, first.start, sim_end)
+            sim_columns = [
+                column for column in feature_plan.matrix_columns if column in panel.columns
+            ]
+            sim_panel = panel.filter(sim_range).select(sorted(sim_columns))
+            sim_encoding = encode_panel_matrix(
+                sim_panel,
+                entry_signal_ids=list(entry_signals),
+                exit_signal_ids=list(exit_signals),
+            )
+        except Exception as e:  # noqa: BLE001 — 编码是纯优化, 失败回退整建
+            logger.warning("共享面板矩阵编码失败, 试算回退逐组建矩阵: %s", e)
+
+        return PreparedPanelBacktest(
+            signature=signature,
+            panel=panel,
+            columns=frozenset(panel.columns),
+            load_start=load_start,
+            load_end=load_end,
+            sim_end=sim_end,
+            sim_encoding=sim_encoding,
+        )
+
+    def run_with_evidence(self, config, progress_cb=None, cancel_event=None) -> StrategyBacktestResult:
+        """正式交互回测启用检查和留档；优化器继续复用轻量 run。"""
+        from app.backtest.evidence import EvidenceRecorder, save_evidence
+
+        started = time.perf_counter()
+        try:
+            strategy = self.strategy_engine.get(config.strategy_id)
+        except ValueError:
+            return self.run(config, progress_cb, cancel_event)
+        data_dir = self.engine.repo.store.data_dir
+        recorder = EvidenceRecorder(data_dir, config, strategy, self.strategy_engine, cancel_event)
+        # 每个正式回测 worker 拥有独立引擎；仅在本次运行内观察成交用分钟数据。
+        previous = getattr(self.engine, "_evidence", None)
+        self.engine._evidence = recorder
+        try:
+            result = self.run(config, progress_cb, cancel_event, evidence=recorder)
+        finally:
+            self.engine._evidence = previous
+        if result.error == "cancelled":
+            return result
+        effective = {
+            **result.config,
+            "params": self._normalize_params(config.params or {}, strategy),
+        }
+        result.evidence = recorder.finish(result, effective)
+        try:
+            # 保存状态是结果的一部分；写入失败时不会宣称记录已经落盘。
+            result.evidence["persistence"] = {"status": "saved"}
+            save_evidence(data_dir, result.evidence)
+        except (OSError, ValueError):
+            result.evidence["persistence"] = {"status": "error", "error": "版本记录未能保存，请导出本次报告"}
+        result.elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        return result
+
     def run(
         self,
         config: StrategyBacktestConfig,
@@ -1012,10 +1331,14 @@ class StrategyBacktestService:
         cancel_event: threading.Event | None = None,
         prepared: PreparedMatrixBacktest | None = None,
         result_policy: BacktestResultPolicy | None = None,
+        prepared_panel: PreparedPanelBacktest | None = None,
+        evidence=None,
     ) -> StrategyBacktestResult:
         t0 = time.perf_counter()
         run_id = uuid.uuid4().hex[:10]
         result_policy = result_policy or BacktestResultPolicy()
+        # 因子归因快照容器: 日线路径在 _apply_score 里填充, 其余路径保持空
+        factor_snapshot: dict = {}
 
         def _err(msg: str) -> StrategyBacktestResult:
             return StrategyBacktestResult(
@@ -1039,6 +1362,23 @@ class StrategyBacktestService:
         except ValueError as e:
             return _err(str(e))
 
+        # Reject incompatible execution before loading quotes or spawning a long
+        # matrix calculation; a recommendation must not stand in for a contract.
+        requirements = s.meta.get("backtest_requirements") or {}
+        labels = {
+            "entry_fill": ("建仓口径", {"close_t": "信号日收盘", "open_t+1": "次日开盘"}),
+            "exit_fill": ("清仓口径", {"close_t": "信号日收盘", "open_t+1": "次日开盘", "signal_next_minute": "信号触发后下一分钟"}),
+            "mode": ("模拟方式", {"position": "仓位模拟", "full": "全量模拟"}),
+            "minute_fill": ("分钟成交", {False: "关闭", True: "开启"}),
+        }
+        conflicts = []
+        for field_name, required in requirements.items():
+            if getattr(config, field_name) != required:
+                label, choices = labels[field_name]
+                conflicts.append(f"{label}为「{choices[required]}」")
+        if conflicts:
+            return _err("该策略要求" + "、".join(conflicts) + "，请调整回测设置后重试。")
+
         params = self._normalize_params(config.params or {}, s)
         overrides = config.overrides or {}
         # 同回测 run 路径: 挖掘运行期也要按资产类型中和股票专属过滤键 (#215)
@@ -1047,6 +1387,10 @@ class StrategyBacktestService:
         )
         entry_signals = self._effective_signals(overrides, "entry_signals", s.entry_signals)
         exit_signals = self._effective_signals(overrides, "exit_signals", s.exit_signals)
+        # 叠加条件 (每策略 overlay 硬过滤): 只 AND 进入场掩码, 不影响已持仓卖出
+        overlay_conditions = StrategyEngine._effective_overlay(overrides)
+        if overlay_conditions and s.execution_backend in ("composite", "minute_filter"):
+            return _err(f"叠加条件不支持 {s.execution_backend} 策略")
         if config.exit_fill == "signal_next_minute":
             if not config.minute_fill:
                 return _err("触发后下一分钟成交需要先开启分钟成交")
@@ -1076,8 +1420,17 @@ class StrategyBacktestService:
             0.005,
             0.5,
         )
-        if trailing_take_profit_activate is not None and trailing_take_profit_drawdown is not None:
-            trailing_take_profit_drawdown = min(trailing_take_profit_drawdown, trailing_take_profit_activate)
+        if (
+            trailing_take_profit_activate is not None
+            and trailing_take_profit_drawdown is not None
+            and trailing_take_profit_drawdown > trailing_take_profit_activate
+        ):
+            # 不再静默钳制: 旧 min() 会把用户填的回撤改写成激活值, 配置"不生效"
+            # 却无任何提示。组合无意义时显式报错, 让用户调整参数后重跑。
+            return _err(
+                f"移动止盈回撤({trailing_take_profit_drawdown:.0%})不能大于"
+                f"激活涨幅({trailing_take_profit_activate:.0%}), 请调整后再试"
+            )
         max_hold_days = self._override_value(overrides, "max_hold_days", s.max_hold_days)
         score_min, score_max = self._normalize_score_range(
             overrides.get("score_min"),
@@ -1085,7 +1438,7 @@ class StrategyBacktestService:
         )
 
         if s.execution_backend == "minute_filter":
-            # 分钟策略回测: 逐交易日回放 filter_minute_history (与实盘选股同源),
+            # 分钟策略回测: 逐交易日回放 filter_minute_history (与实盘策略同源),
             # 信号分钟收盘价入场, 之后复用日K矩阵模拟的离场与组合管理。
             return self._run_minute_backtest(
                 config, s, params, overrides,
@@ -1102,6 +1455,7 @@ class StrategyBacktestService:
                 result_policy=result_policy,
                 run_id=run_id,
                 t0=t0,
+                evidence=evidence,
             )
 
         try:
@@ -1136,8 +1490,10 @@ class StrategyBacktestService:
         matrix_data_cache_timing_ms: Mapping[str, float] = {}
 
         # 加载 warmup + 正式区间。矩阵策略的 warmup 由协议解析，不再依赖策略名称。
-        warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
-        load_start = config.start - timedelta(days=warmup_days)
+        shared = prepared or prepared_panel
+        load_start = shared.load_start if shared is not None else history_load_start(
+            self.engine, config.start, config.asset_type, feature_plan.warmup_bars,
+        )
 
         # 全量模式: entries 只在正式区间触发, exits 需要 end 之后的尾部数据继续执行策略卖点。
         # 若策略有 max_hold_days, 用它决定尾部窗口；否则 holding_days 只作为兜底观察上限。
@@ -1186,11 +1542,7 @@ class StrategyBacktestService:
                 requested_forward_bars=profile_forward,
                 max_disk_bytes=settings.backtest_matrix_cache_max_mb * 1024 * 1024,
             )
-            cache_warmup_days = max(
-                120,
-                int(max(cache_profile.warmup_bars, 1) * 1.6),
-            )
-            coverage_start = config.start - timedelta(days=cache_warmup_days)
+            coverage_start = history_load_start(self.engine, config.start, config.asset_type, cache_profile.warmup_bars)
             coverage_end = config.end
             if config.mode == "full":
                 coverage_end = config.end + timedelta(
@@ -1230,18 +1582,39 @@ class StrategyBacktestService:
                 return _err("正式回测区间内无数据")
             feature_width = len(feature_plan.matrix_columns)
         else:
-            t_load = time.perf_counter()
-            try:
-                panel = self.engine.load_panel_for_backtest(
-                    config.symbols,
-                    load_start,
-                    load_end,
-                    feature_plan,
-                    asset_type=config.asset_type,
+            if prepared_panel is not None:
+                # P2a 共享面板: 优化器准备的超集面板直接复用, 跳过载盘/指标/信号注入。
+                if not _panel_backend(s.execution_backend):
+                    return _err("共享特征面板只能用于面板路径策略")
+                if prepared_panel.signature != self._matrix_prepare_signature(config):
+                    return _err("共享特征面板与当前回测配置不匹配")
+                required_columns = (
+                    set(feature_plan.base_columns) | set(feature_plan.instrument_columns)
+                    | set(feature_plan.signal_columns) | set(feature_plan.indicator_columns)
+                    | set(feature_plan.fundamental_columns)
                 )
-            except (ValueError, pl.exceptions.PolarsError) as e:
-                return _err(f"回测特征准备失败: {e}")
-            timing_ms["load_panel"] = round((time.perf_counter() - t_load) * 1000, 1)
+                missing_columns = required_columns - prepared_panel.columns
+                if missing_columns:
+                    return _err(f"共享特征面板缺少本参数组所需列: {sorted(missing_columns)}")
+                panel = prepared_panel.panel
+                load_start = prepared_panel.load_start
+                load_end = prepared_panel.load_end
+                sim_end = prepared_panel.sim_end
+                timing_ms["load_panel"] = 0.0
+            else:
+                t_load = time.perf_counter()
+                try:
+                    panel = self.engine.load_panel_for_backtest(
+                        config.symbols,
+                        load_start,
+                        load_end,
+                        feature_plan,
+                        asset_type=config.asset_type,
+                        **({"evidence": evidence} if evidence is not None else {}),
+                    )
+                except (ValueError, pl.exceptions.PolarsError) as e:
+                    return _err(f"回测特征准备失败: {e}")
+                timing_ms["load_panel"] = round((time.perf_counter() - t_load) * 1000, 1)
             if panel.is_empty():
                 return _err("无数据，请检查日期范围或先运行盘后管道")
             # 环境过滤下正式起点=面板首日时顺延 (首日让渡为预热)
@@ -1256,6 +1629,7 @@ class StrategyBacktestService:
                 return _err("正式回测区间内无数据")
             feature_width = int(panel.width)
 
+        position_policy_compute, position_policy_params = _resolve_position_policy(config)
         matcher_config = MatcherConfig(
             matching=config.matching,
             entry_fill=config.entry_fill,
@@ -1276,7 +1650,10 @@ class StrategyBacktestService:
             score_max=score_max,
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
+            position_policy_compute=position_policy_compute,
+            position_policy_params=position_policy_params,
             minute_fill=config.minute_fill,
+            asset_type=config.asset_type,
         )
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
@@ -1300,6 +1677,7 @@ class StrategyBacktestService:
                     getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
                     required_start=config.start,
                     required_end=config.end,
+                    evidence=evidence,
                 )
             except ValueError as e:
                 return _err(str(e))
@@ -1323,7 +1701,7 @@ class StrategyBacktestService:
             panel_rows = int(np.isfinite(market_data.close[start_id:stop_id]).sum())
             panel_columns = len(feature_plan.matrix_columns)
             reference_price = (
-                rolling_mean(market_data.close, 5)[start_id:stop_id]
+                build_minute_entry_reference(market_data.close)[start_id:stop_id]
                 if matcher_config.minute_fill
                 else None
             )
@@ -1343,6 +1721,15 @@ class StrategyBacktestService:
                 )
             except ValueError as e:
                 return _err(str(e))
+
+            if evidence is not None:
+                evidence.check_matrix(
+                    market_data, signal_matrix,
+                    lambda data: self._generate_composite_signal_matrix(
+                        composite_children_resolved, data, merge_mode, min_confirm,
+                        composite_max_hold, {},
+                    ),
+                )
 
             sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
             sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
@@ -1404,6 +1791,7 @@ class StrategyBacktestService:
                         getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
                         required_start=config.start,
                         required_end=config.end,
+                        evidence=evidence,
                     )
                 except ValueError as e:
                     return _err(str(e))
@@ -1427,7 +1815,7 @@ class StrategyBacktestService:
                 panel_rows = int(np.isfinite(market_data.close[start_id:stop_id]).sum())
                 panel_columns = len(feature_plan.matrix_columns)
                 reference_price = (
-                    rolling_mean(market_data.close, 5)[start_id:stop_id]
+                    build_minute_entry_reference(market_data.close)[start_id:stop_id]
                     if matcher_config.minute_fill
                     else None
                 )
@@ -1462,6 +1850,14 @@ class StrategyBacktestService:
             except (TypeError, ValueError) as e:
                 return _err(f"矩阵策略信号计算失败: {e}")
 
+            if evidence is not None:
+                evidence.check_matrix(
+                    market_data, signal_matrix,
+                    lambda data: MatrixStrategyPipeline().run(
+                        s.matrix_strategy, data, params, pipeline_config,
+                    ),
+                )
+
             sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
             sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
             sim_signal_matrix = apply_time_masks(
@@ -1469,6 +1865,26 @@ class StrategyBacktestService:
                 entry_time_mask[start_id:stop_id],
                 exit_time_mask[start_id:stop_id],
             )
+            # 叠加条件: 在矩阵 fields (依赖已并入 feature_plan) 上按 (时间, 标的)
+            # 评估, AND 进 entry; exit 不动 — 已持仓卖出不受影响。
+            if overlay_conditions:
+                overlay_mask, overlay_err = self._overlay_matrix_mask(
+                    market_data, overlay_conditions
+                )
+                if overlay_err is not None:
+                    return _err(overlay_err)
+                # np.where 产物可写, 须恢复只读不变量 (SignalMatrix 校验会拒)。
+                # 该路径此前被"扩展字段不可用"挡在更早阶段, 普通列叠加同样会触发。
+                overlay_entry = np.where(
+                    overlay_mask[start_id:stop_id],
+                    sim_signal_matrix.entry,
+                    0,
+                ).astype(sim_signal_matrix.entry.dtype)
+                overlay_entry.flags.writeable = False
+                sim_signal_matrix = replace(
+                    sim_signal_matrix,
+                    entry=overlay_entry,
+                )
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
             if not sim_signal_matrix.entry.any():
                 return _err("在指定区间内未产生买入信号")
@@ -1496,23 +1912,25 @@ class StrategyBacktestService:
         else:
             if panel is None or formal_range is None:
                 return _err("非矩阵策略不能使用共享基础矩阵")
-            # basic_filter 只影响买入候选，不能删除持仓估值和卖出所需行情。
-            basic_mask = pl.Series("_basic", [True] * len(panel), dtype=pl.Boolean)
-            if basic_filter and basic_filter.get("enabled", True):
-                expr = StrategyEngine._basic_filter_expr(panel, basic_filter)
-                if expr is not None:
-                    try:
-                        basic_mask = panel.select(expr.alias("_basic"))["_basic"].fill_null(False).cast(pl.Boolean)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("basic_filter mask failed: %s", e)
-                        return _err(f"基础过滤计算失败: {e}")
-
-            candidate_filter_mask = self._build_candidate_filter_mask(panel, s, params)
-            candidate_mask = basic_mask & candidate_filter_mask
-            panel = self._apply_score(panel, s, overrides, universe_mask=candidate_mask)
+            try:
+                panel, candidate_mask, entry_mask, raw_exit_mask = self._evaluate_panel_decisions(
+                    panel, s, params, overrides, basic_filter, entry_signals, exit_signals,
+                    factor_snapshot=factor_snapshot,
+                )
+            except ValueError as exc:
+                return _err(str(exc))
+            if evidence is not None:
+                evidence.check_panel(
+                    self._decision_frame(panel, candidate_mask, entry_mask, raw_exit_mask),
+                    lambda data: self._decision_frame(*self._evaluate_panel_decisions(
+                        data, s, params, overrides, basic_filter, entry_signals, exit_signals,
+                    )),
+                )
             formal_candidate_mask = candidate_mask & formal_range
-            entry_mask = self._build_entry_mask_from_candidate(panel, candidate_mask, s, entry_signals)
             entry_mask = entry_mask & formal_range
+            # 叠加条件: 在裁剪前的完整 panel (ext_*/因子列已在, polars 路径经
+            # compute_signals 附带 ext 列) 上评估, 只 AND 进 entry — exit 掩码
+            # 独立构建, 已持仓卖出不受影响 (与 basic_filter 同口径)。
             if config.regime_filter:
                 date_values = panel.get_column("date").unique().sort().to_list()
                 date_labels = tuple(str(value)[:10] for value in date_values)
@@ -1523,6 +1941,7 @@ class StrategyBacktestService:
                         getattr(getattr(self.engine.repo, "store", None), "data_dir", None),
                         required_start=config.start,
                         required_end=config.end,
+                        evidence=evidence,
                     )
                 except ValueError as e:
                     return _err(str(e))
@@ -1534,7 +1953,6 @@ class StrategyBacktestService:
                     regime_row_mask = panel.get_column("date").is_in(allowed_dates).fill_null(False)
                     formal_candidate_mask = formal_candidate_mask & regime_row_mask
                     entry_mask = entry_mask & regime_row_mask
-            raw_exit_mask = self._build_signal_mask(panel, exit_signals, "_exit")
             exit_range = self._date_range_mask(panel, config.start, load_end) if config.mode == "full" else formal_range
             exit_mask = raw_exit_mask & exit_range
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
@@ -1560,16 +1978,48 @@ class StrategyBacktestService:
             }
 
             t_matrix = time.perf_counter()
-            market_matrix = build_market_matrix(
-                sim_panel,
-                sim_entry_mask,
-                sim_exit_mask,
-                entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
-                entry_signal_ids=entry_signals,
-                exit_signal_ids=exit_signals,
-                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+            shared_encoding = (
+                prepared_panel.sim_encoding if prepared_panel is not None else None
             )
+            # score 列只在 run 侧存在 (_apply_score 产物), 编码面板没有 —
+            # 重构后两路径的市场矩阵都不含 score 场, 比对忽略它。
+            _enc_cols = (
+                tuple(c for c in shared_encoding.sim_columns if c != "score")
+                if shared_encoding is not None else None
+            )
+            if (
+                shared_encoding is not None
+                and _enc_cols == tuple(c for c in sorted(sim_columns) if c != "score")
+                and len(sim_entry_mask) == shared_encoding.panel_rows
+            ):
+                # P2a-2: 共享矩阵编码 — 只散布随参数变化的 score/entry/exit。
+                # 列序或行数不一致 (计划漂移) 时回退整建, 回退是优化放弃而非
+                # 正确性闸门, 整建结果总是正确。
+                score_series = (
+                    sim_panel.get_column("score")
+                    if "score" in sim_panel.columns and sim_panel["score"].dtype.is_numeric()
+                    else None
+                )
+                market_matrix = build_market_matrix_from_encoding(
+                    shared_encoding,
+                    score=score_series,
+                    entries=sim_entry_mask,
+                    exits=sim_exit_mask,
+                    entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
+                    exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                    minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                )
+            else:
+                market_matrix = build_market_matrix(
+                    sim_panel,
+                    sim_entry_mask,
+                    sim_exit_mask,
+                    entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
+                    exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                    entry_signal_ids=entry_signals,
+                    exit_signal_ids=exit_signals,
+                    minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del panel, sim_panel, sim_entry_mask, sim_exit_mask
 
@@ -1674,6 +2124,16 @@ class StrategyBacktestService:
 
         selected_stats = result_policy.select_stats(result.stats)
 
+        # 因子归因 (fail-open): 快照与成交按信号日关联, 失败只记日志不影响结果
+        factor_attribution = None
+        if factor_snapshot and result.trades and result_policy.include_trades:
+            try:
+                factor_attribution = _factor_attribution_summary(
+                    factor_snapshot["frame"], result.trades
+                )
+            except Exception as exc:
+                logger.warning("factor attribution failed: %s", exc)
+
         elapsed = (time.perf_counter() - t0) * 1000
 
         result_config = self._config_to_dict(config)
@@ -1697,6 +2157,7 @@ class StrategyBacktestService:
                 else []
             ),
             strategy_info=strategy_info,
+            factor_attribution=factor_attribution,
             elapsed_ms=round(elapsed, 1),
         )
 
@@ -1722,6 +2183,7 @@ class StrategyBacktestService:
         result_policy: BacktestResultPolicy,
         run_id: str,
         t0: float,
+        evidence=None,
     ) -> StrategyBacktestResult:
         def _err(msg: str) -> StrategyBacktestResult:
             return StrategyBacktestResult(
@@ -1763,12 +2225,15 @@ class StrategyBacktestService:
                 load_end,
                 feature_plan,
                 asset_type="stock",
+                **({"evidence": evidence} if evidence is not None else {}),
             )
         except (ValueError, OSError, pl.exceptions.PolarsError) as e:
             return _err(f"回测特征准备失败: {e}")
         timing_ms["load_panel"] = round((time.perf_counter() - t_load) * 1000, 1)
         if panel.is_empty():
             return _err("无日线数据, 请检查日期范围或先运行盘后管道")
+        if evidence is not None:
+            evidence.record_frame("minute_daily_features", panel)
 
         replayer = MinuteSignalReplayer(self.engine, self.strategy_engine)
         replay = replayer.replay(
@@ -1781,6 +2246,7 @@ class StrategyBacktestService:
             symbols=config.symbols,
             progress_cb=progress_cb,
             cancel_event=cancel_event,
+            **({"evidence": evidence} if evidence is not None else {}),
         )
         timing_ms["minute_replay"] = replay.elapsed_ms
         if cancel_event is not None and cancel_event.is_set():
@@ -1844,6 +2310,7 @@ class StrategyBacktestService:
             exit_signal_ids=(),
         )
 
+        position_policy_compute, position_policy_params = _resolve_position_policy(config)
         matcher_config = MatcherConfig(
             matching=config.matching,
             entry_fill="close_t",
@@ -1864,6 +2331,8 @@ class StrategyBacktestService:
             score_max=score_max,
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
+            position_policy_compute=position_policy_compute,
+            position_policy_params=position_policy_params,
             # 分钟策略的成交价由 entry_price_override 提供 (触发分钟收盘),
             # 不再叠加日线口径的分钟成交细化。
             minute_fill=False,
@@ -1994,7 +2463,7 @@ class StrategyBacktestService:
             elapsed_ms=round(elapsed, 1),
         )
 
-    # ── 全量模拟 (选股能力统计, 不建组合不算净值) ──
+    # ── 全量模拟 (策略能力统计, 不建组合不算净值) ──
 
     def _run_full_simulation(
         self,
@@ -2004,7 +2473,7 @@ class StrategyBacktestService:
     ) -> SimResult:
         """对 entry_mask 命中的全部候选, 算持有 N 天后的前瞻收益统计。
 
-        不受 max_positions/资金约束, 反映策略选股能力本身。
+        不受 max_positions/资金约束, 反映策略能力本身。
         equity_curve 复用为"累计日均超额收益曲线"(基准归零)。
         """
         n = holding_days if holding_days and holding_days > 0 else 5
@@ -2159,6 +2628,7 @@ class StrategyBacktestService:
         *,
         required_start: date | None = None,
         required_end: date | None = None,
+        evidence=None,
     ) -> np.ndarray | None:
         """构造逐日 T-1 regime mask, 保留历史静态入口兼容调用方。"""
         if not regime_filter:
@@ -2174,6 +2644,8 @@ class StrategyBacktestService:
         from app.services import regime_builder
 
         regime_df = regime_builder.load_regime_history(data_dir)
+        if evidence is not None:
+            evidence.record_frame("regime_history", regime_df)
         regime_by_date = {
             row["date"]: {
                 "state": row.get("state", ""),
@@ -2190,6 +2662,40 @@ class StrategyBacktestService:
             required_end=required_end,
         )
 
+    def _evaluate_panel_decisions(
+        self, panel, strategy, params, overrides, basic_filter, entry_signals, exit_signals,
+        *, factor_snapshot=None,
+    ):
+        """生产回测与时间切片检查共用信号管线，日期/成交延迟在其后应用。"""
+        basic_mask = pl.Series("_basic", [True] * len(panel), dtype=pl.Boolean)
+        if basic_filter and basic_filter.get("enabled", True):
+            expr = StrategyEngine._basic_filter_expr(panel, basic_filter)
+            if expr is not None:
+                basic_mask = panel.select(expr.alias("_basic"))["_basic"].fill_null(False).cast(pl.Boolean)
+        candidate = basic_mask & self._build_candidate_filter_mask(panel, strategy, params)
+        panel = self._apply_score(
+            panel, strategy, overrides, universe_mask=candidate, factor_snapshot=factor_snapshot,
+        )
+        entry = self._build_entry_mask_from_candidate(panel, candidate, strategy, entry_signals)
+        overlay = StrategyEngine._effective_overlay(overrides)
+        if overlay:
+            mask, error = self._overlay_panel_mask(panel, overlay)
+            if error is not None:
+                raise ValueError(error)
+            entry = entry & mask
+        exits = self._build_signal_mask(panel, exit_signals, "_exit")
+        return panel, candidate, entry, exits
+
+    @staticmethod
+    def _decision_frame(panel, candidate, entry, exits):
+        names = [
+            name for name, dtype in panel.schema.items()
+            if name in {"symbol", "date"} or dtype.is_numeric() or dtype == pl.Boolean
+        ]
+        return panel.select(names).with_columns(
+            candidate.rename("_audit_candidate"), entry.rename("_audit_entry"), exits.rename("_audit_exit"),
+        )
+
     def _build_candidate_filter_mask(
         self,
         panel: pl.DataFrame,
@@ -2201,7 +2707,7 @@ class StrategyBacktestService:
         true_mask = pl.Series("_candidate_filter", [True] * len(panel), dtype=pl.Boolean)
 
         history_failed = False
-        # 优先: filter_history_fn 策略 (涨停/反包等多日形态, 与选股路径共用同一逻辑)
+        # 优先: filter_history_fn 策略 (涨停/反包等多日形态, 与策略路径共用同一逻辑)
         if s.filter_history_fn:
             try:
                 hit_df = s.filter_history_fn(panel, params)
@@ -2240,6 +2746,98 @@ class StrategyBacktestService:
 
         # 没有策略候选层时, 由 entry_signals 直接决定买点。
         return true_mask
+
+    @staticmethod
+    def _overlay_panel_mask(
+        panel: pl.DataFrame, conditions: list[dict]
+    ) -> tuple[pl.Series | None, str | None]:
+        """叠加条件 → panel 行布尔掩码 (polars 路径)。出错返回 (None, errmsg)。
+
+        复用引擎侧同一套编译/物化/fail-closed 语义: 注册表因子列缺失时先物化,
+        物化后仍缺列 (扩展表被删等) 报可读错误而不是静默放宽。
+        """
+        from app.strategy import custom_signals
+
+        try:
+            expr = custom_signals.build_overlay_expr(conditions)
+        except ValueError as e:
+            return None, f"叠加条件编译失败: {e}"
+        if expr is None:
+            return None, None
+        try:
+            enriched = custom_signals.materialize_factor_columns(
+                panel, {"__overlay__": expr}
+            )
+            mask = enriched.select(expr.fill_null(False).alias("__overlay__"))[
+                "__overlay__"
+            ]
+            return mask.cast(pl.Boolean), None
+        except Exception as e:  # noqa: BLE001
+            missing = custom_signals.overlay_missing_columns(conditions, panel.columns)
+            detail = f"，缺失列: {', '.join(missing)}" if missing else f": {e}"
+            return None, f"叠加条件评估失败{detail}"
+
+    @staticmethod
+    def _shift_time(arr: np.ndarray, days: int) -> np.ndarray:
+        """沿时间轴取 N 个交易日前的值 (前 days 行置 NaN, 与 polars shift 同语义)。
+
+        NaN 在比较结果里一律不命中 (调用方统一 AND ~isnan), 即越界/缺数据
+        fail-closed, 与 polars 路径 fill_null(False) 对齐。
+        """
+        if days <= 0:
+            return arr
+        out = np.full(arr.shape, np.nan, dtype=float)
+        if days < arr.shape[0]:
+            out[days:] = arr[:-days]
+        return out
+
+    @classmethod
+    def _overlay_matrix_mask(
+        cls, market_data: MarketDataMatrix, conditions: list[dict]
+    ) -> tuple[np.ndarray | None, str | None]:
+        """叠加条件 → (T,A) 布尔掩码 (matrix 路径)。出错返回 (None, errmsg)。
+
+        在 market_data.fields (float 数组) 上元素级评估; NaN (缺数据日) 一律
+        不命中, 与 polars 路径 fill_null(False) 同语义。leftDays/rightDays
+        沿时间轴回看 N 个交易日 (越界前置 NaN → 不命中)。字符串字段在保存期
+        已对 matrix_native 策略拒绝, 这里对 contains 再兜底拦截。
+        """
+        n_times = len(market_data.timestamp_labels)
+        n_assets = len(market_data.symbols)
+        mask = np.ones((n_times, n_assets), dtype=bool)
+        for i, c in enumerate(conditions):
+            op = c.get("op")
+            fn = _OVERLAY_NP_OPS.get(op)
+            if fn is None:
+                return None, f"第 {i+1} 个叠加条件: matrix 路径不支持运算符 {op!r}"
+            left = str(c.get("left", ""))
+            if left not in market_data.fields:
+                return None, (
+                    f"叠加条件引用的列不在回测矩阵中: {left} "
+                    "(请检查扩展数据拉取/因子计算是否可用)"
+                )
+            left_days = int(c.get("leftDays", 0) or 0)
+            right_days = int(c.get("rightDays", 0) or 0)
+            left_arr = cls._shift_time(
+                np.asarray(market_data.fields[left], dtype=float), left_days
+            )
+            right = c.get("right")
+            if isinstance(right, str) and right.startswith("field:"):
+                col = right[len("field:"):]
+                if col not in market_data.fields:
+                    return None, f"叠加条件引用的列不在回测矩阵中: {col}"
+                right_arr = cls._shift_time(
+                    np.asarray(market_data.fields[col], dtype=float), right_days
+                )
+                cond = fn(left_arr, right_arr) & ~np.isnan(left_arr) & ~np.isnan(right_arr)
+            else:
+                try:
+                    value = float(right)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return None, f"第 {i+1} 个叠加条件: 右值必须是数字 (matrix 路径)"
+                cond = fn(left_arr, value) & ~np.isnan(left_arr)
+            mask &= cond
+        return mask, None
 
     def _build_entry_mask_from_candidate(
         self,
@@ -2291,6 +2889,10 @@ class StrategyBacktestService:
         except Exception as e:
             logger.warning("load benchmark %s failed: %s", BENCHMARK_SYMBOL, e)
             return []
+
+        evidence = getattr(self.engine, "_evidence", None)
+        if evidence is not None:
+            evidence.record_frame("benchmark", df)
 
         if df.is_empty() or "close" not in df.columns:
             return []
@@ -2468,6 +3070,8 @@ class StrategyBacktestService:
             "max_exposure_pct": c.max_exposure_pct,
             "initial_capital": c.initial_capital,
             "position_sizing": c.position_sizing,
+            "position_policy": c.position_policy,
+            "position_policy_params": c.position_policy_params,
             "mode": c.mode,
             "holding_days": c.holding_days,
             "asset_type": c.asset_type,
@@ -2481,6 +3085,7 @@ class StrategyBacktestService:
         s: StrategyDef,
         overrides: dict | None,
         universe_mask: pl.Series | None = None,
+        factor_snapshot: dict | None = None,
     ) -> pl.DataFrame:
         scoring = effective_scoring(s.meta.get("scoring"), overrides)
         directions = effective_scoring_directions(overrides)
@@ -2490,6 +3095,18 @@ class StrategyBacktestService:
         has_universe = universe_mask is not None and len(universe_mask) == len(panel)
         if has_universe:
             work = work.with_columns(universe_mask.rename("_score_universe"))
+
+        # 因子归因快照: 在临时因子列被 _finish 丢弃前, 截取候选行的
+        # (symbol, date, 因子值)。与评分共用同一份物化结果, 无第二次计算。
+        if factor_snapshot is not None:
+            snapshot_cols = ["symbol", "date"] + [
+                name for name in scoring if name in work.columns
+            ]
+            if len(snapshot_cols) > 2:
+                frame = work
+                if has_universe:
+                    frame = frame.filter(pl.col("_score_universe"))
+                factor_snapshot["frame"] = frame.select(snapshot_cols)
 
         def _value_in_universe(value: pl.Expr) -> pl.Expr:
             if has_universe:

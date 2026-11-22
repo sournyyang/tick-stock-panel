@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import { api, type MiningResult, type MiningRun, type MiningRunProgress, type MiningRunStatus } from './api'
+import { fetchRunningTask, reportTaskFinished, reportTaskRunning } from './taskRegistry'
 
 export interface MiningTask {
   runId: string | null
@@ -14,6 +15,24 @@ export interface MiningTask {
 }
 
 const ACTIVE_RUN_KEY = 'mining_active_run_id'
+
+// 跨设备接回: run 创建时上报注册表, 终态关闭; attach 命中非终态时重报 running
+// (幂等, 同时刷新 updated_at 防孤儿误回收)。重连/轮询逻辑本身零改动。
+const TASK_KIND = 'mining' as const
+
+/** 终态/重置: 关闭注册表项并清本地活跃 run 键。 */
+function finishTaskRegistry() {
+  const runId = localStorage.getItem(ACTIVE_RUN_KEY)
+  if (runId) reportTaskFinished(TASK_KIND, { run_id: runId })
+  localStorage.removeItem(ACTIVE_RUN_KEY)
+}
+
+/** run 创建/接管: 记本地键 + 上报 running。 */
+function trackRun(runId: string) {
+  localStorage.setItem(ACTIVE_RUN_KEY, runId)
+  reportTaskRunning(TASK_KIND, { run_id: runId })
+}
+
 const TERMINAL_STATES = new Set<MiningRunStatus>([
   'succeeded',
   'succeeded_with_budget_exhausted',
@@ -101,7 +120,7 @@ async function refreshTerminalRun(
       if (result.run_id !== runId) throw new Error('任务结果与运行 ID 不匹配')
     }
     if (current.runId !== runId || connectionToken !== token) return
-    localStorage.removeItem(ACTIVE_RUN_KEY)
+    finishTaskRegistry()
     update({
       run,
       progress: run.progress ?? current.progress,
@@ -113,7 +132,7 @@ async function refreshTerminalRun(
     })
   } catch (error) {
     if (current.runId !== runId || connectionToken !== token) return
-    localStorage.removeItem(ACTIVE_RUN_KEY)
+    finishTaskRegistry()
     const run = current.run && fallbackStatus
       ? { ...current.run, status: fallbackStatus, error: fallbackError || current.run.error }
       : current.run
@@ -235,7 +254,7 @@ function connect(runId: string) {
 
 export async function startMining(payload: Parameters<typeof api.miningStart>[0]) {
   closeEvents()
-  localStorage.removeItem(ACTIVE_RUN_KEY)
+  finishTaskRegistry()
   const token = connectionToken
   update({
     runId: null,
@@ -251,7 +270,7 @@ export async function startMining(payload: Parameters<typeof api.miningStart>[0]
   try {
     const run = await api.miningStart(payload)
     if (connectionToken !== token || current.runId !== null) return
-    localStorage.setItem(ACTIVE_RUN_KEY, run.run_id)
+    trackRun(run.run_id)
     update({
       runId: run.run_id,
       run,
@@ -267,6 +286,67 @@ export async function startMining(payload: Parameters<typeof api.miningStart>[0]
     if (connectionToken !== token || current.runId !== null) return
     update({
       isPending: false,
+      error: String((error as Error).message || error),
+    })
+  }
+}
+
+/** 自动挖掘: L1 全量筛选在后端同步跑 (数十秒到几分钟)。
+ *  模块级提交即返回, 弹窗可立刻关闭; 筛选期间用 progress 呈现, run 创建后走 SSE/轮询。
+ */
+export async function startAutoMining(payload: Parameters<typeof api.miningAutoStart>[0]) {
+  closeEvents()
+  finishTaskRegistry()
+  const token = connectionToken
+  update({
+    runId: null,
+    isPending: true,
+    cancelling: false,
+    reconnecting: false,
+    run: null,
+    progress: { phase: 'screening', label: '正在全量筛选因子（约 1-3 分钟）' },
+    result: null,
+    previousResult: current.result ?? current.previousResult,
+    error: null,
+  })
+  try {
+    const data = await api.miningAutoStart(payload)
+    if (connectionToken !== token || current.runId !== null) return
+    if (data.started && data.run) {
+      const run = data.run
+      trackRun(run.run_id)
+      update({
+        runId: run.run_id,
+        run,
+        progress: run.progress ?? current.progress,
+        isPending: !TERMINAL_STATES.has(run.status),
+      })
+      if (TERMINAL_STATES.has(run.status)) {
+        await refreshTerminalRun(run.run_id, run.status, run, token)
+      } else {
+        connect(run.run_id)
+      }
+      return
+    }
+    // 无达标因子: 不创建任务, 以 task.error 呈现原因分布 (挖掘页红字展示)
+    const screening = data.screening
+    const topReasons = Object.entries(screening?.reason_counts ?? {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([reason, count]) => `${reason} ${count} 个`)
+      .join('；')
+    update({
+      isPending: false,
+      progress: null,
+      error: `${screening?.n_total ?? 0} 个因子里 0 个达标，未启动挖掘。`
+        + (topReasons ? `主要失败原因：${topReasons}。` : '')
+        + '可改选「探索」档（门槛更低）或拉长日期区间后重试。',
+    })
+  } catch (error) {
+    if (connectionToken !== token || current.runId !== null) return
+    update({
+      isPending: false,
+      progress: null,
       error: String((error as Error).message || error),
     })
   }
@@ -331,13 +411,13 @@ export async function attachMiningRun(runId: string): Promise<boolean> {
     if (TERMINAL_STATES.has(run.status)) {
       await refreshTerminalRun(runId, run.status, run, token)
     } else {
-      localStorage.setItem(ACTIVE_RUN_KEY, runId)
+      trackRun(runId)
       connect(runId)
     }
     return true
   } catch (error) {
     if (current.runId !== runId || connectionToken !== token) return false
-    localStorage.removeItem(ACTIVE_RUN_KEY)
+    finishTaskRegistry()
     update({
       isPending: false,
       reconnecting: false,
@@ -347,16 +427,29 @@ export async function attachMiningRun(runId: string): Promise<boolean> {
   }
 }
 
+/** 换设备接回: 本地无键时从服务端注册表找 running 任务, 回填本地键并走原有 attach。 */
+async function adoptFromServer() {
+  if (current.runId) return // 本机已有活动任务
+  const task = await fetchRunningTask(TASK_KIND)
+  const runId = typeof task?.payload?.run_id === 'string' ? task.payload.run_id : ''
+  if (!runId || localStorage.getItem(ACTIVE_RUN_KEY)) return
+  trackRun(runId)
+  void attachMiningRun(runId)
+}
+
 export function tryReconnectMining(): boolean {
   const runId = localStorage.getItem(ACTIVE_RUN_KEY)
-  if (!runId) return false
+  if (!runId) {
+    void adoptFromServer()
+    return false
+  }
   void attachMiningRun(runId)
   return true
 }
 
 export function clearMiningTask() {
   closeEvents()
-  localStorage.removeItem(ACTIVE_RUN_KEY)
+  finishTaskRegistry()
   current = {
     runId: null,
     isPending: false,

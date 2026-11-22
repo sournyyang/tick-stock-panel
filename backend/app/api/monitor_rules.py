@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from pydantic import BaseModel
 from app.strategy import monitor_rules
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/monitor-rules", tags=["monitor-rules"])
 
 
@@ -21,11 +24,11 @@ def _data_dir(request: Request) -> Path:
 
 
 def _reconcile_index_asset_type(rule: dict, repo) -> dict:
-    """纠正误存为 stock 的指数规则 (asset_type → index)。
+    """纠正误存为 stock 的指数/ETF 规则 (asset_type → index/etf)。
 
-    个股弹窗加监控 / 点位提醒等入口未传 asset_type, 指数 symbol 的规则被存成
-    stock, 导致监控中心显示「个股」、引擎在股票轮评估 (指数 symbol 永不命中)。
-    仅当规则全部 symbols 都 resolve 为指数时纠正 (股票+指数混合池不动)。
+    个股弹窗加监控 / 点位提醒等入口未传 asset_type, 指数/ETF symbol 的规则被存成
+    stock, 导致监控中心显示「个股」、引擎在股票轮评估 (指数/ETF symbol 永不命中)。
+    仅当规则全部 symbols 都 resolve 为同一非 stock 类型时纠正 (混合池不动)。
     """
     if rule.get("asset_type", "stock") != "stock" or rule.get("scope") != "symbols":
         return rule
@@ -33,10 +36,13 @@ def _reconcile_index_asset_type(rule: dict, repo) -> dict:
     if not symbols:
         return rule
     try:
-        if all(repo.resolve_asset_type(s) == "index" for s in symbols):
-            rule["asset_type"] = "index"
-    except Exception:  # noqa: BLE001
-        pass
+        types = {repo.resolve_asset_type(s) for s in symbols}
+    except Exception:
+        return rule
+    if len(types) == 1:
+        only = next(iter(types))
+        if only in ("index", "etf"):
+            rule["asset_type"] = only
     return rule
 
 
@@ -50,6 +56,11 @@ def _sync_engine(request: Request) -> None:
             for r in monitor_rules.load_all(_data_dir(request))
         ]
         engine.set_rules(rules)
+    # set_rules 全量覆盖会清掉模拟盘合成规则 → 每次必须重注入;
+    # 覆盖集变化 (新建/删除 strategy 规则) 也会改变去重结果。
+    from app.strategy import paper_watch
+
+    paper_watch.sync_from_state(request.app.state, _data_dir(request))
 
 
 # ── Pydantic 模型 ───────────────────────────────────────
@@ -104,7 +115,7 @@ class RuleModel(BaseModel):
     severity: str = "info"    # info | warn | critical
     webhook_url: str = ""     # Webhook 推送地址 (推送到 QMT 等外部软件, 待定)
     webhook_enabled: bool = False  # 兼容老规则 (已由 webhook_channels 取代, 仅做向后兼容读)
-    webhook_channels: list[str] = []  # 命中时推送的外部渠道 (合法值 'feishu' | 'wecom')
+    webhook_channels: list[str] = []  # 合法值: feishu | wecom | dingtalk | custom | email
     message: str = ""
     # abnormal 专属 (异动边缘监控): any | 3d | 10d | 30d
     abnormal_window: str = "any"
@@ -124,30 +135,36 @@ def get_options(request: Request):
     """返回可选字段、信号列、运算符、枚举,供前端表单使用。"""
     from app.indicators.pipeline import ENRICHED_COLUMNS
     from app.services.kline_sync import intraday_monitor_support
-    from app.strategy.custom_signals import ALLOWED_FIELDS, load_all as load_csg
+    from app.strategy.custom_signals import (
+        ALLOWED_FIELDS,
+        intraday_column_name,
+        resolve_column,
+    )
+    from app.strategy.custom_signals import (
+        load_all as load_csg,
+    )
 
     # 阈值字段 (带中文标签)
     threshold_fields = [
         {"key": f, "label": ENRICHED_COLUMNS.get(f, f)}
         for f in sorted(ALLOWED_FIELDS)
     ]
-    # 内置信号列 (布尔, 用于 op=truth)
+    # 盘中信号列 (布尔, 用于 op=truth); 日线信号列已全部定义驱动 → custom_signals
     builtin_signals = [
-        {"key": k, "label": v}
-        for k, v in ENRICHED_COLUMNS.items()
-        if k.startswith("signal_")
-    ]
-    builtin_signals.extend(
         {"key": key, "label": label}
         for key, label in INTRADAY_SIGNAL_LABELS.items()
-    )
-    # 自定义信号列 (csg_)
+    ]
+    # 自定义信号列 (csg_ 及携带显式 signal_* 列名的迁移定义)
     custom_sigs = []
     try:
         for cs in load_csg(_data_dir(request)):
             if cs.get("enabled") is not False:
                 custom_sigs.append({
-                    "key": f"csg_{cs['id']}",
+                    "key": (
+                        intraday_column_name(cs["id"])
+                        if cs.get("timeframe") == "intraday"
+                        else resolve_column(cs)
+                    ),
                     "label": cs.get("name", cs["id"]),
                 })
     except Exception:
@@ -420,10 +437,27 @@ _DEMO_RULES_TEMPLATE = [
 ]
 
 # 策略类型单独声明 (格式不同: 含 strategy_id + direction)
+# 注意: 这些 id 只是演示候选, 内置策略已下线 → seed 时必须用引擎校验后再落盘,
+# 见 _strategy_available(); 不存在的直接跳过, 不生成死规则 (#490)。
 _DEMO_STRATEGY_RULES: list[dict] = [
     {"name": "策略监控 · 趋势突破", "strategy_id": "trend_breakout", "direction": "entry"},
     {"name": "策略监控 · MACD金叉", "strategy_id": "macd_golden", "direction": "both"},
 ]
+
+
+def _strategy_available(engine, strategy_id: str) -> bool:
+    """策略是否真实存在于引擎。
+
+    引擎未装配/查询异常时一律按「不可用」处理: 演示规则宁可不种,
+    也不要种一条永远不触发的死规则。
+    """
+    if engine is None:
+        return False
+    try:
+        return bool(engine.has(strategy_id))
+    except Exception:  # noqa: BLE001
+        logger.warning("策略可用性检查失败: %s", strategy_id, exc_info=True)
+        return False
 
 
 @router.post("/seed")
@@ -438,8 +472,20 @@ def seed_demo_rules(request: Request):
         monitor_rules.save_one(_data_dir(request), rule)
         created.append(rule_id)
         i += 1
-    # 策略类型规则
+    # 策略类型规则: 只种引擎里真实存在的策略。
+    # 内置策略已下线 (去内置化), 硬编码的历史 id (trend_breakout / macd_golden)
+    # 会生成「列表里显示已启用、运行时永远不触发」的死规则——运行时还会把
+    # unknown strategy 异常吞成空列表, 从日志里也看不出来 (#490)。
+    engine = getattr(request.app.state, "strategy_engine", None)
+    skipped: list[str] = []
     for sr in _DEMO_STRATEGY_RULES:
+        if not _strategy_available(engine, sr["strategy_id"]):
+            skipped.append(sr["strategy_id"])
+            logger.warning(
+                "演示规则跳过: 策略 %s 不存在(内置策略已下线, 需先在「策略」页自建)",
+                sr["strategy_id"],
+            )
+            continue
         rule_id = f"demo_{ts}_{i}"
         rule = _demo_rule(
             rule_id, sr["name"], "strategy", "all", [], [], "and", 3600, "info",
@@ -449,7 +495,7 @@ def seed_demo_rules(request: Request):
         created.append(rule_id)
         i += 1
     _sync_engine(request)
-    return {"ok": True, "generated": len(created), "ids": created}
+    return {"ok": True, "generated": len(created), "ids": created, "skipped": skipped}
 
 
 # ── 封单监控模拟触发 (Dev 调试用) ─────────────────────
@@ -575,6 +621,7 @@ def trigger_ladder(request: Request):
     让用户看到真实的预警通知。绕过 cooldown 强制触发。
     """
     import time
+
     from app.services import alert_store
 
     repo = request.app.state.repo

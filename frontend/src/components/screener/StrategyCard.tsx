@@ -63,9 +63,8 @@ export function cardWrapCls(size: CardSize): string {
 
 // ===== 来源标签 =====
 
-const SRC_MAP: Record<string, string> = { builtin: '内置', custom: '自定义', ai: 'AI', composite: '叠加' }
+const SRC_MAP: Record<string, string> = { custom: '自定义', ai: 'AI', composite: '叠加' }
 const BADGE_CLS_MAP: Record<string, string> = {
-  builtin: 'bg-secondary/10 text-muted border-border',
   ai: 'bg-purple-500/10 text-purple-400 border-purple-500/30',
   custom: 'bg-amber-400/10 text-amber-400 border-amber-400/30',
   composite: 'bg-teal-500/10 text-teal-400 border-teal-500/30',
@@ -94,12 +93,16 @@ interface StrategyCardProps {
   onToggleMonitor?: () => void
   /** 周期徽章 (如 '分钟'); 日线策略不传 */
   timeframeBadge?: string
+  /** 后台计算中 (渐进式 run_all): 数字未出时显示脉冲占位 */
+  computing?: boolean
+  /** 等待运行 (自动计算关闭/失败时的分钟策略): 数字未出时显示「待计算」点击引导 */
+  awaitRun?: boolean
 }
 
 export function StrategyCard({
   name, description, source, active, count, expiredCount,
   loading, cardSize,
-  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge,
+  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, awaitRun,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
@@ -108,8 +111,8 @@ export function StrategyCard({
   const countCls = count === 0
     ? 'text-muted'
     : 'bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent'
-  const srcLabel = cardSize === 'mini' ? (SRC_MAP[source ?? ''] ?? '内') : (SRC_MAP[source ?? ''] ?? '内置')
-  const badgeCls = BADGE_CLS_MAP[source ?? 'builtin'] ?? BADGE_CLS_MAP.builtin
+  const srcLabel = cardSize === 'mini' ? (SRC_MAP[source ?? ''] ?? '自') : (SRC_MAP[source ?? ''] ?? '自定义')
+  const badgeCls = BADGE_CLS_MAP[source ?? 'custom'] ?? BADGE_CLS_MAP.custom
 
   // 失效数 > 0 时显示
   const hasExpired = expiredCount != null && expiredCount > 0
@@ -149,19 +152,14 @@ export function StrategyCard({
                 )}
               </div>
             )}
+            {count == null && !loading && computing && (
+              <span className="mt-1.5 text-sm font-mono font-bold text-muted/50 animate-pulse">···</span>
+            )}
+            {count == null && !loading && !computing && awaitRun && (
+              <span className="mt-1.5 text-[10px] text-muted/60 transition-colors group-hover:text-accent/80" title="自动计算未开启或失败 — 点击卡片实时计算">待计算</span>
+            )}
             {loading && <div className="mt-1 h-4 w-10 rounded bg-elevated animate-pulse" />}
           </button>
-          <button onClick={(e) => { e.stopPropagation(); onSettings() }}
-            className="absolute top-1.5 right-1.5 p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title="策略设置">
-            <Settings2 className="h-3 w-3 text-muted hover:text-accent transition-colors" />
-          </button>
-          {onToggleMonitor && (
-            <button onClick={(e) => { e.stopPropagation(); onToggleMonitor() }}
-              className="absolute top-1.5 right-7 p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title={monitored ? '取消策略监控' : '开启策略监控'}>
-              <RadioTower className={`relative h-3 w-3 transition-colors ${monitored ? 'text-accent' : 'text-muted hover:text-accent'}`} />
-              {monitored && <span className="absolute inset-0 rounded animate-ping bg-accent/20" />}
-            </button>
-          )}
         </>
       ) : cardSize === 'normal' ? (
         <>
@@ -176,6 +174,12 @@ export function StrategyCard({
               {count != null && !loading && (
                 <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
               )}
+              {count == null && !loading && computing && (
+                <span className="text-xs font-mono font-bold text-muted/50 animate-pulse shrink-0">···</span>
+              )}
+              {count == null && !loading && !computing && awaitRun && (
+                <span className="text-[10px] text-muted/60 transition-colors group-hover:text-accent/80 shrink-0" title="自动计算未开启或失败 — 点击卡片实时计算">待计算</span>
+              )}
               {loading && <span className="w-5 h-3 rounded bg-elevated animate-pulse shrink-0" />}
             </div>
             <div className="flex items-center gap-1.5 mt-0.5">
@@ -187,17 +191,6 @@ export function StrategyCard({
               )}
             </div>
           </button>
-          <button onClick={(e) => { e.stopPropagation(); onSettings() }}
-            className="absolute top-1.5 right-1.5 p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title="策略设置">
-            <Settings2 className="h-3 w-3 text-muted hover:text-accent transition-colors" />
-          </button>
-          {onToggleMonitor && (
-            <button onClick={(e) => { e.stopPropagation(); onToggleMonitor() }}
-              className="absolute top-1.5 right-7 p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title={monitored ? '取消策略监控' : '开启策略监控'}>
-              <RadioTower className={`relative h-3 w-3 transition-colors ${monitored ? 'text-accent' : 'text-muted hover:text-accent'}`} />
-              {monitored && <span className="absolute inset-0 rounded animate-ping bg-accent/20" />}
-            </button>
-          )}
         </>
       ) : (
         /* mini */
@@ -209,24 +202,29 @@ export function StrategyCard({
             {count != null && !loading && (
               <span className={`text-xs font-mono font-bold tabular-nums ${countCls}`}>{count}</span>
             )}
+            {count == null && !loading && computing && (
+              <span className="text-xs font-mono font-bold text-muted/50 animate-pulse">···</span>
+            )}
+            {count == null && !loading && !computing && awaitRun && (
+              <span className="text-[9px] text-muted/60 transition-colors group-hover:text-accent/80 shrink-0" title="自动计算未开启或失败 — 点击卡片实时计算">待算</span>
+            )}
             {hasExpired && (
               <span className="text-[9px] font-mono text-red-400/70">{'-' + expiredCount}</span>
             )}
             {loading && <span className="w-4 h-2.5 rounded bg-elevated animate-pulse" />}
           </button>
-          {onToggleMonitor && (
-            <button onClick={(e) => { e.stopPropagation(); onToggleMonitor() }}
-              className="relative p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title={monitored ? '取消策略监控' : '开启策略监控'}>
-              <RadioTower className={`h-3 w-3 transition-colors ${monitored ? 'text-accent' : 'text-muted hover:text-accent'}`} />
-              {monitored && <span className="absolute inset-0 rounded animate-ping bg-accent/20" />}
-            </button>
-          )}
-          <button onClick={(e) => { e.stopPropagation(); onSettings() }}
-            className="p-0.5 rounded hover:bg-elevated transition-colors cursor-pointer" title="策略设置">
-            <Settings2 className="h-3 w-3 text-muted hover:text-accent transition-colors" />
-          </button>
         </>
       )}
+      <div className={cardSize === 'mini' ? 'flex shrink-0 items-center gap-0.5' : 'absolute right-1.5 top-1.5 flex items-center gap-0.5'}>
+        {onToggleMonitor && <button onClick={event => { event.stopPropagation(); onToggleMonitor() }}
+          className="relative rounded p-0.5 transition-colors hover:bg-elevated" title={monitored ? '取消策略监控' : '开启策略监控'}>
+          <RadioTower className={`h-3 w-3 transition-colors ${monitored ? 'text-accent' : 'text-muted hover:text-accent'}`} />
+          {monitored && <span className="absolute inset-0 rounded bg-accent/20 animate-ping" />}
+        </button>}
+        <button onClick={event => { event.stopPropagation(); onSettings() }} title="策略设置" className="rounded p-0.5 transition-colors hover:bg-elevated">
+          <Settings2 className="h-3 w-3 text-muted hover:text-accent" />
+        </button>
+      </div>
     </motion.div>
   )
 }

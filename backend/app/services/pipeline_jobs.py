@@ -8,7 +8,7 @@
   - 实例化时扫描磁盘,把上个进程遗留的 pending/running 孤儿记录补标为
     failed(中断);finished_at 取文件 mtime(最后已知存活时刻),不用下次
     开机时间虚增时长
-  - 列表查询 = 内存中的活跃 job + 磁盘文件扫描,按时间排序
+  - 列表查询读取原子发布的内存摘要；启动加载历史，生命周期与进度变化同步更新
   - 单个查询 = 内存优先,没有则读磁盘
   - 创建新 job 前检查文件数量,>= max_jobs 时删除最老的文件
 """
@@ -19,9 +19,10 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ STALE_JOB_TIMEOUT_S = DEFAULT_JOB_TIMEOUT_S
 
 
 class JobCancelledError(BaseException):
-    """任务已被取消(reap 判定卡死后自动取消,或未来的手动取消)。
+    """任务已被取消(reap 判定卡死后自动取消,手动取消,或排队等槽超时)。
 
     继承 BaseException 而非 Exception(对齐 asyncio.CancelledError 的设计):
     同步循环内部的分块异常隔离(``except Exception: continue``)不得吞掉取消信号,
@@ -110,19 +111,42 @@ class JobStore:
         self._lock = threading.Lock()
         self._store_dir.mkdir(parents=True, exist_ok=True)
         self._reap_orphans()
+        self._summary_snapshot: tuple[str | None, tuple[dict[str, Any], ...]] = (
+            None,
+            tuple(_summary(j) for j in self._job_files_sorted()[:max_jobs]),
+        )
+
+    def _publish_summary(self, job: dict[str, Any]) -> None:
+        """Caller holds _lock. Publish status before potentially slow persistence."""
+        _, previous = self._summary_snapshot
+        summaries = [_summary(job), *(j for j in previous if j["id"] != job["id"])]
+        summaries = summaries[:self._max_jobs]
+        summaries.sort(key=lambda j: j.get("started_at") or "", reverse=True)
+        self._summary_snapshot = self._active_id, tuple(summaries)
 
     # ===== persistence =====
 
     def _write_file(self, job: dict[str, Any]) -> None:
-        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。"""
+        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。
+
+        临时文件 + os.replace 原子替换: get()/list_recent() 等无锁读者
+        不会读到写一半的 JSON —— 否则 _read_file 解析失败按"文件不存在"
+        返回 None, 轮询方会瞬时看到任务凭空消失。
+        """
         path = self._store_dir / f"{job['id']}.json"
+        tmp = self._store_dir / f"{job['id']}.json.tmp"
         try:
-            path.write_text(
+            tmp.write_text(
                 json.dumps(job, ensure_ascii=False, indent=None),
                 encoding="utf-8",
             )
+            os.replace(tmp, path)
         except Exception:
             logger.warning("failed to write job file %s", path)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
         """从磁盘读取单个 job 文件。"""
@@ -135,25 +159,35 @@ class JobStore:
             logger.warning("failed to read job file %s", path)
             return None
 
-    def _delete_oldest(self) -> None:
-        """删除最老的 job 文件,保持文件数量 < max_jobs。"""
+    def _delete_oldest(self, writing_id: str) -> None:
+        """留出待写文件的位置，清理文件时同步移除历史摘要。"""
         try:
             files = sorted(self._store_dir.glob("*.json"), key=lambda f: f.stat().st_mtime)
         except Exception:
             return
-        while len(files) >= self._max_jobs:
+        # 覆盖 pending/running 的已有文件时，不额外占用历史记录名额。
+        keep = self._max_jobs - int(not any(f.stem == writing_id for f in files))
+        deleted: set[str] = set()
+        while len(files) > keep:
             oldest = files.pop(0)
             try:
                 oldest.unlink()
+                if oldest.stem != writing_id:
+                    deleted.add(oldest.stem)
             except Exception:
                 logger.warning("failed to delete old job file %s", oldest)
+        if deleted:
+            active_id, summaries = self._summary_snapshot
+            self._summary_snapshot = active_id, tuple(j for j in summaries if j["id"] not in deleted)
 
     def _job_files_sorted(self) -> list[dict[str, Any]]:
         """扫描磁盘上所有 job 文件,按 started_at 从新到旧排序。"""
         jobs: list[dict[str, Any]] = []
         for f in self._store_dir.glob("*.json"):
             try:
-                jobs.append(json.loads(f.read_text("utf-8")))
+                job = json.loads(f.read_text("utf-8"))
+                _summary(job)
+                jobs.append(job)
             except Exception:
                 continue
         jobs.sort(key=lambda j: j.get("started_at") or "", reverse=True)
@@ -172,6 +206,8 @@ class JobStore:
             try:
                 j = json.loads(f.read_text("utf-8"))
             except Exception:
+                continue
+            if not isinstance(j, dict):
                 continue
             orig_status = j.get("status")
             if not j.get("id") or orig_status not in ("pending", "running"):
@@ -230,6 +266,9 @@ class JobStore:
                     return self._active_id, False
 
             job_id = uuid.uuid4().hex[:10]
+            # last_progress_at 锚定创建时刻: pending 阶段(executor 排队/等重任务槽)
+            # 也要有「已知存活」基准, 否则从未上报进度的排队任务永远不进 reap 视野。
+            created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             job = {
                 "id": job_id,
                 "status": "pending",
@@ -238,7 +277,7 @@ class JobStore:
                 "stage_pct": 0,
                 "log": [],
                 "started_at": None,
-                "last_progress_at": None,
+                "last_progress_at": created_at,
                 "finished_at": None,
                 "duration_s": None,
                 "result": None,
@@ -248,7 +287,8 @@ class JobStore:
             self._active_jobs[job_id] = job
             self._active_id = job_id
             # pending 即落盘: 进程在 start() 前死亡时记录也不丢
-            self._delete_oldest()
+            self._delete_oldest(job_id)
+            self._publish_summary(job)
             self._write_file(job)
         _register_cancel_flag(job_id)
         return job_id, True
@@ -263,6 +303,7 @@ class JobStore:
             # 心跳基准初始化为启动时刻: start() 到首次 progress() 之间的
             # 初始化阶段(解析标的池等)同样计入停滞计时。
             j["last_progress_at"] = j["started_at"]
+            self._publish_summary(j)
             # running 快照落盘: 进程死亡后由下次启动的 _reap_orphans 补录
             self._write_file(j)
 
@@ -278,7 +319,8 @@ class JobStore:
             j["duration_s"] = _duration_s(j)
             if self._active_id == job_id:
                 self._active_id = None
-            self._delete_oldest()
+            self._delete_oldest(job_id)
+            self._publish_summary(j)
             self._write_file(j)
 
     def fail(self, job_id: str, error: str) -> None:
@@ -292,7 +334,8 @@ class JobStore:
             j["duration_s"] = _duration_s(j)
             if self._active_id == job_id:
                 self._active_id = None
-            self._delete_oldest()
+            self._delete_oldest(job_id)
+            self._publish_summary(j)
             self._write_file(j)
 
     # ===== progress =====
@@ -308,12 +351,13 @@ class JobStore:
                 if cancelled is not None and cancelled.is_set():
                     raise JobCancelledError(job_id)
                 return
+            previous_stage = j["stage"]
             j["stage"] = stage
             j["progress"] = max(0, min(100, int(pct)))
             j["last_progress_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             if stage_pct is not None:
                 j["stage_pct"] = max(0, min(100, int(stage_pct)))
-            elif j["stage"] != stage:
+            elif previous_stage != stage:
                 j["stage_pct"] = 0
             entry = {
                 "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -328,6 +372,7 @@ class JobStore:
                 j["log"].append(entry)
                 if len(j["log"]) > 200:
                     j["log"] = j["log"][-200:]
+            self._publish_summary(j)
         # 锁外检查取消: reap 可能在本次更新刚结束后置位,下一次回调必然命中;
         # 在这里立即检查可以把终止延迟压缩到当次回调。
         ev = _CANCEL_FLAGS.get(job_id)
@@ -337,47 +382,55 @@ class JobStore:
     # ===== query =====
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        # 内存中的活跃 job 优先
-        j = self._active_jobs.get(job_id)
-        if j:
-            return j
-        # 否则从磁盘读
-        return self._read_file(job_id)
+        # 取锁与 succeed()/fail() 的「pop 出内存 → 终态落盘」串行,
+        # 避免轮询方恰好落在两者之间, 瞬时看到任务凭空消失。
+        with self._lock:
+            # 内存中的活跃 job 优先
+            j = self._active_jobs.get(job_id)
+            if j:
+                return j
+            # 否则从磁盘读
+            return self._read_file(job_id)
 
     def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
-        # 合并: 内存中的活跃 job + 磁盘文件
-        all_jobs: list[dict[str, Any]] = list(self._active_jobs.values())
-        all_jobs.extend(self._job_files_sorted())
-        # 按 started_at 从新到旧排序,去重(理论上不会有重复)
-        seen: set[str] = set()
-        result: list[dict[str, Any]] = []
-        for j in sorted(all_jobs, key=lambda x: x.get("started_at") or "", reverse=True):
-            jid = j["id"]
-            if jid in seen:
-                continue
-            seen.add(jid)
-            result.append(_summary(j))
-            if len(result) >= limit:
-                break
-        return result
+        return self.recent_snapshot(limit)["jobs"]
+
+    def recent_snapshot(self, limit: int = 20) -> dict[str, Any]:
+        """Read one consistent status snapshot without disk I/O or the writer lock."""
+        active_id, summaries = self._summary_snapshot
+        return {
+            "active_id": active_id,
+            "jobs": [dict(j) for j in summaries[:max(1, limit)]],
+        }
 
     def active_id(self) -> str | None:
         return self._active_id
 
+    def active_status(self) -> JobStatus | None:
+        """仅用于状态展示的内存快照, 不等待持久化锁或读取磁盘。"""
+        job_id = self._active_id
+        active = self._active_jobs.get(job_id) if job_id else None
+        return active.get("status") if active else None
+
     def reap_stale(self, timeout_s: int | None = None) -> None:
-        """回收卡死的 running job。两种判定:
+        """回收卡死的 running job, 以及排队超时的 pending job。判定:
 
         1. 进度停滞(主判定): 距上次 progress() 上报超过阈值秒数。
            慢带宽环境下任务只要仍在分块推进就不会被误杀 —— 这正是旧的
            总时长判定的问题(冷启动全市场拉取 >20min 就被标死,线程却还在写盘)。
         2. 总时长硬上限(兜底): 进度回调持续但永不结束的病态循环。
+        3. pending 排队停滞: 任务卡在「等待其他计算任务完成…」(重任务槽被
+           僵尸线程/长回测占住)超过阈值。旧实现只回收 running, 排队任务
+           无限空转且无任何兜底(用户侧「卡死空转」体感)。排队任务尚未开跑,
+           无数据写入, 取消零代价; 总时长硬上限对 pending 不适用(无 started_at)。
 
         在 /run 和 /jobs/{id} 轮询端点都会调用 — 保证卡死后任意轮询都能自愈,
         无需用户再次手动触发同步。reload 后的孤儿 task(内存里已无 job 记录)
         不在此处理:它们没有 active_id,只能靠 executor 线程自然结束或进程重启。
 
         终止是**协作式**的: 置 cancel flag → 僵尸线程在下一个分块进度回调处
-        抛 JobCancelledError 自行退出(BaseException,不会被分块异常隔离吞掉)。
+        抛 JobCancelledError 自行退出(BaseException,不会被分块异常隔离吞掉);
+        排队中的线程则在 limiter 的 cancel_event 轮询处立即退出。
         线程真正退出前,由所有权 token 保证它误释放不了新任务的执行槽。
 
         timeout_s: 显式覆盖停滞阈值。None 时用 job 自身 create() 时存的 timeout_s,
@@ -389,34 +442,45 @@ class JobStore:
             if not jid:
                 return
             j = self._active_jobs.get(jid)
-            if not j or j.get("status") != "running":
+            status = j.get("status") if j else None
+            if status not in ("pending", "running"):
                 return
             started = j.get("started_at")
             last_alive = j.get("last_progress_at") or started
-            if not started:
+            if not last_alive:
                 return
             # 优先用显式传入, 其次 job 自身阈值, 最后默认值
             effective_timeout = timeout_s if timeout_s is not None else j.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
             timeout_s = effective_timeout
             started_at = started
             last_alive_at = last_alive
+            queued = status == "pending"
         # 时间计算放到锁外(避免 datetime 解析持锁)。
         # started_at 形如 "2026-07-04T12:00:00Z"(start() 用 datetime.utcnow 存)。
         # 两端都用 timezone-aware UTC 比较,避免 naive/aware 混用导致 TypeError。
         try:
-            start_dt = _parse_utc(started_at)
             alive_dt = _parse_utc(last_alive_at)
-            now = datetime.now(start_dt.tzinfo)
+            start_dt = _parse_utc(started_at) if started_at else None
+            now = datetime.now(alive_dt.tzinfo)
             stalled_s = (now - alive_dt).total_seconds()
-            total_s = (now - start_dt).total_seconds()
+            total_s = (now - start_dt).total_seconds() if start_dt else 0.0
         except Exception:  # noqa: BLE001
             return
         if stalled_s > timeout_s:
-            logger.warning(
-                "reap_stale: 强制取消卡死 job %s (进度停滞 %.0fs > 阈值 %ss, 总运行 %.0fs)",
-                jid, stalled_s, timeout_s, total_s)
-            self.terminate(jid, f"超时自动取消: 进度停滞 {int(stalled_s)}s 超过阈值 {timeout_s}s,已请求终止")
-        elif total_s > HARD_JOB_TIMEOUT_S:
+            if queued:
+                logger.warning(
+                    "reap_stale: 取消排队 job %s (等待重任务槽 %.0fs > 阈值 %ss)",
+                    jid, stalled_s, timeout_s)
+                self.terminate(
+                    jid,
+                    f"超时自动取消: 排队等待重任务执行槽 {int(stalled_s)}s 超过阈值 {timeout_s}s — "
+                    "槽位可能被长回测或未正常退出的残留任务占用, 请稍后重试; 若持续出现请重启后端")
+            else:
+                logger.warning(
+                    "reap_stale: 强制取消卡死 job %s (进度停滞 %.0fs > 阈值 %ss, 总运行 %.0fs)",
+                    jid, stalled_s, timeout_s, total_s)
+                self.terminate(jid, f"超时自动取消: 进度停滞 {int(stalled_s)}s 超过阈值 {timeout_s}s,已请求终止")
+        elif not queued and total_s > HARD_JOB_TIMEOUT_S:
             logger.warning(
                 "reap_stale: 强制取消 job %s (总运行 %.0fs 超过硬上限 %ss)",
                 jid, total_s, HARD_JOB_TIMEOUT_S)
@@ -441,6 +505,7 @@ class JobStore:
         with self._lock:
             self._active_jobs.clear()
             self._active_id = None
+            self._summary_snapshot = None, ()
             for f in self._store_dir.glob("*.json"):
                 try:
                     f.unlink()
@@ -478,6 +543,48 @@ def _duration_s(j: dict[str, Any]) -> float | None:
 
 # 进程内单例
 job_store = JobStore()
+
+_Result = TypeVar("_Result")
+
+
+def run_with_capacity(job_id: str, fn: Callable[[], _Result]) -> _Result:
+    """Wait in the worker, keeping the reservation until its real execution ends.
+
+    排队等待有上界(取 job 自身 timeout_s): 重任务槽被长回测或未正常退出的
+    残留线程长期占住时, 有限等待后以可读错误失败, 而不是无限空转
+    (「分钟K同步卡死空转」的排队侧修复; 持有侧由 kline_sync 的 SDK deadline 兜底)。
+    """
+    from app.services.heavy_job_limiter import (
+        HeavyJobCancelledError,
+        HeavyJobLimitTimeoutError,
+        shared_heavy_job_limiter,
+    )
+
+    job_store.progress(job_id, "init", 0, "等待其他计算任务完成…")
+    with _CANCEL_FLAGS_LOCK:
+        cancel_event = _CANCEL_FLAGS.get(job_id)
+    wait_s: float = DEFAULT_JOB_TIMEOUT_S
+    job = job_store.get(job_id)
+    if isinstance(job, dict):
+        configured = job.get("timeout_s")
+        if isinstance(configured, (int, float)) and configured > 0:
+            wait_s = configured
+    try:
+        with shared_heavy_job_limiter.slot("exclusive", timeout=wait_s, cancel_event=cancel_event):
+            if is_cancelled(job_id):
+                raise JobCancelledError(job_id)
+            job_store.start(job_id)
+            return fn()
+    except HeavyJobCancelledError as exc:
+        raise JobCancelledError(job_id) from exc
+    except HeavyJobLimitTimeoutError:
+        # 排队超时: fn 尚未执行, 无数据写入; 直接标记失败并按「已终止」上报,
+        # API 层的 except JobCancelledError 分支无需(也无法)再改写状态。
+        job_store.fail(
+            job_id,
+            f"排队等待重任务执行槽超时({int(wait_s)}s): 槽位可能被长回测或未正常退出的"
+            "残留任务占用, 请稍后重试; 若持续出现请重启后端")
+        raise JobCancelledError(job_id)
 
 
 # ================================================================

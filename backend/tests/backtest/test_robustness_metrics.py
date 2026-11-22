@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date
 
 import numpy as np
+import pytest
 
 from app.backtest.engine import BacktestEngine, SimulationOptions, TradeRecord
 
@@ -108,6 +109,62 @@ def test_mc_drawdown_too_few_trades():
 # ---------------------------------------------------------------
 # 集成: stats 输出新字段
 # ---------------------------------------------------------------
+
+
+def test_account_mc_matches_scalar_block_bootstrap_with_initial_peak():
+    returns = np.array([-.12, -.08, .02, .03, -.04, 0., 0., .10, -.03, .01, .02])
+    equity = 100_000 * np.cumprod(1 + returns)
+    rng = np.random.default_rng(42)
+    starts = rng.integers(0, len(returns), size=(1000, 3))
+    drawdowns = []
+    for row in starts:
+        path = [returns[(start + j) % len(returns)] for start in row for j in range(5)]
+        wealth = peak = 1.
+        worst = 0.
+        for ret in path[:len(returns)]:
+            wealth *= 1 + ret
+            peak = max(peak, wealth)
+            worst = min(worst, wealth / peak - 1)
+        drawdowns.append(worst)
+    got = BacktestEngine._mc_account_drawdown_percentiles(equity, 100_000)
+    assert got['mc_account_maxdd_p50'] == round(float(np.percentile(drawdowns, 50)), 4)
+    assert got['mc_account_maxdd_p95'] == round(float(np.percentile(drawdowns, 5)), 4)
+    assert got['mc_account_method'] == 'daily_circular_block_v1'
+    assert got['mc_account_block_days'] == 5
+    assert got['mc_account_horizon_days'] == len(returns)
+    assert got['mc_account_n_sims'] == 1000
+    assert got == BacktestEngine._mc_account_drawdown_percentiles(equity * 2, 200_000)
+
+
+def test_account_mc_keeps_first_day_loss_and_idle_cash_days():
+    got = BacktestEngine._mc_account_drawdown_percentiles([90_000, 81_000, 72_900], 100_000)
+    assert got['mc_account_maxdd_p50'] == -.271
+    assert got['mc_account_maxdd_p95'] == -.271
+    flat = BacktestEngine._mc_account_drawdown_percentiles([100_000] * 10, 100_000)
+    assert flat['mc_account_maxdd_p95'] == 0.
+    assert flat['mc_account_horizon_days'] == 10
+
+
+@pytest.mark.parametrize('values,capital', [([], 100), ([100, 100], 100),
+    ([100, np.nan, 90], 100), ([100, np.inf, 90], 100),
+    ([100, 0, 90], 100), ([100, -1, 90], 100), ([100] * 3, 0)])
+def test_account_mc_invalid_or_short_path_is_unknown(values, capital):
+    got = BacktestEngine._mc_account_drawdown_percentiles(values, capital)
+    assert got['mc_account_maxdd_p50'] is None
+    assert got['mc_account_maxdd_p95'] is None
+    assert got['mc_account_n_sims'] == 0
+
+
+def test_portfolio_mc_uses_account_curve_preserving_legacy_trade_metric():
+    trades = _trades([-.10, -.10, -.10], [1, 1, 1])
+    curve = [{'value': 100_000., 'exposure': 0.} for _ in range(10)]
+    stats = BacktestEngine._calc_portfolio_stats(curve, trades, 100_000)
+    assert stats['mc_account_maxdd_p95'] == 0.
+    assert stats['mc_maxdd_p95'] == BacktestEngine._mc_drawdown_percentiles(
+        np.array([-.10] * 3))['mc_maxdd_p95']
+    assert stats['mc_maxdd_p95'] < 0.
+    light = BacktestEngine._calc_portfolio_stats(curve, trades, 100_000, include_monte_carlo=False)
+    assert not any(key.startswith('mc_') for key in light)
 
 def _trades(pnls: list[float], durations: list[int]) -> list[TradeRecord]:
     out = []

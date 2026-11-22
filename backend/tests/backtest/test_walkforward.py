@@ -151,15 +151,20 @@ class _FakeEngine:
 
 
 class _FakeService:
-    """run 返回受控 OOS stats, 记录测试区间 + 收到的 params。"""
-    def __init__(self):
+    """run 返回受控 OOS stats, 记录测试区间 + 收到的 params。
+
+    stats 带 n_trades: 每折 OOS 交易数门槛 (fail-closed) 要求桩显式声明交易数,
+    缺省 50 足以通过默认 min_trades_oos=10。
+    """
+    def __init__(self, n_trades=50):
         self.calls = []
         self.engine = _FakeEngine()
+        self.n_trades = n_trades
 
     def run(self, config, progress_cb=None, cancel_event=None):
         self.calls.append({"start": config.start, "end": config.end,
                            "params": dict(config.params or {}), "mode": config.mode})
-        return _FakeResult(stats={"total_return": 0.05, "sortino": 1.0})
+        return _FakeResult(stats={"total_return": 0.05, "sortino": 1.0, "n_trades": self.n_trades})
 
 
 def _wf_cfg(**kw):
@@ -237,6 +242,58 @@ def test_walkforward_reports_degradation():
     assert out["summary"]["avg_is_objective"] == 2.0
     assert out["summary"]["avg_oos_objective"] == 1.0
     assert abs(out["summary"]["degradation"] - 1.0) < 1e-9
+
+
+# ---------------------------------------------------------------
+# 非矩阵后端的闸门: filter_history/内置走通用路径, 其余 fail-closed
+# ---------------------------------------------------------------
+
+class _FakeStrategyDef:
+    def __init__(self, backend):
+        self.execution_backend = backend
+
+
+class _FakeStrategyEngine:
+    def get(self, strategy_id):
+        return _FakeStrategyDef(self._backend)
+
+    def __init__(self, backend):
+        self._backend = backend
+
+
+def test_walkforward_supports_filter_history_strategy():
+    """python_history_legacy (filter_history) 策略走通用路径:
+    不建共享矩阵, 每折在训练区间独立优化、测试区间独立 OOS。"""
+    opt, svc = _FakeOptimizer(), _FakeService()
+    wf = WalkForwardService(opt, svc, strategy_engine=_FakeStrategyEngine("python_history_legacy"))
+    out = wf.run(_wf_cfg())
+
+    assert out["n_folds"] > 0
+    assert out["shared_market_data"] is False
+    assert len(opt.train_ranges) == out["n_folds"]
+    assert len(svc.calls) == out["n_folds"]
+    first_fold = out["folds"][0]
+    assert svc.calls[0]["params"] == first_fold["best_params"]
+    assert svc.calls[0]["start"] >= opt.train_ranges[0][1]
+
+
+def test_walkforward_supports_polars_expr_strategy():
+    """内置 polars_expr 策略同样走通用路径 (与矩阵策略共用同一套折编排)。"""
+    opt, svc = _FakeOptimizer(), _FakeService()
+    wf = WalkForwardService(opt, svc, strategy_engine=_FakeStrategyEngine("polars_expr"))
+    out = wf.run(_wf_cfg())
+    assert out["n_folds"] > 0
+    assert out["shared_market_data"] is False
+
+
+def test_walkforward_rejects_minute_filter_strategy():
+    """minute_filter / composite 无法用日线折编排评估: 保持 fail-closed。"""
+    wf = WalkForwardService(
+        _FakeOptimizer(), _FakeService(),
+        strategy_engine=_FakeStrategyEngine("minute_filter"),
+    )
+    with pytest.raises(ValueError, match=r"步进优化暂仅支持|minute_filter"):
+        wf.run(_wf_cfg())
 
 
 class _NoParamsOptimizer(_FakeOptimizer):
@@ -334,3 +391,66 @@ def test_wf_cancel_by_echoed_key():
         assert res2["ok"] is False
     finally:
         _running_jobs.pop(key, None)
+
+
+# ---------------------------------------------------------------
+# 每折 OOS 交易数门槛 (共享护栏 trades_ok, fail-closed)
+# ---------------------------------------------------------------
+
+def test_walkforward_oos_min_trades_gate_skips_thin_folds():
+    """OOS 段交易数不足的折 → 标记 skipped (原因可见), 不混入复利曲线。"""
+    opt, svc = _FakeOptimizer(), _FakeService(n_trades=3)  # 3 < 默认 10
+    wf = WalkForwardService(opt, svc, strategy_engine=None)
+    out = wf.run(_wf_cfg())
+
+    assert out["n_planned_folds"] > 0
+    assert out["n_folds"] == 0                    # 全部折被门槛拦下
+    assert out["n_skipped"] == out["n_planned_folds"]
+    assert all("OOS 交易数不足" in s["reason"] for s in out["skipped"])
+    assert out["skipped"][0]["best_params"] is not None  # 仍可诊断用了什么参数
+
+
+def test_walkforward_oos_min_trades_gate_disabled_when_zero():
+    """min_trades_oos<=0 关闭门槛: 少交易折恢复计入 (向后兼容开关)。"""
+    opt, svc = _FakeOptimizer(), _FakeService(n_trades=3)
+    wf = WalkForwardService(opt, svc, strategy_engine=None)
+    out = wf.run(_wf_cfg(min_trades_oos=0))
+
+    assert out["n_folds"] == out["n_planned_folds"]
+    assert out["n_skipped"] == 0
+
+
+def test_walkforward_oos_missing_n_trades_fails_closed():
+    """stats 缺 n_trades 字段按不达标处理 (宁可误杀不让无交易折伪装有效)。"""
+    opt, svc = _FakeOptimizer(), _FakeService(n_trades=3)
+    orig_run = svc.run
+
+    def run_without_trades(config, **kw):
+        res = orig_run(config, **kw)
+        res.stats.pop("n_trades")
+        return res
+
+    svc.run = run_without_trades
+    wf = WalkForwardService(opt, svc, strategy_engine=None)
+    out = wf.run(_wf_cfg())
+
+    assert out["n_folds"] == 0
+    assert all("交易数不足 (0 <" in s["reason"] for s in out["skipped"])
+
+
+def test_walkforward_stream_rejects_degenerate_objective():
+    """P4 白名单全面生效: 退化目标 (win_rate) 在 walkforward 端点层即被 400 拒绝。"""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.api.backtest import walkforward_stream
+
+    class _Req:
+        def __init__(self):
+            self.app = None
+
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(walkforward_stream(_Req(), strategy_id="s", param_grid='{"p":[1]}', objective="win_rate"))
+    assert ei.value.status_code == 400
+    assert "退化" in str(ei.value.detail) or "不适合" in str(ei.value.detail)

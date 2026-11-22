@@ -24,26 +24,19 @@ import polars as pl
 from app.market_time import cn_today
 from app.strategy import config as _strategy_config
 from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
+from app.strategy.custom_signals import signal_names as _custom_signal_names
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
 from app.strategy.monitor_rules import date_rule_in_window
 
 logger = logging.getLogger(__name__)
 
-# 信号 / 字段中文名映射 — 与前端 lib/signals.ts 对齐, 用于告警 message / 推送文案。
-# signal_* 为内置原子信号, 其余为技术指标/行情字段。
+# 字段中文名映射 — 与前端 lib/signals.ts 对齐, 用于告警 message / 推送文案。
+# 信号布尔列 (csg_/csgi_/迁移的 signal_*) 的中文名由 _signal_label 查用户定义,
+# 此处只保留技术指标/行情字段与盘中信号。
 _SIGNAL_CN: dict[str, str] = {
-    # 内置信号
-    "signal_ma_golden_5_20": "MA5上穿MA20", "signal_ma_dead_5_20": "MA5下穿MA20",
-    "signal_ma_golden_20_60": "MA20上穿MA60", "signal_macd_golden": "MACD金叉",
-    "signal_macd_dead": "MACD死叉", "signal_ma20_breakout": "突破MA20",
-    "signal_ma20_breakdown": "跌破MA20", "signal_ma5_breakout": "突破MA5",
-    "signal_ma5_breakdown": "跌破MA5", "signal_ma10_breakout": "突破MA10",
-    "signal_ma10_breakdown": "跌破MA10", "signal_n_day_high": "60日新高",
-    "signal_n_day_low": "60日新低", "signal_boll_breakout_upper": "突破布林上轨",
-    "signal_boll_breakdown_lower": "跌破布林下轨", "signal_volume_surge": "放量",
-    "signal_limit_up": "涨停", "signal_limit_down": "跌停",
-    "signal_limit_down_recovery": "跌停翘板", "signal_broken_limit_up": "炸板",
     **INTRADAY_SIGNAL_LABELS,
+    # 涨跌停判定价 (运行时列)
+    "limit_up_price": "涨停判定价", "limit_down_price": "跌停判定价",
     # 行情字段
     "close": "收盘价", "open": "开盘价", "high": "最高价", "low": "最低价",
     "change_pct": "涨跌幅", "change_amount": "涨跌额", "amplitude": "振幅",
@@ -339,10 +332,10 @@ class MonitorRuleEngine:
         self._date_eval_day: str | None = None
         self._date_eval_rules_version = -1
         self._rules_version = 0  # set/add/remove/clear 递增, 供 date 缓存失效
-        self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
+        self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑策略
         # symbol → 股票名 (enriched DataFrame 已 drop name 列, 触发时从此映射回填)
         self._name_map: dict[str, str] = {}
-        # 策略选股池状态: (rule_id, strategy_id, asset_type) → 上期选股符号集合
+        # 策略池状态: (rule_id, strategy_id, asset_type) → 上期入选符号集合
         self._strategy_pools: dict[tuple[str, str, str], set[str]] = {}
         self._watchlist_candidates: list[dict] = []
         # 策略信号状态: (rule_id, strategy_id, asset_type, event_type) → (K线日期, 命中集合)
@@ -352,13 +345,13 @@ class MonitorRuleEngine:
         # 数据目录 (用于加载策略 overrides)
         self._data_dir = None
         # 历史窗口加载器: (target_date, lookback_days) → 多日 enriched DataFrame。
-        # 用于声明 filter_history 的策略 (如反包), 实时监控时拼历史窗口 + 今日行情跑选股。
+        # 用于声明 filter_history 的策略 (如反包), 实时监控时拼历史窗口 + 今日行情跑策略。
         # 为 None 时, filter_history 策略仍会被跳过 (保持旧行为, 不破坏无历史场景)。
         self._history_loader: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
         # ETF 版历史窗口加载器 (asset_type=etf 的规则用)。为 None 时 ETF filter_history 策略跳过。
         self._history_loader_etf: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
         self._active_matrix_snapshots: dict[str, Any] = {}
-        # 本轮 evaluate() 产出的策略选股结果: strategy_id → {rows, total, as_of}
+        # 本轮 evaluate() 产出的策略结果: strategy_id → {rows, total, as_of}
         # 供策略页实时回显复用 (/api/screener/cached 端点直接读取, 避免重跑)。
         # 注意: 始终是「完整」的 dict —— evaluate 重算时先写到 _building_strategy_results,
         # 算完后整体替换此属性, 保证 /cached 并发读取永远拿到完整结果, 不会读到空中间态。
@@ -375,18 +368,30 @@ class MonitorRuleEngine:
         self._abnormal_condition_state: dict[tuple[str, str], bool] = {}
 
     def set_strategy_engine(self, engine) -> None:
-        """注入 StrategyEngine, type=strategy 规则据此跑选股。"""
+        """注入 StrategyEngine, type=strategy 规则据此跑策略。"""
         self._strategy_engine = engine
 
     def set_data_dir(self, data_dir) -> None:
         """注入数据目录, 用于加载策略的用户覆盖配置。"""
         self._data_dir = data_dir
 
+    def _signal_label(self, field: str) -> str:
+        """信号/字段 → 中文名: 信号列 (csg_/csgi_/signal_*) 查用户定义, 其余查 _SIGNAL_CN。
+
+        信号命名从 data_dir 的 custom_signals 定义加载 (指纹缓存, 含迁移自
+        内置、携带显式 signal_* 列名的定义); 未注入 data_dir 或查不到时回退原始列名。
+        """
+        if field.startswith(("csg_", "csgi_", "signal_")) and self._data_dir is not None:
+            name = _custom_signal_names(self._data_dir).get(field)
+            if name:
+                return name
+        return _signal_cn_name(field)
+
     def set_sector_monitor_service(self, service) -> None:
         self._sector_monitor_service = service
 
     def invalidate_strategy_state(self) -> None:
-        """策略注册表变更后清除选股池、结果和矩阵快照。"""
+        """策略注册表变更后清除策略池、结果和矩阵快照。"""
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
@@ -539,12 +544,24 @@ class MonitorRuleEngine:
         return len(self._rules)
 
     def latest_strategy_results(self) -> dict[str, dict]:
-        """返回本轮 evaluate() 产出的策略选股结果 (strategy_id → {rows, total, as_of})。
+        """返回本轮 evaluate() 产出的策略结果 (strategy_id → {rows, total, as_of})。
 
         供策略页实时回显复用: /api/screener/cached 端点直接读取此内存结果,
         避免对被监控的策略重跑第二遍。无 type=strategy 规则时返回空 dict。
         """
+        if self._data_dir is not None:
+            from app.services.daily_health import DailyIntegrityError, assert_usable
+            try:
+                assert_usable(self._data_dir)
+            except DailyIntegrityError:
+                return {}
         return self._latest_strategy_results
+
+    def invalidate_daily_asset(self, asset_type: str) -> None:
+        """历史价格修正后失效计算快照; 保留告警去重和入选池, 避免重复通知。"""
+        self._active_matrix_snapshots.pop(asset_type, None)
+        if asset_type == "stock":
+            self._latest_strategy_results = {}
 
     def consume_strategy_result_updates(self) -> bool:
         """返回并清除本轮成功写入的股票策略实时结果标记。"""
@@ -609,6 +626,13 @@ class MonitorRuleEngine:
         if not self._rules or df.is_empty():
             return []
 
+        if self._data_dir is not None:
+            from app.services.daily_health import DailyIntegrityError, assert_usable
+            try:
+                assert_usable(self._data_dir, asset_type)
+            except DailyIntegrityError:
+                return []
+
         now = time.time()
         events: list[dict] = []
         # 原子化: reset 轮 (股票轮) 时先把本轮结果写到临时容器, 算完后一次性替换
@@ -656,13 +680,16 @@ class MonitorRuleEngine:
                     params_map=params_map,
                     overrides_map=overrides_map,
                 )
+                from app.services.daily_health import revision
                 from app.strategy.engine import StrategyDataContext
+                data_revision = revision(self._data_dir, asset_type) if self._data_dir is not None else None
                 context = StrategyDataContext(
                     asset_type=asset_type,
                     timeframe="1d",
                     as_of=cn_today(),
                     current=df,
                     cache_key=f"monitor:{asset_type}",
+                    data_generation=data_revision,
                 )
                 try:
                     snapshot = self._strategy_engine.prepare_realtime_matrix(
@@ -683,6 +710,7 @@ class MonitorRuleEngine:
                             current=df,
                             history=history,
                             cache_key=f"monitor:{asset_type}",
+                            data_generation=data_revision,
                         ),
                         matrix_ids,
                         params_map=params_map,
@@ -1084,7 +1112,7 @@ class MonitorRuleEngine:
 
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
-            # 策略类型: 跑策略选股, 同时产出所选的信号和结果池变更事件
+            # 策略类型: 跑策略, 同时产出所选的信号和结果池变更事件
             hit_rows = self._match_strategy(scoped, rule)
         elif rtype == "ladder":
             # 连板梯队封单监控: 独立处理 (需带预警封单值, 走专属 message)
@@ -1126,6 +1154,7 @@ class MonitorRuleEngine:
                     rule, ev_type=ev_type, sym=sym, name=resolved_name,
                     pct=pct, price=price,
                     conditions=list(rule.get("conditions", [])) if rule.get("type") != "strategy" else None,
+                    signals=hit_sigs,
                 )
 
             ev = {
@@ -1143,7 +1172,7 @@ class MonitorRuleEngine:
                 "signals": hit_sigs,
                 "severity": severity,
                 # 触发条件快照 (signal/price/market 类型): 用于触发记录展示
-                # 「命中了什么条件」。strategy 类型靠策略选股池 diff, 不写条件。
+                # 「命中了什么条件」。strategy 类型靠策略池 diff, 不写条件。
                 "conditions": list(rule.get("conditions", [])) if rtype != "strategy" else [],
                 "logic": rule.get("logic", "and") if rtype != "strategy" else "and",
             }
@@ -1203,11 +1232,14 @@ class MonitorRuleEngine:
         try:
             s = self._strategy_engine.get(sid)
         except Exception:
+            # 规则引用了不存在的策略(内置策略已下线): 静默空转最容易骗人,
+            # 至少留一条 debug 线索, 避免"看起来在监控其实什么都没跑" (#490)
+            logger.debug("monitor: 策略 %s 不存在, 规则 %s 本轮跳过", sid, rule.get("id"))
             return []
         if s is None:
             return []
 
-        # 运行策略选股: 复用当前 enriched DataFrame 跳过数据加载
+        # 运行策略: 复用当前 enriched DataFrame 跳过数据加载
         overrides = {}
         if self._data_dir:
             try:
@@ -1251,9 +1283,21 @@ class MonitorRuleEngine:
                 [sid],
                 overrides_map={sid: overrides},
             )
-        if getattr(s, "execution_backend", "polars_expr") not in {"composite", "matrix_native"} and (
-            s.filter_history_fn or required_history_bars > 1
-        ):
+        backend = getattr(s, "execution_backend", "polars_expr")
+        # 叠加条件带「前 N 日」偏移时同样需要历史窗口: polars 侧已由
+        # required_history_bars 抬升 (>1); 矩阵策略的信号走实时矩阵快照, 平时
+        # 不加载历史, 仅此情形补窗口供 overlay 在历史行上求值。
+        overlay_days = 0
+        overlay_conditions = (overrides or {}).get("overlay_filter")
+        if overlay_conditions:
+            from app.strategy import custom_signals as _custom_signals
+            overlay_days = _custom_signals.overlay_max_days(overlay_conditions)
+        needs_history = (
+            (backend not in {"composite", "matrix_native"}
+             and (s.filter_history_fn or required_history_bars > 1))
+            or (backend == "matrix_native" and overlay_days > 0)
+        )
+        if needs_history:
             history_loader = self._history_loader_for(rule)
             if history_loader is None:
                 logger.debug("策略 %s 需要历史数据但未注入 history_loader (asset_type=%s), 跳过实时监控",
@@ -1262,6 +1306,9 @@ class MonitorRuleEngine:
             try:
                 today = cn_today()
                 lookback = max(1, getattr(s, "lookback_days", 1), required_history_bars)
+                if backend == "matrix_native":
+                    # 矩阵补窗口只为 overlay 偏移求值, 按回看深度取窗口即可
+                    lookback = max(1, overlay_days + 1)
                 hist_df = history_loader(today, lookback)
                 if hist_df is None or hist_df.is_empty():
                     logger.debug("策略 %s 历史数据为空, 跳过本轮实时监控", sid)
@@ -1271,12 +1318,14 @@ class MonitorRuleEngine:
                 # 否则 today 行重复会污染 filter_history 的 .over("symbol") 窗口判定。
                 if "date" in hist_df.columns:
                     hist_df = hist_df.filter(pl.col("date") != today)
-                # 拼接历史窗口 + 今日实时行情 (filter_history 用 .over("symbol") 窗口, 多日天然可用)
+                # 拼接历史窗口 + 今日实时行情 (filter_history / overlay 偏移都用
+                # .over("symbol") 窗口, 多日天然可用)
                 current_context = StrategyDataContext(
                     asset_type=at,
                     timeframe="1d",
                     as_of=today,
                     current=df,
+                    market=current_context.market,
                     history=pl.concat(
                         [hist_df, df], how="diagonal_relaxed"
                     ),
@@ -1295,10 +1344,10 @@ class MonitorRuleEngine:
                 params=dict(overrides.get("params") or {}),
             )
         except Exception as e:
-            logger.warning("策略 %s 选股执行失败: %s", sid, e)
+            logger.warning("策略 %s 执行失败: %s", sid, e)
             return []
 
-        # 记录本轮完整选股结果 (供策略页实时回显: /cached 端点直接读取, 不落盘)。
+        # 记录本轮完整策略结果 (供策略页实时回显: /cached 端点直接读取, 不落盘)。
         # 与下面的事件无关, 无论是否产生通知结果都用于策略页实时回显。
         # 策略结果缓存仅用于股票策略页 /cached 回显; ETF 策略页走实时单跑, 不写入。
         # 写到 evaluate 提供的临时容器 (_building_strategy_results), 算完后整体替换,
@@ -1389,8 +1438,8 @@ class MonitorRuleEngine:
         action_labels = {
             "buy_signal": "买入信号",
             "sell_signal": "卖出信号",
-            "pool_entry": "进入选股结果",
-            "pool_exit": "移出选股结果",
+            "pool_entry": "进入策略结果",
+            "pool_exit": "移出策略结果",
         }
         for event_type, symbols in changes.items():
             if event_type not in notify_events or not symbols:
@@ -1695,11 +1744,12 @@ class MonitorRuleEngine:
 
     def _default_message(self, rule: dict, ev_type: str = "", sym: str = "",
                           name: str = "", pct: Any = None, price: Any = None,
-                          conditions: list[dict] | None = None) -> str:
+                          conditions: list[dict] | None = None,
+                          signals: list[str] | None = None) -> str:
         """生成默认 message。
 
         - strategy: 按变更方向生成 (进入/移出 + 涨跌幅)
-        - signal/price/market: 条件摘要 + 现价 + 涨跌幅 (避免笼统的「信号触发」)
+        - signal/price/market: 命中信号 (signals 非空时) 或条件摘要 + 现价 + 涨跌幅
         """
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
@@ -1719,10 +1769,10 @@ class MonitorRuleEngine:
             action = {
                 "buy_signal": "买入信号",
                 "sell_signal": "卖出信号",
-                "pool_entry": "进入选股结果",
-                "pool_exit": "移出选股结果",
-                "new_entry": "进入选股结果",
-                "dropped": "移出选股结果",
+                "pool_entry": "进入策略结果",
+                "pool_exit": "移出策略结果",
+                "new_entry": "进入策略结果",
+                "dropped": "移出策略结果",
             }.get(ev_type)
             if action:
                 pct_text = ""
@@ -1732,32 +1782,52 @@ class MonitorRuleEngine:
                 return f"策略「{sname}」{action} {name}{pct_text}"
             return f"策略「{sname}」事件"
 
-        # signal / price / market: 条件摘要 + 现价 + 涨跌幅
-        # 条件摘要: 把 conditions (truth/比较) 拼成可读串, 如 "MA20金叉 且 量比>2"
-        cond_text = self._format_conditions_text(rule, conditions)
+        # signal / price / market: 命中信号 + 现价 + 涨跌幅
+        # 有实际命中信号 (op=truth 且为真的子集) 时以命中信号开头 — 全量规则
+        # 条件仍保留在 event.conditions 供前端展示, message 不再复读 (OR 规则
+        # 条件多时全文复读会淹没真正触发的条件)。
         tail = format_alert_quote(price, pct)
+        if signals:
+            hit_text = "命中 " + "、".join(self._signal_label(s) for s in signals)
+            # AND 规则: 比较条件同样全部满足, 补进 message 保持信息完整。
+            # OR 规则无法判定哪些比较条件为真 (hit_sigs 只收集 truth 信号), 不补。
+            if rule.get("logic", "and") == "and":
+                comp = [c for c in (conditions if conditions is not None else rule.get("conditions", []))
+                        if c.get("op") != "truth"]
+                if comp:
+                    comp_text = self._format_conditions_text(rule, comp, resolver=self._signal_label)
+                    if comp_text:
+                        hit_text = f"{hit_text} 且 {comp_text}"
+            return f"{hit_text} · {tail}" if tail else hit_text
+        # 无 truth 命中 (纯比较条件规则): 回退条件摘要
+        # 条件摘要: 把 conditions (truth/比较) 拼成可读串, 如 "MA20金叉 且 量比>2"
+        cond_text = self._format_conditions_text(rule, conditions, resolver=self._signal_label)
         if cond_text and tail:
             return f"{cond_text} · {tail}"
         return cond_text or tail or "监控触发"
 
     @staticmethod
-    def _format_conditions_text(rule: dict, conditions: list[dict] | None) -> str:
+    def _format_conditions_text(rule: dict, conditions: list[dict] | None,
+                                 resolver: Callable[[str], str] | None = None) -> str:
         """把 rule.conditions 拼成可读文本 (用于 message / 推送)。
 
         op=truth: 直接用信号中文名 (如 "MA20金叉")
         op=比较: 字段中文名 + 操作符 + 值 (如 "涨跌幅≥5")
         logic: and → "且", or → "或"
+        resolver: 自定义信号名解析器 (默认 _signal_cn_name); 引擎内传
+            self._signal_label 以解析 csg_/csgi_ 用户命名, 外部 (lots.py) 不传。
         """
         conds = conditions if conditions is not None else list(rule.get("conditions", []))
         if not conds:
             return ""
         logic_word = "且" if rule.get("logic", "and") == "and" else "或"
+        label_of = resolver or _signal_cn_name
         parts: list[str] = []
         for c in conds:
             field = c.get("field", "")
             op = c.get("op", "truth")
             value = c.get("value")
-            label = _signal_cn_name(field) or field
+            label = label_of(field) or field
             if op == "truth":
                 parts.append(label)
             else:

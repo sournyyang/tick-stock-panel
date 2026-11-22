@@ -1,0 +1,280 @@
+"""TdxQuant 候选 Key 探测 — 子进程拉起方式与 worker 行为。
+
+回归背景: 打包版 sys.executable 是应用本身, `-c` 被 PyInstaller bootloader
+无视 → 探测子进程重启整个桌面应用而非执行探测 (Key 永远验证失败)。
+拉起方式因此分叉: dev 用 `python -c`, frozen 用「裸重执行自身 + 哨兵」
+(desktop.main 最先分发到 run_worker), 两种入口共用同一份 worker 实现。
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+import app.desktop as desktop
+from app.plugins.tdxquant import probe
+
+
+class _FakeProc:
+    def __init__(self, stdout: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
+
+
+def _capture_spawn(monkeypatch, frozen: bool) -> dict:
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        seen["env"] = dict(kwargs["env"])
+        return _FakeProc(stdout=json.dumps({"ok": True, "reason": ""}))
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    if frozen:
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+    else:
+        monkeypatch.delattr(sys, "frozen", raising=False)
+    return seen
+
+
+def test_run_dev_spawns_python_dash_c(monkeypatch):
+    seen = _capture_spawn(monkeypatch, frozen=False)
+    ok, _ = probe.run("TDX-KEY")
+    assert ok
+    assert seen["cmd"][:2] == [sys.executable, "-c"]
+    assert "run_worker" in seen["cmd"][2]
+    # dev 路径不设哨兵 — 那是 frozen 重执行自身的分发机制
+    assert probe._PROBE_ENV_WORKER not in seen["env"]
+
+
+def test_run_frozen_reexecs_self_with_sentinel(monkeypatch):
+    seen = _capture_spawn(monkeypatch, frozen=True)
+    ok, _ = probe.run("TDX-KEY")
+    assert ok
+    # 不带 -c: bootloader 会无视它并重启整个桌面应用
+    assert seen["cmd"] == [sys.executable]
+    assert seen["env"][probe._PROBE_ENV_WORKER] == "1"
+    assert seen["env"][probe._PROBE_ENV_KEY] == "TDX-KEY"
+
+
+@pytest.mark.parametrize("reachable", [True, False])
+def test_frozen_probe_returns_result_without_console(monkeypatch, reachable):
+    """Windows windowed 的 stdout/stderr 为 None, 仍须回传成功或失败原因。"""
+    import tdxaidata.tdxaidata as tdxmod
+    from tdxaidata import tqs
+
+    class Native:
+        def get_market_snapshot_batch(self, *args):
+            if not reachable:
+                raise RuntimeError("offline")
+            return {"price": 1}
+
+        def get_his_dats(self, *args):
+            return {"Date": ["2026-01-02"]}
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr("app.plugins.tdxquant.client.materialize_lib", lambda key, tmp: tmp / "fake.dll")
+    monkeypatch.setattr(tdxmod._NativeTdxAiData, "get_instance", classmethod(lambda cls: Native()))
+    monkeypatch.setattr(tqs, "_clean", lambda raw: raw)
+    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    monkeypatch.setattr(desktop, "_setup_logging", lambda: None)
+
+    def fake_run(cmd, **kwargs):
+        with monkeypatch.context() as worker:
+            for name, value in kwargs["env"].items():
+                worker.setenv(name, value)
+            worker.setattr(sys, "stdout", None)
+            worker.setattr(sys, "stderr", None)
+            return _FakeProc(returncode=desktop.main())
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    ok, message = probe.run("TDX-SMOKE-KEY")
+    assert ok is reachable
+    assert ("连通正常" if reachable else "网络不可达") in message
+
+
+def test_probe_redirects_stdin_without_console(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        # 模拟 Windows 无控制台时继承失效的标准输入句柄。
+        if kwargs.get("stdin") != probe.subprocess.DEVNULL:
+            raise OSError(6, "The handle is invalid")
+        return _FakeProc(stdout='{"ok": true}')
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    assert probe.run("TDX-SMOKE-KEY")[0] is True
+
+
+@pytest.mark.parametrize("content", ['{"ok": "yes"}', '{"ok":', '[]'])
+def test_probe_rejects_invalid_result_file(monkeypatch, content):
+    def fake_run(cmd, **kwargs):
+        root = Path(kwargs["env"][probe._PROBE_ENV_TMP])
+        (root / "result.json").write_text(content, encoding="utf-8")
+        (root / "progress.json").write_text('{"stage": "load_dll"}', encoding="utf-8")
+        return _FakeProc()
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    ok, message = probe.run("TDX-SMOKE-KEY")
+    assert ok is False
+    assert "load_dll" in message and "exit=0" in message
+
+
+def test_probe_rejects_success_result_after_worker_crash(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        root = Path(kwargs["env"][probe._PROBE_ENV_TMP])
+        (root / "result.json").write_text('{"ok": true}', encoding="utf-8")
+        return _FakeProc(stdout='{"ok": true}', returncode=1)
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    ok, message = probe.run("TDX-SMOKE-KEY")
+    assert ok is False
+    assert "exit=1" in message
+
+
+def test_probe_timeout_reports_stage_before_browser_deadline(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        assert 45 < kwargs["timeout"] < 75
+        root = Path(kwargs["env"][probe._PROBE_ENV_TMP])
+        (root / "progress.json").write_text('{"stage": "load_dll"}', encoding="utf-8")
+        raise probe.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    ok, message = probe.run("TDX-SMOKE-KEY")
+    assert ok is False
+    assert "探测超时" in message and "load_dll" in message
+
+
+def test_probe_reports_unavailable_worker(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        raise OSError("executable unavailable")
+
+    monkeypatch.setattr(probe.subprocess, "run", fake_run)
+    ok, message = probe.run("TDX-SMOKE-KEY")
+    assert ok is False
+    assert "进程启动失败" in message
+
+
+def _patch_worker_env(monkeypatch, tmp_path):
+    monkeypatch.setenv(probe._PROBE_ENV_KEY, "TDX-KEY")
+    monkeypatch.setenv(probe._PROBE_ENV_TMP, str(tmp_path))
+    monkeypatch.setenv(probe._PROBE_ENV_WORKER, "1")
+    monkeypatch.setattr(
+        "app.plugins.tdxquant.client.materialize_lib",
+        lambda key, tmp, **kw: tmp_path / "fake_lib.so",
+    )
+    monkeypatch.setattr(probe.time, "sleep", lambda s: None)
+
+
+def test_run_worker_unreachable_reports_json(monkeypatch, tmp_path, capsys):
+    _patch_worker_env(monkeypatch, tmp_path)
+
+    class _FakeNative:
+        def get_market_snapshot_batch(self, *a, **kw):
+            raise RuntimeError("down")
+
+    import tdxaidata.tdxaidata as tdxmod
+
+    monkeypatch.setattr(
+        tdxmod._NativeTdxAiData, "get_instance", classmethod(lambda cls: _FakeNative())
+    )
+
+    assert probe.run_worker() == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == payload
+    assert payload["ok"] is False
+    assert "连接失败" in payload["reason"]
+    progress = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+    assert progress["stage"] == "done" and progress["ok"] is False
+
+
+def test_run_worker_ok_path(monkeypatch, tmp_path, capsys):
+    _patch_worker_env(monkeypatch, tmp_path)
+
+    class _FakeNative:
+        def get_market_snapshot_batch(self, *a, **kw):
+            return {"price": 1.0}
+
+        def get_his_dats(self, *a, **kw):
+            return "raw"
+
+    import tdxaidata.tdxaidata as tdxmod
+    from tdxaidata import tqs
+
+    monkeypatch.setattr(
+        tdxmod._NativeTdxAiData, "get_instance", classmethod(lambda cls: _FakeNative())
+    )
+    monkeypatch.setattr(tqs, "_clean", lambda raw: {"Date": ["2026-01-02"]})
+
+    assert probe.run_worker() == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == payload
+    assert payload["ok"] is True
+    assert payload["aux"] == "his_ok"
+
+
+def test_run_worker_exception_reports_stage(monkeypatch, tmp_path, capsys):
+    _patch_worker_env(monkeypatch, tmp_path)
+
+    def _boom(key, tmp, **kw):
+        raise RuntimeError("materialize failed")
+
+    monkeypatch.setattr("app.plugins.tdxquant.client.materialize_lib", _boom)
+
+    assert probe.run_worker() == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == payload
+    assert payload["ok"] is False
+    assert "materialize failed" in payload["reason"]
+    progress = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+    assert progress["stage"] == "exception"
+
+
+def test_run_worker_rejects_explicit_auth_denial_after_reachable_snapshot(monkeypatch, tmp_path, capsys):
+    _patch_worker_env(monkeypatch, tmp_path)
+    import tdxaidata.tdxaidata as tdxmod
+    from tdxaidata import tqs
+
+    class Native:
+        def get_market_snapshot_batch(self, *args):
+            return {"price": 1}
+
+        def get_his_dats(self, *args):
+            return json.dumps({"ErrorId": -1, "Error": "TokenKey Insufficient Or Key Error"})
+
+    monkeypatch.setattr(tdxmod._NativeTdxAiData, "get_instance", classmethod(lambda cls: Native()))
+    monkeypatch.setattr(tqs, "_clean", lambda raw: raw if isinstance(raw, dict) else None)
+    assert probe.run_worker() == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == payload
+    assert payload["ok"] is False
+    assert "凭据" in payload["reason"] or "额度" in payload["reason"]
+
+
+def test_desktop_main_dispatches_probe_worker(monkeypatch):
+    monkeypatch.setenv("TDX_PROBE_WORKER", "1")
+    monkeypatch.setattr(desktop, "_guard_streams", lambda: None)
+    monkeypatch.setattr(desktop, "_setup_logging", lambda: None)
+    monkeypatch.setattr("app.plugins.tdxquant.probe.run_worker", lambda: 7)
+
+    def _boom(*a, **kw):
+        raise AssertionError("worker 模式不应触碰桌面启动流程")
+
+    monkeypatch.setattr(desktop, "_ensure_data_dir_writable", _boom)
+    monkeypatch.setattr(desktop, "_acquire_single_instance", _boom)
+    assert desktop.main() == 7
+
+
+def test_desktop_main_without_sentinel_starts_normally(monkeypatch):
+    monkeypatch.delenv("TDX_PROBE_WORKER", raising=False)
+    monkeypatch.setattr(desktop, "_guard_streams", lambda: None)
+    monkeypatch.setattr(desktop, "_setup_logging", lambda: None)
+    monkeypatch.setattr(desktop, "_ensure_data_dir_writable", lambda: None)
+    # 单实例未抢到 → 正常退出, 不触碰后端/窗口
+    monkeypatch.setattr(desktop, "_acquire_single_instance", lambda: False)
+    assert desktop.main() == 0
+
+
+def test_pid_alive_posix_current_process():
+    assert desktop._pid_alive(os.getpid()) is True

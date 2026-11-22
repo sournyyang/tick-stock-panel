@@ -6,7 +6,7 @@ backtests stay data-source agnostic.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
@@ -16,6 +16,10 @@ import polars as pl
 AssetType = Literal["stock", "index", "etf"]
 
 
+class ProviderRequestError(RuntimeError):
+    """数据源明确请求失败; 调用方须标记失败, 不得转换成成功的空数据。"""
+
+
 @dataclass(frozen=True)
 class ProviderCapabilities:
     instruments: bool = False
@@ -23,7 +27,23 @@ class ProviderCapabilities:
     adj_factor: bool = False
     minute: bool = False
     realtime: bool = False
+    depth5: bool = False
     financial: bool = False
+
+
+class StreamingMinuteProvider(Protocol):
+    """可选的分钟流式能力;请求分批/分页/限频与有界输出由源负责。"""
+
+    def iter_minute(
+        self, symbols: list[str], start_time: datetime | None, end_time: datetime | None,
+        asset_type: AssetType = "stock", freq: str = "1m",
+        on_chunk_done: Callable[[int, int], None] | None = None,
+    ) -> Iterator[pl.DataFrame]:
+        """逐批返回标准分钟帧;正常空批可用,请求失败须明确抛错。
+
+        回调仍为(cur,total)两参,允许重复进度作为限流等待心跳;
+        回调异常必须透传以支持取消。调用者提前结束会关闭迭代器。
+        """
 
 
 class MarketDataProvider(Protocol):
@@ -73,3 +93,6 @@ class MarketDataProvider(Protocol):
         symbols: list[str] | None = None,
     ) -> pl.DataFrame:
         """Return normalized realtime quotes. Implementations may return empty."""
+
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """Return five-level order books keyed by symbol."""

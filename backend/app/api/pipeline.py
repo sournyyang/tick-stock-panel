@@ -4,17 +4,19 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as _cf
 import logging
+from datetime import date
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.api.data import invalidate_storage_cache
 from app.jobs import daily_pipeline
 from app.services.pipeline_jobs import (
     JobCancelledError,
     job_store,
     release_run_slot,
+    run_with_capacity,
     try_acquire_run_slot,
 )
-from app.api.data import invalidate_storage_cache
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
 _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="long-task")
@@ -24,16 +26,69 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
 
+@router.get("/minute/status")
+def minute_status(request: Request, trade_date: date | None = None, include_symbols: bool = False) -> dict:
+    """当天分钟检查点及量额覆盖率；可展开逐股失败原因。"""
+    from app.market_time import cn_today
+    from app.services import postmarket_minute
+
+    return postmarket_minute.session_status(
+        request.app.state.repo.store.data_dir, trade_date or cn_today(),
+        include_symbols=include_symbols,
+    )
+
+
+@router.post("/minute/run")
+async def run_minute_now(request: Request) -> dict:
+    """触发当天盘后分钟采集，与其他数据任务共享单飞锁。"""
+    from app.services import postmarket_minute
+
+    reason = postmarket_minute.gate_reason()
+    if reason:
+        messages = {
+            "disabled": "请先开启分钟自动同步",
+            "before_close": "当天分钟采集从北京时间15:45开始",
+            "non_trading_day": "今天不是交易日",
+            "calendar_unknown": "暂时无法确认今天是否交易日，请稍后重试",
+        }
+        raise HTTPException(status_code=400, detail=messages[reason])
+    return await _submit_job(
+        request.app.state.repo, None,
+        lambda progress: (lambda: daily_pipeline.run_postmarket_minute(
+            request.app.state.repo, request.app.state.capabilities, on_progress=progress,
+        )),
+    )
+
+
 @router.post("/run")
 async def run_now(request: Request) -> dict:
-    """异步触发盘后管道,立即返回 job_id。客户端轮询 /jobs/{id} 拿进度。
+    """异步触发盘后管道,立即返回 job_id。客户端轮询 /jobs/{id} 拿进度。"""
+    return await trigger_pipeline_job(
+        request.app.state.repo,
+        request.app.state.capabilities,
+        getattr(request.app.state, "quote_service", None),
+    )
+
+
+async def trigger_pipeline_job(repo, capset, quote_service=None) -> dict:
+    """触发盘后管道后台任务(HTTP 端点与 AI 助手共用同一条触发路径)。
 
     若已有任务在跑,**返回该任务 id 而不是开新任务**(防止并发拉数据撞限流)。
     卡死判定按「进度停滞」而非总时长(慢带宽下长任务不会被误杀), 见 reap_stale。
     """
-    repo = request.app.state.repo
-    capset = request.app.state.capabilities
+    return await _submit_job(
+        repo, quote_service,
+        lambda progress: (lambda: daily_pipeline.run_now(repo, capset, on_progress=progress)),
+    )
 
+
+async def _submit_job(repo, quote_service, make_run) -> dict:
+    """任务化执行公共机制: 单飞 create → 重任务槽 → 行情暂停 → 缓存失效。
+
+    make_run(progress) 返回实际执行闭包(阻塞 IO + CPU, 在 executor 里跑)。
+    盘后管道与独立除权因子同步共用 —— 两者写同一批 parquet, 必须共享
+    单飞与重任务槽防并发覆写。
+    """
     # 检测卡死的 running job (如 reload 后孤儿 task / 网络读无限阻塞)。
     # reap_stale 会在 /run 和 /jobs/{id} 轮询端点都调用,保证卡死后能自愈。
     job_store.reap_stale()
@@ -43,38 +98,41 @@ async def run_now(request: Request) -> dict:
     if not is_new:
         return {"job_id": job_id, "reused": True}
 
+    def progress(stage: str, pct: int, msg: str, stage_pct: int | None = None,
+                 skip_log: bool = False) -> None:
+        job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
+
+    run = make_run(progress)
+
     # 在 executor 里跑同步任务(pipeline 内部都是阻塞 IO + CPU)
     async def task() -> None:
         # 重任务执行槽: 防僵尸并发(reap 后线程仍活时新任务不得并行写 parquet)
         if not try_acquire_run_slot(job_id):
             job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
             return
-        # 管道运行期间暂停实时行情取数, 防止覆写同一批 parquet 竞态
-        qs = getattr(request.app.state, "quote_service", None)
+        # 任务运行期间暂停实时行情取数, 防止覆写同一批 parquet 竞态
+        qs = quote_service
         try:
-            job_store.start(job_id)
             loop = asyncio.get_event_loop()
 
-            def progress(stage: str, pct: int, msg: str, stage_pct: int | None = None,
-                         skip_log: bool = False) -> None:
-                job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
-
             def _run() -> dict:
-                if qs:
-                    with qs.paused():
-                        return daily_pipeline.run_now(repo, capset, on_progress=progress)
-                return daily_pipeline.run_now(repo, capset, on_progress=progress)
+                try:
+                    if qs:
+                        with qs.paused():
+                            return run()
+                    return run()
+                finally:
+                    repo.refresh_cache()
 
-            result = await loop.run_in_executor(_long_task_executor, _run)
+            result = await loop.run_in_executor(_long_task_executor, run_with_capacity, job_id, _run)
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
-            repo.refresh_cache()  # 刷新 Polars 缓存
         except JobCancelledError:
             # 已被 reap/手动取消终止: job 状态已由 terminate() 写为 failed,
             # 拉取线程在分块回调处自行退出, 这里无需(也无法)再写状态。
             logger.warning("pipeline job %s cancelled", job_id)
         except Exception as e:  # noqa: BLE001
-            logger.exception("pipeline failed")
+            logger.exception("pipeline job failed")
             job_store.fail(job_id, str(e))
             invalidate_storage_cache()
         finally:
@@ -82,6 +140,30 @@ async def run_now(request: Request) -> dict:
 
     asyncio.create_task(task())
     return {"job_id": job_id, "reused": False}
+
+
+@router.post("/adj-factor/run")
+async def run_adj_factor_now(request: Request) -> dict:
+    """独立同步除权因子(全历史 + 受影响个股 enriched 局部重算), 任务化+进度轮询。
+
+    与盘后管道共用单飞与重任务槽 (两者写同一批 parquet); 门控与矩阵
+    usable 同口径: TickFlow 档位不足且未路由到其他可用源时 400。
+    """
+    from app.services import preferences
+    from app.tickflow.capabilities import Cap
+
+    capset = request.app.state.capabilities
+    if not (capset.has(Cap.ADJ_FACTOR) or preferences.get_adj_factor_provider() != "tickflow"):
+        raise HTTPException(
+            status_code=400,
+            detail="除权因子能力不可用: 请先在 设置 → 数据源 中配置可用数据源",
+        )
+    repo = request.app.state.repo
+    return await _submit_job(
+        repo,
+        getattr(request.app.state, "quote_service", None),
+        lambda progress: (lambda: daily_pipeline.run_adj_factor_sync(repo, capset, on_progress=progress)),
+    )
 
 
 @router.get("/jobs/{job_id}")
@@ -108,8 +190,6 @@ def cancel_job(job_id: str) -> dict:
 
 
 @router.get("/jobs")
-def list_jobs(limit: int = 20) -> dict:
-    return {
-        "active_id": job_store.active_id(),
-        "jobs": job_store.list_recent(limit=limit),
-    }
+async def list_jobs(limit: int = 20) -> dict:
+    # 常驻侧栏轮询只读内存，不排队等待长计算占用的同步路由线程。
+    return job_store.recent_snapshot(limit)

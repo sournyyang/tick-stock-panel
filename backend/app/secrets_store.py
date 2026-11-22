@@ -7,12 +7,20 @@ UI 改 Key 时只动这个文件,不动 .env。
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 from pathlib import Path
 
+from app.services.fs_utils import atomic_write_text
+
 logger = logging.getLogger(__name__)
+
+# (mtime_ns, size) 签名缓存 — 与 preferences.load 同模式。
+# 实时行情每轮的 webhook/邮件判定会多次读 secrets, 避免每次全文件读+JSON 解析。
+_cache: dict | None = None
+_cache_sig: tuple[int, int] | None = None
 
 
 def _path() -> Path:
@@ -22,14 +30,36 @@ def _path() -> Path:
     return p
 
 
+def file_path() -> Path:
+    """secrets.json 绝对路径 (设置页展示用)。
+
+    该文件是 AI 与数据源 Key 的统一配置源, 支持用户用编辑器直接修改;
+    load() 按 mtime 签名缓存失效, 外部保存后下一次请求即读取最新内容,
+    无需重启。
+    """
+    return _path()
+
+
 def load() -> dict:
+    """读取 secrets.json (带 mtime 签名缓存)。返回深拷贝, 调用方可自由修改。"""
+    global _cache, _cache_sig
     p = _path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("secrets.json malformed: %s", e)
-    return {}
+    try:
+        sig = (p.stat().st_mtime_ns, p.stat().st_size)
+    except OSError:
+        return {}
+    if _cache is not None and sig == _cache_sig:
+        return copy.deepcopy(_cache)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("secrets.json malformed: %s", e)
+        return {}
+    _cache = data
+    _cache_sig = sig
+    return copy.deepcopy(_cache)
 
 
 def save(updates: dict) -> dict:
@@ -37,11 +67,9 @@ def save(updates: dict) -> dict:
     current = load()
     current.update({k: v for k, v in updates.items() if v is not None})
     p = _path()
-    p.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except OSError:
-        pass
+    atomic_write_text(
+        p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+    )
     return current
 
 
@@ -56,7 +84,9 @@ def clear(*keys: str) -> dict:
     current = load()
     for k in keys:
         current.pop(k, None)
-    p.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(
+        p, json.dumps(current, indent=2, ensure_ascii=False), mode=0o600,
+    )
     return current
 
 
@@ -97,6 +127,50 @@ def get_ai_config_int(key: str, default: int) -> int:
             logger.warning("ai config %s is not an int: %r", key, val)
     from app.config import settings
     return int(getattr(settings, key, default) or default)
+
+
+def get_dingtalk_webhook_secret() -> str:
+    """钉钉加签密钥，供投递适配器和配置表单读取。"""
+    return str(load().get("dingtalk_webhook_secret") or "")
+
+
+def set_dingtalk_webhook_secret(secret: str) -> str:
+    value = (secret or "").strip()
+    if value:
+        save({"dingtalk_webhook_secret": value})
+    else:
+        clear("dingtalk_webhook_secret")
+    return value
+
+
+def get_custom_webhook_secret() -> str:
+    """Return the optional HMAC secret for the generic outbound webhook."""
+    return str(load().get("custom_webhook_secret") or "")
+
+
+def set_custom_webhook_secret(secret: str) -> str:
+    """Persist or clear the generic outbound webhook HMAC secret."""
+    value = (secret or "").strip()
+    if value:
+        save({"custom_webhook_secret": value})
+    else:
+        clear("custom_webhook_secret")
+    return value
+
+
+def get_email_smtp_password() -> str:
+    """Return the SMTP password used by the email notification channel."""
+    return str(load().get("email_smtp_password") or "")
+
+
+def set_email_smtp_password(password: str) -> str:
+    """Persist or clear the SMTP password used by email notifications."""
+    value = password or ""
+    if value:
+        save({"email_smtp_password": value})
+    else:
+        clear("email_smtp_password")
+    return value
 
 
 def get_env_backed_secret(field: str, env_name: str) -> str:

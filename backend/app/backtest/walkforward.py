@@ -14,6 +14,8 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+from app.backtest.guards import trades_ok
+
 logger = logging.getLogger(__name__)
 
 
@@ -133,6 +135,7 @@ class WalkForwardConfig:
     test_days: int = 63
     step_days: int = 63
     direction: str | None = None
+    min_trades_oos: int = 10            # 每折 OOS 段最小交易数 (<=0 关闭)
     max_workers: int = 4
     base_params: dict = field(default_factory=dict)
     overrides: dict | None = None
@@ -149,14 +152,21 @@ class WalkForwardService:
         self.strategy_engine = strategy_engine
 
     def _prepare_shared_matrix(self, cfg: WalkForwardConfig, folds: list[Fold]):
-        """Build one immutable superset matrix for every matrix-native fold."""
+        """Build one immutable superset matrix for every matrix-native fold.
+
+        返回 None 时 run() 走通用路径: 每折独立优化 + OOS 回测, 正确但无共享矩阵加速。
+        python_history_legacy (filter_history) 与 polars_expr (内置) 策略无法装入
+        共享矩阵, 走通用路径; composite / minute_filter 仍不支持, 保持 fail-closed。
+        """
         if self.strategy_engine is None or not folds:
             return None
         strategy = self.strategy_engine.get(cfg.strategy_id)
         if strategy.execution_backend != "matrix_native":
+            if strategy.execution_backend in ("python_history_legacy", "polars_expr"):
+                return None
             raise ValueError(
-                f"步进优化暂仅支持矩阵(matrix_native)策略; "
-                f"{cfg.strategy_id} 是 {strategy.execution_backend}"
+                f"步进优化暂仅支持矩阵(matrix_native)/日线历史(python_history_legacy/"
+                f"polars_expr)策略; {cfg.strategy_id} 是 {strategy.execution_backend}"
             )
 
         from app.backtest.optimizer import expand_param_grid
@@ -316,6 +326,17 @@ class WalkForwardService:
             # OOS 失败 (含 cancelled) -> 跳过, 不把空/0 收益混入复利曲线
             if oos_res.error:
                 skipped.append({**base, "best_params": best_params, "reason": f"OOS 回测失败: {oos_res.error}"})
+                if progress_cb is not None:
+                    progress_cb({"type": "walkforward_progress", "done": done, "total": n_total, "fold": f.index})
+                continue
+
+            # 交易数门槛 (共享护栏): 少数几笔的 OOS 段统计意义不足, 混入复利曲线
+            # 会被运气主导 —— 标记无效折跳过, 与数据缺口折同一透明处理。
+            if not trades_ok(oos_res.stats, cfg.min_trades_oos):
+                skipped.append({
+                    **base, "best_params": best_params,
+                    "reason": f"OOS 交易数不足 ({oos_res.stats.get('n_trades') or 0} < {cfg.min_trades_oos})",
+                })
                 if progress_cb is not None:
                     progress_cb({"type": "walkforward_progress", "done": done, "total": n_total, "fold": f.index})
                 continue

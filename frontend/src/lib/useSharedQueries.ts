@@ -28,6 +28,8 @@ export function useCapabilityMatrix() {
   return useQuery({
     queryKey: QK.capabilityMatrix,
     queryFn: api.capabilityMatrix,
+    // 矩阵仅在路由偏好/插件装卸时变化 (设置页会失效): 5 分钟新鲜度减少切页重拉
+    staleTime: 5 * 60_000,
   })
 }
 
@@ -36,6 +38,17 @@ export function useSettings() {
   return useQuery({
     queryKey: QK.settings,
     queryFn: api.settings,
+    staleTime: 30_000,
+  })
+}
+
+/** 自检状态及修补版本。与数据页共用查询, SSE 主动刷新, 全局挂载处轮询兜底。 */
+export function useDailyIntegrity(opts?: { poll?: boolean }) {
+  return useQuery({
+    queryKey: QK.dataIntegrity,
+    queryFn: api.dataIntegrity,
+    staleTime: 10_000,
+    refetchInterval: opts?.poll ? 30_000 : false,
   })
 }
 
@@ -44,6 +57,7 @@ export function usePreferences() {
   return useQuery({
     queryKey: QK.preferences,
     queryFn: api.preferences,
+    staleTime: 30_000,
   })
 }
 
@@ -90,6 +104,7 @@ export function useDataStatus(opts?: {
     queryKey: QK.dataStatus,
     queryFn: api.dataStatus,
     staleTime: opts?.staleTime,
-    refetchInterval: opts?.refetchInterval,
+    // 首次统计和失效刷新由后台完成, 取到快照后自动停止兜底轮询。
+    refetchInterval: opts?.refetchInterval ?? ((query) => query.state.data?.stats_pending ? 2_000 : false),
   })
 }

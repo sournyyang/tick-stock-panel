@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import threading
 from dataclasses import replace
 from datetime import date, timedelta
@@ -38,6 +39,13 @@ from app.indicators.pipeline import (
 from app.strategy.engine import StrategyDataContext, StrategyEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def _migrated_signal_definitions(monkeypatch):
+    """注入迁移自内置的信号定义 (信号列定义驱动, 不依赖运行目录)。"""
+    from tests.signal_seeds import install_pipeline_caches
+    install_pipeline_caches(monkeypatch)
 
 
 def test_common_matrix_features_match_polars_indicator_pipeline():
@@ -211,7 +219,7 @@ def test_matrix_pipeline_builds_and_reuses_one_compact_valid_bar_index():
     market = build_market_data_matrix(panel)
     base_bytes = market.nbytes
     strategy = StrategyEngine._load_file(
-        REPO_ROOT / "backend" / "app" / "strategy" / "builtin" / "ma_golden_cross.py"
+        REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies" / "ma_golden_cross.py"
     ).matrix_strategy
 
     with patch.object(
@@ -283,7 +291,7 @@ def test_matrix_crossovers_skip_missing_asset_bars_like_polars_signals(
     )
     market = build_market_data_matrix(panel)
     strategy_def = StrategyEngine._load_file(
-        REPO_ROOT / "backend" / "app" / "strategy" / "builtin" / strategy_file
+        REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies" / strategy_file
     )
     actual = strategy_def.matrix_strategy.compute_signals(market, params)
     time_id_by_date = {
@@ -315,13 +323,13 @@ def test_matrix_crossovers_skip_missing_asset_bars_like_polars_signals(
 
 
 def test_builtin_matrix_strategies_use_their_declared_formula_modules():
-    strategy_dir = REPO_ROOT / "backend" / "app" / "strategy" / "builtin"
+    strategy_dir = REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies"
     strategy_files = sorted(
         path for path in strategy_dir.glob("*.py") if path.name != "__init__.py"
     )
 
-    # 分钟形态策略 (minute_red_streak) 已迁至自定义策略目录, 内置策略全部 matrix 后端
-    assert len(strategy_files) == 28
+    # 夹具目录 = 25 个 matrix 策略 (分钟形态策略在 strategies_minute 子目录, 研究模板在 research 目录)
+    assert len(strategy_files) == 25
     for strategy_path in strategy_files:
         strategy = StrategyEngine._load_file(strategy_path)
         assert strategy.execution_backend == "matrix_native"
@@ -422,7 +430,7 @@ def test_direct_parquet_matrix_matches_panel_builder_and_reuses_mmap(tmp_path):
     instruments = pl.DataFrame({
         "symbol": ["000001.SZ", "000002.SZ", "300001.SZ"],
         "name": ["普通", "ST测试", "创业板"],
-        "listing_date": ["2000-01-01", "2024-01-01", "2010-01-01"],
+        "listing_date": ["2000-01-01", "2000-01-01", "2010-01-01"],
         "total_shares": [1_000_000.0, 2_000_000.0, 3_000_000.0],
         "float_shares": [800_000.0, 1_500_000.0, 2_000_000.0],
         "limit_up": [12.0, 11.0, 13.0],
@@ -512,6 +520,110 @@ def test_direct_parquet_matrix_matches_panel_builder_and_reuses_mmap(tmp_path):
     target_asset = refreshed.symbols.index("000001.SZ")
     assert refreshed.close[-1, target_asset] == pytest.approx(12.5)
     assert len(list(cache_root.glob("v*-*"))) == 2
+
+
+def test_collect_parquet_axes_stringifies_numeric_symbols(tmp_path):
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+
+    day = date(2024, 2, 1)
+    root = tmp_path / "date=2024-02-01"
+    root.mkdir()
+    pl.DataFrame({"symbol": [1, 2], "date": [day, day]}).write_parquet(root / "part.parquet")
+    dataset = pads.dataset(
+        str(tmp_path), format="parquet",
+        partitioning=pads.partitioning(pa.schema([("date", pa.date32())]), flavor="hive"),
+    )
+    dates, symbols = matrix_module._collect_parquet_axes(
+        dataset, matrix_module._matrix_filter_expression(day, day, None), batch_size=1,
+    )
+    assert dates == [day]
+    assert symbols == ["1", "2"]
+
+
+def test_collect_parquet_axes_deduplicates_bounded_groups(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+
+    first = date(2024, 2, 1)
+    for offset in range(9):
+        day = first + timedelta(days=offset)
+        part = tmp_path / f"date={day}" / "part.parquet"
+        part.parent.mkdir()
+        pl.DataFrame({"symbol": ["000001.SZ"], "date": [day]}).write_parquet(part)
+    dataset = pads.dataset(
+        str(tmp_path), format="parquet",
+        partitioning=pads.partitioning(pa.schema([("date", pa.date32())]), flavor="hive"),
+    )
+    unique = matrix_module.pc.unique
+    calls = []
+
+    def counted_unique(values):
+        calls.append(len(values))
+        return unique(values)
+
+    monkeypatch.setattr(matrix_module.pc, "unique", counted_unique)
+    dates, symbols = matrix_module._collect_parquet_axes(
+        dataset, matrix_module._matrix_filter_expression(first, first + timedelta(days=8), None),
+        batch_size=1,
+    )
+    assert dates == [first + timedelta(days=offset) for offset in range(9)]
+    assert symbols == ["000001.SZ"]
+    assert calls == [8, 8, 1, 1]
+
+
+def test_collect_parquet_axes_cancels_before_processing_partial_group(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+
+    day = date(2024, 2, 1)
+    part = tmp_path / f"date={day}" / "part.parquet"
+    part.parent.mkdir()
+    pl.DataFrame({"symbol": ["000001.SZ"], "date": [day]}).write_parquet(part)
+    dataset = pads.dataset(
+        str(tmp_path), format="parquet",
+        partitioning=pads.partitioning(pa.schema([("date", pa.date32())]), flavor="hive"),
+    )
+    cancelled = threading.Event()
+    original = matrix_module._raise_if_matrix_cancelled
+    calls = 0
+
+    def cancel_after_first_batch(event):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            cancelled.set()
+        original(event)
+
+    monkeypatch.setattr(matrix_module, "_raise_if_matrix_cancelled", cancel_after_first_batch)
+    with pytest.raises(matrix_module.MatrixPrewarmCancelledError):
+        matrix_module._collect_parquet_axes(
+            dataset, matrix_module._matrix_filter_expression(day, day, None),
+            batch_size=1, cancel_event=cancelled,
+        )
+
+
+def test_matrix_cold_build_reports_axis_scan_breakdown(tmp_path, caplog):
+    root = tmp_path / "kline_daily_enriched"
+    day = date(2024, 2, 1)
+    partition = root / f"date={day}"
+    partition.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["000001.SZ", "600000.SH"], "date": [day, day],
+        "open": [10.0, 11.0], "high": [10.0, 11.0],
+        "low": [10.0, 11.0], "close": [10.0, 11.0],
+        "volume": [1000.0, 1000.0],
+    }).write_parquet(partition / "part.parquet")
+
+    with caplog.at_level(logging.INFO, logger=matrix_module.__name__):
+        market = load_market_data_matrix_from_parquet(
+            root, day, day, field_columns=set(), cache_root=tmp_path / "cache",
+        )
+
+    assert market.symbols == ("000001.SZ", "600000.SH")
+    assert market.timestamp_labels == ("2024-02-01",)
+    assert any("matrix axes scan" in record.message and "read_ms=" in record.message
+               and "unique_ms=" in record.message for record in caplog.records)
 
 
 def test_covering_matrix_cache_reuses_wider_dates_and_fields(tmp_path):
@@ -748,7 +860,7 @@ def test_matrix_cache_prunes_by_bytes_and_leaves_no_staging_directory(tmp_path):
     del first
     gc.collect()
     assert second.close[0, 0] == pytest.approx(11.0)
-    assert len(list(cache_root.glob("v4-*"))) == 1
+    assert len(list(cache_root.glob("v*-*"))) == 1
     assert list(cache_root.glob(".*.tmp")) == []
     assert len(list(cache_root.glob(".axes-v1-*.json"))) == 1
 
@@ -801,12 +913,12 @@ def test_managed_source_generation_skips_file_walk_and_invalidates_explicitly(tm
     assert changed.cache_path != first.cache_path
     del first, repeated
     gc.collect()
-    assert len(list(cache_root.glob("v4-*"))) == 1
+    assert len(list(cache_root.glob("v*-*"))) == 1
 
 
 def test_registered_builtin_matrix_strategies_share_one_cache_profile():
     engine = StrategyEngine(
-        strategy_dirs=[REPO_ROOT / "backend" / "app" / "strategy" / "builtin"]
+        strategy_dirs=[REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies"]
     )
     profile = build_matrix_cache_profile(engine, "stock")
     strategies = tuple(
@@ -814,7 +926,8 @@ def test_registered_builtin_matrix_strategies_share_one_cache_profile():
         if s.execution_backend != "minute_filter"
     )
 
-    assert len(strategies) == 28
+    # 25 个 matrix 策略夹具 (研究模板在 research 目录, 不在夹具目录)
+    assert len(strategies) == 25
     assert all(strategy.execution_backend == "matrix_native" for strategy in strategies)
     assert profile.warmup_bars > 0
     assert profile.forward_bars == max(int(strategy.max_hold_days or 0) for strategy in strategies)
@@ -1079,7 +1192,7 @@ def test_strategy_engine_runs_matrix_strategy_without_legacy_filter():
     history = pl.DataFrame(rows)
     target = start + timedelta(days=64)
     engine = StrategyEngine(
-        strategy_dirs=[REPO_ROOT / "backend" / "app" / "strategy" / "builtin"],
+        strategy_dirs=[REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies"],
     )
     strategy = engine.get("macd_golden")
     assert strategy.filter_fn is None
@@ -1123,7 +1236,7 @@ def test_strategy_engine_run_all_builds_one_shared_matrix():
     history = pl.DataFrame(rows)
     target = start + timedelta(days=64)
     engine = StrategyEngine(
-        strategy_dirs=[REPO_ROOT / "backend" / "app" / "strategy" / "builtin"],
+        strategy_dirs=[REPO_ROOT / "backend" / "tests" / "fixtures" / "strategies"],
     )
     original = engine.get("macd_golden")
     engine._strategies["macd_copy"] = replace(

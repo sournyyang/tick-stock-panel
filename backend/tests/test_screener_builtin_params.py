@@ -4,6 +4,8 @@ import types
 from datetime import date
 from typing import ClassVar
 
+import pytest
+
 from app.api import screener as screener_api
 from app.services.screener import ScreenerResult
 
@@ -59,7 +61,7 @@ class _CapturingStrategyEngine:
         })
         return ScreenerResult(as_of=context.as_of, strategy=strategy_id)
 
-    def run_all(self, context, *, params_map=None, overrides_map=None, strategy_ids=None):
+    def run_all(self, context, *, params_map=None, overrides_map=None, strategy_ids=None, parallel=True):
         self.calls.append({
             "kind": "run_all",
             "params_map": params_map,
@@ -82,9 +84,9 @@ def _install_api_fakes(monkeypatch):
     _CapturingScreenerService.calls = []
     _CapturingStrategyEngine.calls = []
     monkeypatch.setattr(screener_api, "ScreenerService", _CapturingScreenerService)
-    monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *_args: {})
-    monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *_args: None)
-    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *_args: None)
+    monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *_args, **_kwargs: None)
 
 
 def test_single_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path):
@@ -92,7 +94,7 @@ def test_single_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path
     request = _api_request(tmp_path, engine)
     _install_api_fakes(monkeypatch)
     saved = {"params": {"threshold": 3.0, "enabled": False}}
-    monkeypatch.setattr(screener_api.strategy_config, "load_override", lambda *_args: saved)
+    screener_api.strategy_config.save_override(tmp_path, "builtin_strategy", saved)
 
     screener_api.run_preset(
         screener_api.PresetRequest(
@@ -108,6 +110,30 @@ def test_single_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path
     assert context_call["overrides_map"] == {"builtin_strategy": saved}
     assert run_call["params"] == saved["params"]
     assert run_call["overrides"] == saved
+
+
+@pytest.mark.parametrize("timeframe", ["1d", "1m"])
+@pytest.mark.parametrize("asset_type", ["stock", "etf"])
+def test_single_run_accepts_legacy_null_filter_without_reporting_changed_params(monkeypatch, tmp_path, timeframe, asset_type):
+    engine = _CapturingStrategyEngine()
+    request = _api_request(tmp_path, engine)
+    _install_api_fakes(monkeypatch)
+    saved = {"params": {"threshold": 3.0, "enabled": False},
+             "basic_filter": {"amount_min": None, "price_min": 0, "enabled": False}}
+    screener_api.strategy_config.save_override(tmp_path, "builtin_strategy", saved)
+    path = tmp_path / "user_data" / "strategy_overrides" / "builtin_strategy.json"
+    before = path.read_bytes()
+
+    payload = screener_api.run_preset(screener_api.PresetRequest(
+        strategy_id="builtin_strategy", as_of=date(2026, 7, 15),
+        asset_type=asset_type, timeframe=timeframe, ensure=True,
+    ), request)
+
+    assert payload["strategy"] == "builtin_strategy"
+    run_call = next(call for call in engine.calls if call["kind"] == "run")
+    assert run_call["params"] == saved["params"]
+    assert run_call["overrides"]["basic_filter"] == {"price_min": 0, "enabled": False}
+    assert path.read_bytes() == before
 
 
 def test_batch_run_passes_saved_params_to_strategy_engine(monkeypatch, tmp_path):
@@ -142,7 +168,7 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
     _install_api_fakes(monkeypatch)
     written = []
     monkeypatch.setattr(screener_api.strategy_config, "list_overrides", lambda *_args: {})
-    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *args: written.append(args))
+    monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *args, **kwargs: written.append(args))
 
     payload = screener_api.run_all(
         request,
@@ -153,8 +179,13 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
         },
     )
 
-    assert payload == {
-        "as_of": "2026-07-15",
-        "results": {"builtin_strategy": {"total": 0, "as_of": "2026-07-15"}},
-    }
+    assert payload["as_of"] == "2026-07-15"
+    assert payload["results"]["builtin_strategy"]["total"] == 0
+    assert payload["results"]["builtin_strategy"]["as_of"] == "2026-07-15"
+    # 渐进式路径: 全部算完 → complete 且无 pending
+    assert payload["pending"] == []
+    assert payload["complete"] is True
+    assert payload["error"] is None
+    # 渐进式增量写 + 收尾全量写都带 rows, 缓存口径不变
     assert written[0][2]["builtin_strategy"]["rows"] == []
+    assert written[-1][2]["builtin_strategy"]["rows"] == []
