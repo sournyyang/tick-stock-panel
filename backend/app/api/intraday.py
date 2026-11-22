@@ -179,6 +179,8 @@ async def quote_stream(request: Request):
                     }
 
                 # 五档修正完成 — 前端刷新连板梯队封单数据
+                if data.get("watchlist_updated"):
+                    yield {"event": "watchlist_updated", "data": "{}"}
                 if data["depth_updated"]:
                     yield {
                         "event": "depth_updated",

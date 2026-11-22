@@ -902,6 +902,7 @@ export interface MonitorRule {
   strategy_id?: string | null
   direction: 'entry' | 'exit' | 'both' | 'up' | 'down'
   notify_events?: StrategyNotifyEvent[]
+  auto_watchlist?: boolean
   score_min?: number | null
   score_max?: number | null
   conditions: MonitorCondition[]

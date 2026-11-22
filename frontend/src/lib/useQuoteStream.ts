@@ -7,6 +7,7 @@ import { toast } from '@/components/Toast'
 import { pushAlertToasts } from '@/components/AlertToast'
 import { feedReviewEvent } from './reviewStore'
 import type { KlineDailyResponse, StrategyAlertEvent } from './api'
+import { registerMonitorWatchlistUpdates } from './monitorWatchlistUpdates'
 
 // ===== 全局 SSE 连接状态 (模块级 store, 仿 AlertToast.tsx 模式) =====
 // 实时行情 SSE 断开时 UI 无感知 → 会漏掉策略告警。这里暴露连接状态,
@@ -113,17 +114,21 @@ export function useQuoteStream(
     // 连续失败计数 (用于指数退避 + 到阈值弹一次 toast)
     let failCount = 0
     let toastFired = false
+    let disposeWatchlistUpdates: (() => void) | undefined
 
     const connect = () => {
       _setStatus(failCount > 0 ? 'reconnecting' : _streamStatus)
       const es = new EventSource('/api/intraday/stream')
       esRef.current = es
+      const watchlistUpdates = registerMonitorWatchlistUpdates(es, qc)
+      disposeWatchlistUpdates = watchlistUpdates.dispose
 
       es.onopen = () => {
         // 连接成功: 重置退避与 toast 标记
         failCount = 0
         toastFired = false
         _setStatus('connected')
+        watchlistUpdates.refresh()
       }
 
       // sse-starlette ping 心跳走 SSE comment，不会到达这里
@@ -227,6 +232,7 @@ export function useQuoteStream(
       })
 
       es.onerror = () => {
+        watchlistUpdates.dispose()
         es.close()
         esRef.current = null
         failCount += 1
@@ -248,6 +254,7 @@ export function useQuoteStream(
     return () => {
       clearTimeout(retryRef.current)
       if (esRef.current) {
+        disposeWatchlistUpdates?.()
         esRef.current.close()
         esRef.current = null
       }

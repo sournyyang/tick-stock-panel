@@ -83,6 +83,7 @@ class QuoteSubscriber:
         self._max_reviews = max_reviews
         self._quote_updated = False
         self._strategy_results_updated = False
+        self._watchlist_updated = False
         self._depth_updated = False
         self._alerts: list[dict] = []
         self._reviews: list[str] = []
@@ -98,12 +99,14 @@ class QuoteSubscriber:
             out = {
                 "quote_updated": self._quote_updated,
                 "strategy_results_updated": self._strategy_results_updated,
+                "watchlist_updated": self._watchlist_updated,
                 "depth_updated": self._depth_updated,
                 "alerts": self._alerts,
                 "reviews": self._reviews,
             }
             self._quote_updated = False
             self._strategy_results_updated = False
+            self._watchlist_updated = False
             self._depth_updated = False
             self._alerts = []
             self._reviews = []
@@ -131,6 +134,7 @@ class QuoteSubscriber:
             if (
                 not self._quote_updated
                 and not self._strategy_results_updated
+                and not self._watchlist_updated
                 and not self._depth_updated
                 and not self._reviews
             ):
@@ -150,6 +154,12 @@ class QuoteSubscriber:
         with self._lock:
             self._depth_updated = True
             self._event.set()
+
+    def notify_watchlist(self) -> None:
+        with self._lock:
+            self._watchlist_updated = True
+            # 支持同步 SSE 等待与支持异步唤醒的宿主。
+            getattr(self, "_notify", self._event.set)()
 
 
 # 落盘节流间隔: last_fetch_ms 仅在进程重启后用于显示"最后获取时间"(运行中读内存值),
@@ -217,6 +227,11 @@ class QuoteService:
         self._subscribers: set[QuoteSubscriber] = set()
         self._strategy_monitor = None            # 延迟注入
         self._app_state = None                   # 延迟注入 (FastAPI app.state)
+        from app.services.monitor_watchlist import MonitorWatchlistSync
+        self._monitor_watchlist_sync = MonitorWatchlistSync(
+            lambda: getattr(getattr(self._app_state, "monitor_engine", None), "rules", {}),
+            self.notify_watchlist_updated,
+        )
         # 异动边缘规则上次评估时间戳 (秒)。异动快照历史部分有 60s 缓存,
         # 但每次构建仍有全市场循环, 轮询线程里限频到 30s 一次。
         self._abnormal_last_eval = 0.0
@@ -423,6 +438,10 @@ class QuoteService:
         """
         for sub in self._snapshot_subscribers():
             sub.notify_depth()
+
+    def notify_watchlist_updated(self) -> None:
+        for sub in self._snapshot_subscribers():
+            sub.notify_watchlist()
 
     def _broadcast_alerts(self, alerts: list[dict]) -> None:
         for sub in self._snapshot_subscribers():
@@ -1080,6 +1099,8 @@ class QuoteService:
                             eval_df = self._inject_volume_delta(eval_df)
                         eval_df = self._inject_intraday_signals(eval_df, engine, "stock")
                         rule_events = engine.evaluate(eval_df, asset_type="stock")
+                        if any(r.get("auto_watchlist") for r in engine.rules.values()):
+                            self._monitor_watchlist_sync.submit(engine.consume_watchlist_candidates())
                         if engine.consume_strategy_result_updates():
                             self.notify_strategy_results_updated()
                     if engine.has_rule_type("sector"):

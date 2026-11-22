@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -227,6 +228,49 @@ def remove(symbol: str) -> list[dict]:
         df = _read_entries().filter(pl.col("symbol") != symbol)
         _write_entries(df)
         return df.to_dicts()
+
+
+def add_strategy_results(strategy_id: str, strategy_name: str, symbols: list[str]) -> bool:
+    """追加策略入选股, 保留已有条目的时间、备注、顺序及其他分组。"""
+    wanted = sorted({symbol for symbol in symbols if symbol and symbol != "_batch"})
+    if not wanted:
+        return False
+    # 身份绑定策略 ID, 同名策略不串组, 重启或策略改名也不重复建组。
+    digest = hashlib.sha256(strategy_id.encode()).hexdigest()
+    group_id = f"strategy_{digest}"
+    with _LOCK:
+        groups = _read_groups()
+        group = next((g for g in groups if g["id"] == group_id), None)
+        if group is None:
+            base = (strategy_name.strip() or strategy_id)[:_MAX_GROUP_NAME_LENGTH]
+            name = base
+            index = 0
+            while any(g["name"].casefold() == name.casefold() for g in groups):
+                index += 1
+                suffix = f"·{digest[:6]}" + (f"-{index}" if index > 1 else "")
+                name = base[:_MAX_GROUP_NAME_LENGTH - len(suffix)] + suffix
+            group = {"id": group_id, "name": name, "color": DEFAULT_GROUP_COLOR}
+            _write_groups([*groups, group])
+        rows = _read_entries().to_dicts()
+        by_symbol = {row["symbol"]: row for row in rows}
+        new_rows = []
+        changed = False
+        for symbol in wanted:
+            row = by_symbol.get(symbol)
+            if row is None:
+                new_rows.append({
+                    "symbol": symbol,
+                    "added_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "note": "",
+                    "group_ids": [group_id],
+                })
+                changed = True
+            elif group_id not in (row["group_ids"] or []):
+                row["group_ids"] = [*(row["group_ids"] or []), group_id]
+                changed = True
+        if changed:
+            _write_entries(pl.DataFrame([*new_rows, *rows], schema=_ENTRY_SCHEMA))
+        return changed
 
 
 def move_to_top(symbol: str) -> list[dict]:

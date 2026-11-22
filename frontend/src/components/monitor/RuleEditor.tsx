@@ -66,6 +66,7 @@ const emptyRule = (preset?: Partial<MonitorRule>): MonitorRule => ({
   window_minutes: 5,
   abnormal_window: 'any',
   strategy_id: null,
+  auto_watchlist: false,
   score_min: null,
   score_max: null,
   direction: 'entry',
@@ -174,6 +175,7 @@ export function RuleEditor({ rule, preset, simple, onClose, onSaved }: Props) {
     mutationFn: () => {
       const d = { ...draft }
       delete d.runtime_warning
+      if (d.type !== 'strategy' || assetType !== 'stock') delete d.auto_watchlist
       // name 为空时用默认名
       if (!d.name.trim()) {
         const base = TYPE_DEFAULT_NAME[d.type] ?? '监控规则'
@@ -1442,6 +1444,23 @@ export function RuleEditor({ rule, preset, simple, onClose, onSaved }: Props) {
               </label>
             </div>
           </div>
+
+          {assetType === 'stock' && (
+            <label className="flex cursor-pointer items-start gap-2 rounded-btn border border-border bg-base p-3">
+              <input
+                type="checkbox"
+                checked={draft.auto_watchlist ?? false}
+                onChange={event => setDraft(d => ({ ...d, auto_watchlist: event.target.checked }))}
+                className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-accent"
+              />
+              <span className="min-w-0 space-y-1">
+                <span className="block text-[11px] text-foreground">自动加入自选，按策略分组</span>
+                <span className="block text-[10px] leading-relaxed text-muted">
+                  下一轮监控补入当前结果池，此后自动加入新入选股票。移出结果池、停用或删除监控均保留自选；已有备注和分组保留。
+                </span>
+              </span>
+            </label>
+          )}
 
           <div className="border-t border-border/60 pt-3">
             <div className="mb-2 flex items-center justify-between gap-3">

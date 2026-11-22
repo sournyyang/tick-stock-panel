@@ -156,6 +156,8 @@ def validate(rule: dict) -> None:
 
     # 策略类型: 需要 strategy_id + direction,conditions 可空
     if rule.get("type") == "strategy":
+        if rule.get("auto_watchlist") and rule.get("asset_type", "stock") != "stock":
+            raise ValueError("自动加入自选仅支持股票策略监控")
         if not rule.get("strategy_id"):
             raise ValueError("策略类型规则必须指定 strategy_id")
         if rule.get("direction", "entry") not in DIRECTIONS:
@@ -352,6 +354,7 @@ def normalize(rule: dict) -> dict:
         "up" if r.get("type") in {"ladder", "sector"} else "both" if r.get("type") == "abnormal" else "entry",
     )
     if r.get("type") == "strategy":
+        r.setdefault("auto_watchlist", False)
         r.setdefault("score_min", None)
         r.setdefault("score_max", None)
         if r.get("notify_events") is None:
@@ -360,6 +363,7 @@ def normalize(rule: dict) -> dict:
         else:
             r["notify_events"] = list(dict.fromkeys(r["notify_events"]))
     else:
+        r.pop("auto_watchlist", None)
         r.pop("notify_events", None)
         r.pop("score_min", None)
         r.pop("score_max", None)

@@ -344,6 +344,7 @@ class MonitorRuleEngine:
         self._name_map: dict[str, str] = {}
         # 策略选股池状态: (rule_id, strategy_id, asset_type) → 上期选股符号集合
         self._strategy_pools: dict[tuple[str, str, str], set[str]] = {}
+        self._watchlist_candidates: list[dict] = []
         # 策略信号状态: (rule_id, strategy_id, asset_type, event_type) → (K线日期, 命中集合)
         self._strategy_signal_state: dict[tuple[str, str, str, str], tuple[str, set[str]]] = {}
         # 同一根 K 线的信号即使盘中回落后再次命中也只通知一次。
@@ -551,6 +552,11 @@ class MonitorRuleEngine:
         self._latest_strategy_result_ids.clear()
         return updated
 
+    def consume_watchlist_candidates(self) -> list[dict]:
+        candidates = self._watchlist_candidates
+        self._watchlist_candidates = []
+        return candidates
+
     def has_rule_type(self, rtype: str) -> bool:
         """是否存在指定类型的 (已启用) 规则。供 quote_service 判断是否需要注入特殊数据。"""
         if not self._rules:
@@ -599,6 +605,7 @@ class MonitorRuleEngine:
         Returns:
             触发的 AlertEvent dict 列表 (含 ts/rule_id/source/type/symbol/...)
         """
+        self._watchlist_candidates = []
         if not self._rules or df.is_empty():
             return []
 
@@ -1332,6 +1339,13 @@ class MonitorRuleEngine:
             eligible_symbols = {str(row["symbol"]) for row in result.rows}
 
         current_pool = eligible_symbols
+        if at == "stock" and rule.get("auto_watchlist"):
+            self._watchlist_candidates.append({
+                "rule": dict(rule),
+                "rules_version": self._rules_version,
+                "strategy_name": s.meta.get("name") or sid,
+                "symbols": frozenset(current_pool),
+            })
         prev_pool = self._strategy_pools.get(pool_key)
         self._strategy_pools[pool_key] = current_pool
 

@@ -92,6 +92,7 @@ class RuleModel(BaseModel):
     strategy_id: str | None = None
     direction: str = "entry"  # entry | exit | both | (sector/ladder/abnormal: up|down|both)
     notify_events: list[str] | None = None
+    auto_watchlist: bool = False
     score_min: float | None = None
     score_max: float | None = None
     conditions: list[ConditionModel] = []
@@ -254,6 +255,14 @@ def list_rules(request: Request):
             pass
     # 按 created_at 倒序
     rules.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    quote_service = getattr(request.app.state, "quote_service", None)
+    sync = getattr(quote_service, "_monitor_watchlist_sync", None)
+    if sync is not None:
+        for rule in rules:
+            if rule.get("enabled", True) and rule.get("auto_watchlist"):
+                warning = sync.warning_for(rule["id"])
+                if warning:
+                    rule["runtime_warning"] = warning
     return {"rules": rules}
 
 

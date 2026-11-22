@@ -7,6 +7,11 @@
 
 // ===== Query Key 工厂 =====
 
+/** 后台自动加入自选后刷新成员、分组与监控写入状态。 */
+export const WATCHLIST_DATA_QUERY_PREFIXES = new Set([
+  'watchlist', 'watchlist-groups', 'watchlist-enriched', 'watchlist-quotes', 'monitor-rules',
+])
+
 export const QK = {
   // 全局 / 共享 (Layout 预取)
   capabilities:   ['capabilities'] as const,
