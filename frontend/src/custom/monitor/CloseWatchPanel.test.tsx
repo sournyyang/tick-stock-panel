@@ -11,7 +11,7 @@ vi.mock('@/lib/api', () => ({ api: { screenerStrategies: vi.fn(async () => ({ pr
   { id: 'other', name: '其他策略', execution_backend: 'matrix_native', timeframes: ['1d'] },
 ] })) } }))
 vi.mock('./closeWatchClient', () => ({ closeWatchKey: ['custom', 'close-watch', 'state'], closeWatchApi: {
-  state: vi.fn(), configure: vi.fn(),
+  state: vi.fn(), configure: vi.fn(), configureDingTalk: vi.fn(), testDingTalk: vi.fn(),
 } }))
 
 const initial: CloseWatchState = {
@@ -75,4 +75,35 @@ it('does not allow configuration while the backend is unavailable', async () => 
   expect(host.querySelector('[role="alert"]')?.textContent).toContain('尾盘监控未就绪')
   const button = [...host.querySelectorAll('button')].find(b => b.textContent === '保存并启用')!
   expect(button.disabled).toBe(true)
+})
+
+
+it('enables the existing robot without changing strategy and shows safe delivery failures', async () => {
+  const status = { enabled: false, configured: true, status: 'ready', message: '钉钉推送未启用', pending: 0, records: [] }
+  vi.mocked(closeWatchApi.state).mockResolvedValueOnce({ ...initial, dingtalk: status })
+  const enabled = { ...initial, dingtalk: { ...status, enabled: true } }
+  vi.mocked(closeWatchApi.configureDingTalk).mockResolvedValue(enabled)
+  vi.mocked(closeWatchApi.testDingTalk).mockResolvedValue({ ...enabled, dingtalk: { ...enabled.dingtalk, records: [{
+    id: 'test', phase: 'test', type: 'connection_test', symbol: '', queued_at: 1,
+    status: 'failed', detail: '签名校验失败', elapsed_ms: 30,
+  }] } })
+  await render()
+  const toggle = host.querySelector('input[aria-label="启用尾盘钉钉推送"]') as HTMLInputElement
+  await act(async () => toggle.click()); await flush()
+  expect(closeWatchApi.configureDingTalk).toHaveBeenCalledWith(true)
+  expect(closeWatchApi.configure).not.toHaveBeenCalled()
+  await click('发送连接测试')
+  expect(closeWatchApi.testDingTalk).toHaveBeenCalledTimes(1)
+  expect(host.textContent).toContain('签名校验失败')
+  expect(host.textContent).toContain('不补发历史')
+  expect(host.textContent).not.toContain('access_token')
+})
+
+it('requires configured robot before enabling tail notifications', async () => {
+  vi.mocked(closeWatchApi.state).mockResolvedValueOnce({ ...initial, dingtalk: {
+    enabled: false, configured: false, status: 'ready', message: '未配置', pending: 0, records: [],
+  } })
+  await render()
+  expect((host.querySelector('input[aria-label="启用尾盘钉钉推送"]') as HTMLInputElement).disabled).toBe(true)
+  expect(host.textContent).toContain('请先到设置页面配置钉钉机器人')
 })

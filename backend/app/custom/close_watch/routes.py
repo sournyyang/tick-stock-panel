@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from app.services.screener import ScreenerService
 
+from .dingtalk import CloseWatchDingTalk
 from .service import CloseWatchService
 
 logger = logging.getLogger(__name__)
@@ -24,13 +25,18 @@ class ConfigRequest(BaseModel):
     start_time: str = Field(default='14:50', pattern=r'^14:[3-5][0-9]$')
 
 
+class DingTalkRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    enabled: StrictBool
+
+
 def build_router():
     service = None
 
     @asynccontextmanager
     async def lifespan(app):
         nonlocal service
-        lease = thread = None
+        lease = thread = delivery_thread = None
         try:
             repo = getattr(app.state, 'repo', None)
             engine = getattr(app.state, 'strategy_engine', None)
@@ -43,6 +49,7 @@ def build_router():
             service = CloseWatchService(repo.store.data_dir, engine, ScreenerService(repo),
                                         getattr(app.state, 'quote_service', None))
             active = service
+            active.notifications = CloseWatchDingTalk(repo.store.data_dir, active.notification_context)
 
             def run():
                 while not active.stopping.is_set():
@@ -52,6 +59,16 @@ def build_router():
                         logger.exception('close watch evaluation failed')
                     active.stopping.wait(15)
 
+            def deliver():
+                while not active.stopping.is_set():
+                    try:
+                        active.notifications.tick()
+                    except (OSError, ValueError, KeyError, TypeError):  # Isolate invalid channel state.
+                        logger.warning('尾盘钉钉渠道暂不可用，请查看发送状态')
+                    active.stopping.wait(1)
+
+            delivery_thread = threading.Thread(target=deliver, name='close-watch-dingtalk', daemon=True)
+            delivery_thread.start()
             thread = threading.Thread(target=run, name='close-watch', daemon=True)
             thread.start()
         except Exception:  # An unavailable optional module must not stop the app.
@@ -64,6 +81,8 @@ def build_router():
                 service.stopping.set()
             if thread:
                 thread.join(timeout=3)
+            if delivery_thread:
+                delivery_thread.join(timeout=6)
             if lease:
                 lease.close()
             service = None
@@ -86,5 +105,13 @@ def build_router():
     @router.put('/config')
     def configure(body: ConfigRequest):
         return call('configure', body.strategy_id, body.enabled, body.start_time)
+
+    @router.put('/dingtalk')
+    def configure_dingtalk(body: DingTalkRequest):
+        return call('configure_dingtalk', body.enabled)
+
+    @router.post('/dingtalk/test')
+    def test_dingtalk():
+        return call('test_dingtalk')
 
     return router

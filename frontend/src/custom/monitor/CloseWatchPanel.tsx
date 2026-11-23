@@ -8,6 +8,7 @@ import { selectableStrategies } from '@/lib/strategyLibrary'
 import { closeWatchApi, closeWatchKey, type CloseWatchState } from './closeWatchClient'
 
 const input = 'rounded-btn border border-border bg-base px-2 py-1.5 text-xs text-foreground min-w-0'
+const deliveryLabels: Record<string, string> = { queued: '等待发送', sending: '正在发送', sent: '钉钉已接收', failed: '发送失败', expired: '已过时未发送', cancelled: '已取消发送', unknown: '发送结果未知' }
 const button = 'rounded-btn border border-border bg-elevated px-2 py-1.5 text-xs disabled:opacity-40'
 
 export function CloseWatchPanel() {
@@ -23,7 +24,10 @@ export function CloseWatchPanel() {
   const saved = (value: CloseWatchState) => { qc.setQueryData(closeWatchKey, value) }
   const config = useMutation({ mutationFn: (enabled: boolean) => closeWatchApi.configure(sid, enabled, time), onSuccess: saved })
   const pause = useMutation({ mutationFn: () => closeWatchApi.configure(state!.binding!.strategy_id, false, state!.binding!.start_time), onSuccess: saved })
-  const error = query.error || config.error || pause.error || strategies.error
+  const dingtalk = useMutation({ mutationFn: (enabled: boolean) => closeWatchApi.configureDingTalk(enabled), onSuccess: saved })
+  const test = useMutation({ mutationFn: () => closeWatchApi.testDingTalk(), onSuccess: saved })
+  const error = query.error || config.error || pause.error || strategies.error || dingtalk.error || test.error
+  const deliveryBusy = dingtalk.isPending || test.isPending
   const busy = config.isPending || pause.isPending
   return <section className="mx-auto w-full max-w-7xl rounded-xl border border-accent/25 bg-surface/60" aria-label="尾盘策略监控">
     <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
@@ -39,7 +43,7 @@ export function CloseWatchPanel() {
     {error && <p role="alert" className="px-4 pb-3 text-xs text-danger">{error.message}</p>}
     {open && <div className="max-h-[65vh] space-y-4 overflow-y-auto border-t border-border/60 px-4 py-3">
       <p className="text-[11px] leading-relaxed text-secondary">买入和卖出信号均在尾盘当天提示，不等第二天。自动跟踪本策略买点之后的卖点，不代表已经买入或卖出；无需模拟账户和持仓登记，不代下单。</p>
-      <p className="text-[11px] leading-relaxed text-muted">尾盘预警尚可能变化，收盘后另给确认或取消。历史回测按次日开盘成交，尾盘当天成交的效果尚未单独验证。本模块只发送站内提醒，不推送外部群。</p>
+      <p className="text-[11px] leading-relaxed text-muted">尾盘预警尚可能变化，收盘后另给确认或取消。历史回测按次日开盘成交，尾盘当天成交的效果尚未单独验证。可在下方启用钉钉，接收新预警、收盘确认和取消通知。</p>
       <p className="text-[11px] text-muted">原有普通监控规则独立运行；若只需要尾盘提醒，可暂停规则列表中同策略的普通规则。</p>
       <div className="flex flex-wrap items-end gap-2">
         <label className="flex min-w-48 flex-1 flex-col gap-1 text-[11px] text-muted">尾盘策略<select aria-label="尾盘策略" className={input} value={sid} onChange={e => setStrategy(e.target.value)} disabled={busy}>
@@ -50,6 +54,22 @@ export function CloseWatchPanel() {
         <button type="button" className={button} disabled={busy || !state?.enabled} onClick={() => pause.mutate()}>暂停</button>
       </div>
       {state?.binding && <p className="text-[11px] text-muted">当前绑定：{state.binding.name} · {state.binding.max_hold_days == null ? '无固定观察期限' : `买点后${state.binding.max_hold_days}个市场交易日到期观察`}。更换策略会重建信号观察，不影响实际账户。{state.checked_at && ` 最近检查：${state.checked_at.slice(0,19).replace('T',' ')}`}</p>}
+      {state?.dingtalk && <div className="space-y-2 rounded-btn border border-border p-3" aria-label="尾盘钉钉推送">
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-xs font-medium"><input type="checkbox" aria-label="启用尾盘钉钉推送" checked={state.dingtalk.enabled}
+            disabled={deliveryBusy || state.dingtalk.status === 'blocked' || (!state.dingtalk.enabled && !state.dingtalk.configured)} onChange={e => dingtalk.mutate(e.target.checked)} />尾盘钉钉推送</label>
+          <button type="button" className={button} disabled={deliveryBusy || !state.dingtalk.enabled || !state.dingtalk.configured || state.dingtalk.status === 'blocked'} onClick={() => test.mutate()}>发送连接测试</button>
+          <span className="text-[11px] text-muted">{state.dingtalk.message} · 待发送 {state.dingtalk.pending}</span>
+        </div>
+        <p className="text-[11px] text-muted">复用设置中的机器人和加签配置；仅推送启用后的新信号，不补发历史。发送在后台进行，不影响信号计算。收盘确认仅供复核，当日已无法交易。</p>
+        {!state.dingtalk.configured && <p className="text-[11px] text-warning">请先到设置页面配置钉钉机器人。</p>}
+        <details><summary className="cursor-pointer text-[11px] text-muted">最近钉钉发送记录 ({state.dingtalk.records.length})</summary>
+          <p className="my-2 text-[11px] text-muted">网络失败或中断后不自动重复发送，避免重复提醒；发送结果未知时请核对群消息。</p>
+          {state.dingtalk.records.slice(0, 12).map(r => <p key={r.id} className="mt-2 text-[11px] leading-relaxed">
+            {new Date(r.queued_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })} · {r.phase === 'test' ? '连接测试' : `${r.symbol} ${r.phase === 'preview' ? '尾盘预警' : '收盘复核'}`} · <span className={['failed', 'unknown'].includes(r.status) ? 'text-danger' : 'text-muted'}>{deliveryLabels[r.status] || r.status}</span> · {r.detail}{r.elapsed_ms != null && ` · ${r.elapsed_ms}毫秒`}
+          </p>)}
+        </details>
+      </div>}
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2"><div className="text-xs font-medium">最近检查的买入候选{state?.as_of && <span className="ml-2 text-muted">{state.as_of}</span>}</div>
           {!state?.candidates.length && <p className="text-[11px] text-muted">尚无可展示候选；请结合上方行情状态判断，旧日数据不会当作今日信号。</p>}

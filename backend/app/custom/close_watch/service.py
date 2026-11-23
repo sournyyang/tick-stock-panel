@@ -42,13 +42,14 @@ def _price(value):
 
 
 class CloseWatchService:
-    def __init__(self, data_dir, engine, screener, quotes):
+    def __init__(self, data_dir, engine, screener, quotes, notifications=None):
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / 'user_data/extensions/close_watch/state.json'
         self.engine, self.screener, self.quotes = engine, screener, quotes
         self.lock = threading.RLock()
         self.eval_lock = threading.Lock()
         self.stopping = threading.Event()
+        self.notifications = notifications
 
     def _load(self):
         if not self.path.exists():
@@ -82,7 +83,23 @@ class CloseWatchService:
 
     def get(self):
         with self.lock:
-            return {k:v for k,v in self._load().items() if k not in {'seen','outbox'}}
+            result = {k:v for k,v in self._load().items() if k not in {'seen','outbox'}}
+        if self.notifications:
+            result['dingtalk'] = self.notifications.status()
+        return result
+
+    def notification_context(self):
+        with self.lock:
+            state = self._load()
+            return {'enabled': state['enabled'], **(state['binding'] or {})}
+
+    def configure_dingtalk(self, enabled):
+        self.notifications.configure(enabled)
+        return self.get()
+
+    def test_dingtalk(self):
+        self.notifications.enqueue_test()
+        return self.get()
 
     def _definition(self, sid):
         strategy = self.engine.get(sid)
@@ -411,5 +428,8 @@ class CloseWatchService:
                 alert_store.append_many(self.data_dir,new)
                 if self.quotes:
                     self.quotes.push_alerts(new)
+            if self.notifications:
+                # Queue ALL pending IDs: recover a crash after local append but before enqueue.
+                self.notifications.enqueue(pending, now=now)
             state['outbox'] = []
             self._save(state)

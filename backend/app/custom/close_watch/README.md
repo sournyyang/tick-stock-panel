@@ -48,12 +48,21 @@ JSON原子写，损坏或未知版本拒绝覆盖。保存观察、最近200条�
 去重ID和持久化outbox。先保存outbox再追加现有告警；检查点之间崩溃时按告警ID
 恢复去重。预警、收盘确认分别去重，一只观察的多个卖出原因合并为一条。
 
-API：GET /api/custom/close-watch/state、PUT /api/custom/close-watch/config。
+API：GET /api/custom/close-watch/state、PUT /api/custom/close-watch/config、
+PUT /api/custom/close-watch/dingtalk（严格布尔enabled）、POST /api/custom/close-watch/dingtalk/test。
 没有账户、持仓登记或交易端点；HTTP不触发全市场同步扫描。前端查询键与请求
 集中在closeWatchClient.ts，每15秒刷新。状态含来源日期和最近检查时间。
 
 信号复用alert_store及QuoteService.push_alerts，进入监控中心和站内提醒；
-不调用外部Webhook或自动跟单。已有普通监控规则及其全天时段/推送渠道独立保留，
+钉钉开关独立，默认关闭，复用全局保存的机器人及加签配置，不在本模块保存凭据。
+只排队启用之后的新预警、收盘确认及未获确认事件，不补发历史信号。
+独立发送线程每秒取一条持久化队列，HTTP单次尝试，不阻塞行情/矩阵计算。
+预警超过120秒或已收盘、确认超过600秒、跨日、暂停监控或更换绑定均不发送。
+发送前落盘sending；重启遇到sending标记结果未知，不自动重发，避免网络歧义重复。
+失败保留可见状态，不自动重试。钉钉返回成功仅表示机器人已接收，不表示用户已阅读。
+连接测试明确标注非买卖信号，每分钟最多一次。收盘消息明确标注当日已无法执行。
+数据dingtalk.json保存开关、队列和最近200条终态；ID独立持久化，同日重启去重。
+已有普通监控规则及其全天时段/推送渠道独立保留，
 模块不会改写它们；只想要尾盘提醒时可自行暂停同策略的普通规则。
 
 模块不保证行情离线期间的即时预警，也不保证成交。移除扩展不删除历史记录，

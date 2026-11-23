@@ -256,11 +256,14 @@ def test_realtime_history_reused_until_repair_generation(env,monkeypatch):
     assert builds==[DAY,DAY]
 
 
-def test_router_only_controls_signal_monitor_not_positions(env):
+def test_router_only_controls_signal_monitor_not_positions(env, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from app.custom.close_watch.routes import build_router
+    from app.services.dingtalk_adapter import SendResult
+    monkeypatch.setattr('app.services.preferences.get_dingtalk_webhook_url', lambda: 'https://oapi.dingtalk.com/robot/send?access_token=fake')
+    monkeypatch.setattr('app.services.dingtalk_adapter.send_text_result', lambda *a, **kw: SendResult(True, 'accepted'))
     app=FastAPI()
     app.state.repo=SimpleNamespace(store=SimpleNamespace(data_dir=env.root))
     app.state.strategy_engine=env.engine
@@ -273,6 +276,13 @@ def test_router_only_controls_signal_monitor_not_positions(env):
         assert result.status_code==200
         assert client.put(root+'/config',json={'strategy_id':'demo','enabled':True,'start_time':'09:30'}).status_code==422
         assert client.post(root+'/positions',json={}).status_code==404
+        assert client.put(root+'/dingtalk', json={'enabled': 'true'}).status_code == 422
+        assert client.put(root+'/dingtalk', json={'enabled': True, 'url': 'bad'}).status_code == 422
+        enabled = client.put(root+'/dingtalk', json={'enabled': True})
+        assert enabled.status_code == 200 and enabled.json()['dingtalk']['enabled']
+        tested = client.post(root+'/dingtalk/test')
+        assert tested.status_code == 200 and tested.json()['dingtalk']['records'][0]['phase'] == 'test'
+        assert client.post(root+'/dingtalk/test').status_code == 409
 
 
 
@@ -286,3 +296,29 @@ def test_verified_close_is_kept_without_recomputing_all_night(env):
     env.service._evaluate = unexpected
     env.service.tick(later.replace(hour=22))
     assert env.service.get() == before
+
+
+def test_notification_queue_recovers_local_append_checkpoint_without_duplicate(env, monkeypatch):
+    from app.custom.close_watch.dingtalk import CloseWatchDingTalk
+    from app.services.dingtalk_adapter import SendResult
+    monkeypatch.setattr('app.services.preferences.get_dingtalk_webhook_url', lambda: 'https://oapi.dingtalk.com/robot/send?access_token=fake')
+    sent = []
+    channel = CloseWatchDingTalk(env.root, env.service.notification_context,
+        sender=lambda *a, **kw: (sent.append(a), SendResult(True, 'accepted'))[1])
+    env.service.notifications = channel
+    channel.configure(True, now=NOW)
+    enqueue = channel.enqueue
+    monkeypatch.setattr(channel, 'enqueue', lambda *a, **kw: (_ for _ in ()).throw(OSError('checkpoint unavailable')))
+    with pytest.raises(OSError):
+        env.service.tick(NOW)
+    first = alert_store.list_recent(env.root, source='strategy')
+    assert len(first) == 1
+    assert env.service._load()['outbox']
+    monkeypatch.setattr(channel, 'enqueue', enqueue)
+    env.service._drain(NOW)
+    channel.tick(now=NOW)
+    env.service._drain(NOW)
+    assert len(alert_store.list_recent(env.root, source='strategy')) == 1
+    assert len(sent) == 1
+    assert not env.service._load()['outbox']
+    assert env.service.get()['dingtalk']['records'][0]['status'] == 'sent'

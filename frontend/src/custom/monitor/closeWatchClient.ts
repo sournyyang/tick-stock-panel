@@ -1,7 +1,12 @@
 import { ApiError } from '@/lib/api'
 
 export interface SignalTrack { id: string; symbol: string; name: string; signal_date: string }
+export interface DingTalkStatus {
+  enabled: boolean; configured: boolean; status: string; message: string; pending: number
+  records: Array<{ id: string; status: string; detail: string; queued_at: number; symbol: string; phase: string; type: string; elapsed_ms?: number }>
+}
 export interface CloseWatchState {
+  dingtalk?: DingTalkStatus
   enabled: boolean
   status: string
   message: string
@@ -42,6 +47,8 @@ async function request<T>(path: string, method = 'GET', body?: unknown): Promise
 }
 
 export const closeWatchApi = {
+  configureDingTalk: (enabled: boolean) => request<CloseWatchState>('dingtalk', 'PUT', { enabled }),
+  testDingTalk: () => request<CloseWatchState>('dingtalk/test', 'POST'),
   state: () => request<CloseWatchState>('state'),
   configure: (strategy_id: string, enabled: boolean, start_time: string) => request<CloseWatchState>('config', 'PUT', { strategy_id, enabled, start_time }),
 }
