@@ -46,8 +46,10 @@ def build_router():
             root.mkdir(parents=True, exist_ok=True)
             lease = sqlite3.connect(root/'runner.sqlite', timeout=0)
             lease.execute('BEGIN EXCLUSIVE')
+            monitor = getattr(app.state, 'monitor_engine', None)
             service = CloseWatchService(repo.store.data_dir, engine, ScreenerService(repo),
-                                        getattr(app.state, 'quote_service', None))
+                                        getattr(app.state, 'quote_service', None),
+                                        monitor_rules=lambda: monitor.rules if monitor else {})
             active = service
             active.notifications = CloseWatchDingTalk(repo.store.data_dir, active.notification_context)
 

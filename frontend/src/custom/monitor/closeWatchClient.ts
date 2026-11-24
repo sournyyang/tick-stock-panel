@@ -7,6 +7,7 @@ export interface DingTalkStatus {
 }
 export interface CloseWatchState {
   dingtalk?: DingTalkStatus
+  watchlist?: { enabled: boolean; message: string; warning: string | null }
   enabled: boolean
   status: string
   message: string

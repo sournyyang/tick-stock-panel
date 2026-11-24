@@ -44,7 +44,9 @@ export function CloseWatchPanel() {
     {open && <div className="max-h-[65vh] space-y-4 overflow-y-auto border-t border-border/60 px-4 py-3">
       <p className="text-[11px] leading-relaxed text-secondary">买入和卖出信号均在尾盘当天提示，不等第二天。自动跟踪本策略买点之后的卖点，不代表已经买入或卖出；无需模拟账户和持仓登记，不代下单。</p>
       <p className="text-[11px] leading-relaxed text-muted">尾盘预警尚可能变化，收盘后另给确认或取消。历史回测按次日开盘成交，尾盘当天成交的效果尚未单独验证。可在下方启用钉钉，接收新预警、收盘确认和取消通知。</p>
-      <p className="text-[11px] text-muted">原有普通监控规则独立运行；若只需要尾盘提醒，可暂停规则列表中同策略的普通规则。</p>
+      <p className="text-[11px] text-muted">原有普通监控规则的通知独立运行；自动加入分组自选需保持同策略普通规则启用，并开启“自动加入自选”。</p>
+      {state?.watchlist && <p className="text-[11px] text-muted">分组自选：{state.watchlist.message}。跟随同策略普通规则的“自动加入自选”开关；尾盘临时预警不自动加入。</p>}
+      {state?.watchlist?.warning && <p role="alert" className="text-xs text-danger">{state.watchlist.warning}</p>}
       <div className="flex flex-wrap items-end gap-2">
         <label className="flex min-w-48 flex-1 flex-col gap-1 text-[11px] text-muted">尾盘策略<select aria-label="尾盘策略" className={input} value={sid} onChange={e => setStrategy(e.target.value)} disabled={busy}>
           {selectableStrategies(strategies.data?.presets ?? [], [sid]).filter(s => s.execution_backend === 'matrix_native' && s.timeframes?.includes('1d')).map(s => <option value={s.id} key={s.id}>{s.name}</option>)}

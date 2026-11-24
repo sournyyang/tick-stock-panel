@@ -107,3 +107,15 @@ it('requires configured robot before enabling tail notifications', async () => {
   expect((host.querySelector('input[aria-label="启用尾盘钉钉推送"]') as HTMLInputElement).disabled).toBe(true)
   expect(host.textContent).toContain('请先到设置页面配置钉钉机器人')
 })
+
+
+it('shows confirmed-buy watchlist behavior and persistent write failures', async () => {
+  vi.mocked(closeWatchApi.state).mockResolvedValueOnce({ ...initial, watchlist: {
+    enabled: true, message: '已确认买点自动加入策略分组，结束观察后保留自选',
+    warning: '自动加入自选失败，将在下轮监控时重试',
+  } })
+  await render()
+  expect(host.textContent).toContain('结束观察后保留自选')
+  expect(host.textContent).toContain('尾盘临时预警不自动加入')
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('自动加入自选失败')
+})

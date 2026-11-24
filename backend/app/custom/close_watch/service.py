@@ -16,6 +16,7 @@ from app.backtest.matrix import MatrixPipelineConfig, MatrixStrategyPipeline
 from app.market_time import CN_TZ, cn_now
 from app.services import alert_store
 from app.services.fs_utils import atomic_write_text
+from app.services.monitor_watchlist import MonitorWatchlistSync
 from app.strategy import config as strategy_config
 from app.strategy.engine import StrategyDataContext
 from app.strategy.scoring import effective_scoring, effective_scoring_directions
@@ -42,7 +43,7 @@ def _price(value):
 
 
 class CloseWatchService:
-    def __init__(self, data_dir, engine, screener, quotes, notifications=None):
+    def __init__(self, data_dir, engine, screener, quotes, notifications=None, monitor_rules=None):
         self.data_dir = Path(data_dir)
         self.path = self.data_dir / 'user_data/extensions/close_watch/state.json'
         self.engine, self.screener, self.quotes = engine, screener, quotes
@@ -50,6 +51,9 @@ class CloseWatchService:
         self.eval_lock = threading.Lock()
         self.stopping = threading.Event()
         self.notifications = notifications
+        self.monitor_rules = monitor_rules or (lambda: {})
+        self.watchlist_sync = MonitorWatchlistSync(self._active_watchlist_rules,
+            lambda: self.quotes.notify_watchlist_updated() if self.quotes else None)
 
     def _load(self):
         if not self.path.exists():
@@ -86,7 +90,37 @@ class CloseWatchService:
             result = {k:v for k,v in self._load().items() if k not in {'seen','outbox'}}
         if self.notifications:
             result['dingtalk'] = self.notifications.status()
+        rules = self._active_watchlist_rules()
+        warnings = [self.watchlist_sync.warning_for(rid) for rid in rules]
+        result['watchlist'] = {'enabled': bool(rules),
+            'message': '已确认买点自动加入策略分组，结束观察后保留自选' if rules else
+                       '自动加入自选未启用，请在同策略普通监控规则中开启',
+            'warning': next((w for w in warnings if w), None)}
         return result
+
+    def _active_watchlist_rules(self):
+        with self.lock:
+            state = self._load()
+        if not state['enabled'] or not state['binding'] or self.stopping.is_set():
+            return {}
+        sid = state['binding']['strategy_id']
+        return {rid: rule for rid, rule in self.monitor_rules().items()
+                if rule.get('type') == 'strategy' and rule.get('enabled', True)
+                and rule.get('auto_watchlist') and rule.get('asset_type', 'stock') == 'stock'
+                and rule.get('strategy_id') == sid}
+
+    def _sync_watchlist(self):
+        # The durable observations recover missed additions even before today's tail window.
+        # Queue outside the monitor lock; the shared worker rechecks enabled rules before IO.
+        rules = self._active_watchlist_rules()
+        with self.lock:
+            state = self._load()
+        if not rules or not state['enabled'] or not state['binding']:
+            return
+        self.watchlist_sync.submit([{'rule': rule,
+            'rules_version': (state['generation'], state['binding']['revision']),
+            'strategy_name': state['binding']['name'],
+            'symbols': frozenset(t['symbol'] for t in state['tracks'])} for rule in rules.values()])
 
     def notification_context(self):
         with self.lock:
@@ -208,6 +242,7 @@ class CloseWatchService:
                     return
                 if json.dumps(state, sort_keys=True) != before:
                     self._save(state)
+            self._sync_watchlist()
             if phase is not None and state['status'] != 'blocked':
                 self._drain(now)
         finally:

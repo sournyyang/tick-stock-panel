@@ -57,9 +57,10 @@ MATRIX_STRATEGY=Native()
     quotes = SimpleNamespace(
         status=lambda:{'mode':'full_market','quote_age_ms':0,'last_fetch_ms':NOW.timestamp()*1000,
             'final_sync_done':False,'final_sync_failed':None,'symbol_count':2},
-        get_enriched_today=lambda:(current, DAY), pushed=[],
+        get_enriched_today=lambda:(current, DAY), pushed=[], watchlist_notices=[],
     )
     quotes.push_alerts=lambda events:quotes.pushed.extend(events)
+    quotes.notify_watchlist_updated=lambda:quotes.watchlist_notices.append(True)
     repo = SimpleNamespace(get_instruments_asset=lambda asset:pl.DataFrame({'symbol':['000001.SZ','600000.SH']}))
     screener = SimpleNamespace(repo=repo)
     service = CloseWatchService(tmp_path, engine, screener, quotes)
@@ -267,6 +268,8 @@ def test_router_only_controls_signal_monitor_not_positions(env, monkeypatch):
     app=FastAPI()
     app.state.repo=SimpleNamespace(store=SimpleNamespace(data_dir=env.root))
     app.state.strategy_engine=env.engine
+    app.state.monitor_engine=SimpleNamespace(rules={'auto': {'id': 'auto', 'type': 'strategy',
+        'strategy_id': 'demo', 'enabled': True, 'auto_watchlist': True}})
     app.state.quote_service=env.quotes
     app.include_router(build_router())
     with TestClient(app) as client:
@@ -274,6 +277,7 @@ def test_router_only_controls_signal_monitor_not_positions(env, monkeypatch):
         assert client.get(root+'/state').status_code==200
         result=client.put(root+'/config',json={'strategy_id':'demo','enabled':False,'start_time':'14:50'})
         assert result.status_code==200
+        assert client.get(root+'/state').json()['watchlist']['enabled'] is False
         assert client.put(root+'/config',json={'strategy_id':'demo','enabled':True,'start_time':'09:30'}).status_code==422
         assert client.post(root+'/positions',json={}).status_code==404
         assert client.put(root+'/dingtalk', json={'enabled': 'true'}).status_code == 422
@@ -322,3 +326,119 @@ def test_notification_queue_recovers_local_append_checkpoint_without_duplicate(e
     assert len(sent) == 1
     assert not env.service._load()['outbox']
     assert env.service.get()['dingtalk']['records'][0]['status'] == 'sent'
+
+
+def test_confirmed_tail_buy_joins_persistent_strategy_group(env, monkeypatch):
+    from app.config import settings
+    from app.services import watchlist
+    monkeypatch.setattr(settings, 'data_dir', env.root)
+    rule = {'id': 'auto', 'type': 'strategy', 'strategy_id': 'demo',
+            'enabled': True, 'auto_watchlist': True, 'asset_type': 'stock'}
+    env.service.monitor_rules = lambda: {'auto': rule}
+    env.service.tick(confirmed(env))
+    sync = getattr(env.service, 'watchlist_sync', None)
+    if sync and sync._thread:
+        sync._thread.join(timeout=3)
+    rows = watchlist.list_symbols()
+    assert [r['symbol'] for r in rows] == ['600000.SH']
+    assert watchlist.list_groups()[0]['name'] == '测试策略'
+    assert rows[0]['group_ids'] == [watchlist.list_groups()[0]['id']]
+
+
+def _wire_tail_watchlist(env, monkeypatch, **changes):
+    from app.config import settings
+    monkeypatch.setattr(settings, 'data_dir', env.root)
+    rule = {'id': 'auto', 'type': 'strategy', 'strategy_id': 'demo',
+            'enabled': True, 'auto_watchlist': True, 'asset_type': 'stock', **changes}
+    env.service.monitor_rules = lambda: {'auto': rule}
+    return rule
+
+
+def _wait_tail_watchlist(service):
+    if service.watchlist_sync._thread:
+        service.watchlist_sync._thread.join(timeout=3)
+        assert not service.watchlist_sync._thread.is_alive()
+
+
+@pytest.mark.parametrize('change', [{'auto_watchlist': False}, {'enabled': False},
+    {'strategy_id': 'other'}, {'asset_type': 'etf'}, {'type': 'signal'}])
+def test_tail_watchlist_honors_existing_matching_rule_switch(env, monkeypatch, change):
+    from app.services import watchlist
+    _wire_tail_watchlist(env, monkeypatch, **change)
+    env.service.tick(confirmed(env))
+    _wait_tail_watchlist(env.service)
+    assert watchlist.list_symbols() == []
+    assert not env.service.get()['watchlist']['enabled']
+
+
+def test_tail_watchlist_does_not_add_preview_or_cancelled_buy(env, monkeypatch):
+    from app.services import watchlist
+    _wire_tail_watchlist(env, monkeypatch)
+    state = env.service._load()
+    state['seeded'] = True
+    env.service._save(state)
+    env.service.tick(NOW)
+    _wait_tail_watchlist(env.service)
+    assert env.service.get()['candidates'][0]['symbol'] == '600000.SH'
+    assert watchlist.list_symbols() == []
+    env.service._market = lambda *a: changed_market(env, 9.8)
+    env.service.tick(confirmed(env, price=9.8))
+    _wait_tail_watchlist(env.service)
+    assert '600000.SH' not in {r['symbol'] for r in watchlist.list_symbols()}
+
+
+def test_tail_watchlist_restart_recovers_active_buys_before_window_without_alert_replay(env, monkeypatch):
+    from app.services import watchlist
+    rule = _wire_tail_watchlist(env, monkeypatch)
+    tracked(env)
+    restarted = CloseWatchService(env.root, env.engine, env.service.screener, env.quotes,
+                                  monitor_rules=lambda: {'auto': rule})
+    restarted.tick(NOW.replace(hour=10))
+    _wait_tail_watchlist(restarted)
+    assert [r['symbol'] for r in watchlist.list_symbols()] == ['600000.SH']
+    assert env.quotes.watchlist_notices == [True]
+    assert env.quotes.pushed == [] and restarted.get()['events'] == []
+    before = watchlist.list_symbols()
+    restarted.tick(NOW.replace(hour=10, minute=52))
+    _wait_tail_watchlist(restarted)
+    assert watchlist.list_symbols() == before
+    assert env.quotes.watchlist_notices == [True]
+
+
+def test_tail_sell_and_paused_rule_retain_existing_favorite_and_metadata(env, monkeypatch):
+    from app.services import watchlist
+    rule = _wire_tail_watchlist(env, monkeypatch)
+    group = watchlist.create_group('我的分组')[1]
+    watchlist.add('600000.SH', '我的备注', group['id'])
+    original = watchlist.list_symbols()[0]
+    tracked(env)
+    env.service.tick(NOW.replace(hour=10))
+    _wait_tail_watchlist(env.service)
+    saved = watchlist.list_symbols()[0]
+    assert saved['note'] == original['note'] and saved['added_at'] == original['added_at']
+    assert group['id'] in saved['group_ids'] and len(saved['group_ids']) == 2
+    env.service._market = lambda *a: changed_market(env, 9.8)
+    env.service.tick(confirmed(env, price=9.8))
+    _wait_tail_watchlist(env.service)
+    assert all(t['symbol'] != '600000.SH' for t in env.service.get()['tracks'])
+    rule['enabled'] = False
+    env.service.tick(NOW.replace(hour=15, minute=2))
+    _wait_tail_watchlist(env.service)
+    assert next(r for r in watchlist.list_symbols() if r['symbol'] == '600000.SH') == saved
+
+
+def test_tail_watchlist_disk_failure_is_visible_retries_and_does_not_block_alerts(env, monkeypatch):
+    from app.services import watchlist
+    _wire_tail_watchlist(env, monkeypatch)
+    original = watchlist.add_strategy_results
+    monkeypatch.setattr(watchlist, 'add_strategy_results', lambda *a: (_ for _ in ()).throw(OSError('disk unavailable')))
+    env.service.tick(confirmed(env))
+    _wait_tail_watchlist(env.service)
+    assert len(env.quotes.pushed) == 1
+    assert env.service.get()['watchlist']['warning']
+    monkeypatch.setattr(watchlist, 'add_strategy_results', original)
+    env.service.tick(NOW.replace(hour=15, minute=2))
+    _wait_tail_watchlist(env.service)
+    assert [r['symbol'] for r in watchlist.list_symbols()] == ['600000.SH']
+    assert env.service.get()['watchlist']['warning'] is None
+    assert len(env.quotes.pushed) == 1
