@@ -85,9 +85,29 @@ class CloseWatchService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self.path, json.dumps(state, ensure_ascii=False, allow_nan=False, indent=2))
 
+    def _name_map(self):
+        getter = getattr(getattr(self.screener, 'repo', None), 'get_name_map', None)
+        try:
+            return getter() if getter else {}
+        except (OSError, ValueError, KeyError):
+            logger.warning('尾盘证券名称暂不可读取，保留原有名称')
+            return {}
+
+    @staticmethod
+    def _display_name(symbol, original, names):
+        name = names.get(symbol) or original
+        return name if name and name != symbol else '名称待补齐'
+
     def get(self):
         with self.lock:
             result = {k:v for k,v in self._load().items() if k not in {'seen','outbox'}}
+        names = self._name_map()
+        for key in ['tracks', 'candidates', 'watch_status', 'events']:
+            for row in result[key]:
+                old = row.get('name') or row['symbol']
+                row['name'] = self._display_name(row['symbol'], old, names)
+                if 'message' in row and row['name'] != old:
+                    row['message'] = row['message'].replace(f'：{old} ', f'：{row["name"]} ', 1)
         if self.notifications:
             result['dingtalk'] = self.notifications.status()
         rules = self._active_watchlist_rules()
@@ -364,10 +384,12 @@ class CloseWatchService:
             state['tracks'] = self._seed_tracks(market,signals,t,dates,assets,hold)
             state['seeded'] = True
             state['seeded_on'] = str(day)
+        names = self._name_map()
         events, candidates, checked, remaining = [], [], [], []
         exiting = set()
         for track in state['tracks']:
             symbol = track['symbol']
+            track['name'] = self._display_name(symbol, track['name'], names)
             item = {**track,'price':None,'floor_price':None,'signal_age':None,
                     'reasons':[],'message':'该标的行情缺失或过期，未判断卖点','ended':False}
             checked.append(item)
@@ -376,7 +398,8 @@ class CloseWatchService:
                 if item['reasons']:
                     exiting.add(symbol)
                     events.append(self._event(state,now,phase,symbol,track['name'],'sell_signal',
-                        track['id']+':exit','；'.join(item['reasons']),rows[symbol]['raw_close']))
+                        track['id']+':exit','；'.join(item['reasons']),rows[symbol]['raw_close'],
+                        floor_price=item['floor_price'], floor_signal_date=track['signal_date']))
                     item['ended'] = phase=='confirmed'
             if not item['ended']:
                 remaining.append(track)
@@ -389,13 +412,17 @@ class CloseWatchService:
                 stale_candidates.add(symbol)
                 continue
             note = '原观察出现卖点，卖点优先' if symbol in exiting else '已在信号观察中，不重置原防守线' if symbol in active else ''
-            row = {'symbol':symbol,'name':market.names[int(a)] or symbol,'price':rows[symbol]['raw_close'],
+            floor_track = next((x for x in checked if x['symbol'] == symbol), None) or self._track(symbol, str(day), symbol)
+            defense = self._reasons(floor_track, market, signals, t, dates, assets, hold)
+            row = {'symbol':symbol,'name':self._display_name(symbol, market.names[int(a)], names),'price':rows[symbol]['raw_close'],
+                   'floor_price':defense['floor_price'], 'floor_signal_date':floor_track['signal_date'],
                    'signal_date':str(day),'score':float(signals.score[t,a]),'note':note}
             candidates.append(row)
             if symbol in exiting:
                 continue
             events.append(self._event(state,now,phase,symbol,row['name'],'buy_signal','entry',
-                '当日买入候选'+('；'+note if note else ''),row['price']))
+                '当日买入候选'+('；'+note if note else ''),row['price'],
+                floor_price=row['floor_price'], floor_signal_date=row['floor_signal_date']))
             if phase=='confirmed' and symbol not in active:
                 track = self._track(symbol,str(day),row['name'])
                 state['tracks'].append(track)
@@ -410,10 +437,10 @@ class CloseWatchService:
                     continue
                 symbol = previous['symbol']
                 if previous['type']=='buy_signal' and symbol not in final_symbols:
-                    events.append(self._event(state,now,phase,symbol,previous['name'],'pool_exit',
+                    events.append(self._event(state,now,phase,symbol,self._display_name(symbol, previous['name'], names),'pool_exit',
                         'cancelled_buy','尾盘买入预警未获收盘确认',rows[symbol]['raw_close']))
                 if previous['type']=='sell_signal' and any(x['symbol']==symbol and not x['reasons'] for x in checked):
-                    events.append(self._event(state,now,phase,symbol,previous['name'],'pool_exit',
+                    events.append(self._event(state,now,phase,symbol,self._display_name(symbol, previous['name'], names),'pool_exit',
                         'cancelled_sell','尾盘卖出预警未获收盘确认',rows[symbol]['raw_close']))
         state.update(candidates=candidates,watch_status=checked,as_of=str(day),phase=phase,
             checked_at=now.isoformat(),status='running',
@@ -431,16 +458,26 @@ class CloseWatchService:
             state['events'].insert(0,event)
         state['events'] = state['events'][:200]
 
-    def _event(self, state, now, phase, symbol, name, event_type, reason, text, price):
+    def _event(self, state, now, phase, symbol, name, event_type, reason, text, price,
+               *, floor_price=None, floor_signal_date=None):
         tag = '尾盘预警' if phase=='preview' else '收盘确认'
         execution = '，当天信号提醒；不代表已买入或已卖出'
         if event_type=='pool_exit':
             execution = '，不作为已确认卖出条件' if '卖出' in text else '，不作为已确认买点'
+        if floor_signal_date is not None:
+            if floor_price is None:
+                text += '；防守参考价待核对'
+            else:
+                text += f'；防守参考价{floor_price:.2f}元（原买点{floor_signal_date}）'
+                text += '；收盘失守条件，非保证成交价'
+                if price < floor_price:
+                    text += '；注意：参考价已低于防守线，不能视为正常的下方止损价'
         return {'id':_digest([str(now.date()),phase,event_type,symbol,reason,state['binding']['revision']]),
             'ts':int(now.timestamp()*1000),'day':str(now.date()),'phase':phase,
             'source':'strategy','rule_id':'close_watch','strategy_id':state['binding']['strategy_id'],
             'strategy_revision':state['binding']['revision'],
             'type':event_type,'symbol':symbol,'name':name,'price':float(price),'change_pct':0.,
+            'floor_price':floor_price, 'floor_signal_date':floor_signal_date,
             'severity':'warn' if event_type=='sell_signal' else 'info','signals':[text],
             'message':f'策略「{state["binding"]["name"]}」{tag}：{name} {text}{execution}'}
 

@@ -75,7 +75,7 @@ export function CloseWatchPanel() {
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2"><div className="text-xs font-medium">最近检查的买入候选{state?.as_of && <span className="ml-2 text-muted">{state.as_of}</span>}</div>
           {!state?.candidates.length && <p className="text-[11px] text-muted">尚无可展示候选；请结合上方行情状态判断，旧日数据不会当作今日信号。</p>}
-          {state?.candidates.map(c => <div key={c.symbol} className="rounded-btn border border-border p-2 text-[11px]">{c.name} {c.symbol} · {fmtPrice(c.price)} · 信号日{c.signal_date}{c.note && <p className="mt-1 text-muted">{c.note}</p>}</div>)}
+          {state?.candidates.map(c => <div key={c.symbol} className="rounded-btn border border-border p-2 text-[11px]">{c.name} {c.symbol} · {fmtPrice(c.price)} · 信号日{c.signal_date}<p className="mt-1 text-muted">防守参考价：{c.floor_price == null ? '待核对' : `${fmtPrice(c.floor_price)}元`} · 收盘失守条件，非保证成交价{c.floor_signal_date && ` · 原买点${c.floor_signal_date}`}</p>{c.floor_price != null && c.price < c.floor_price && <p className="mt-1 text-warning">参考价已低于防守线，不能视为正常的下方止损价</p>}{c.note && <p className="mt-1 text-muted">{c.note}</p>}</div>)}
         </div>
         <div className="space-y-2"><div className="text-xs font-medium">买点后的自动信号观察</div>
           <p className="text-[11px] text-muted">只跟踪买点和卖点，不计算实际仓位或资金。首次补入可用历史中尚未出现卖点的观察，不补发旧日提醒。</p>
@@ -83,6 +83,7 @@ export function CloseWatchPanel() {
           {state?.watch_status.map(t => <div key={t.id} className="rounded-btn border border-border p-2 text-[11px]">
             <span className="font-medium">{t.name} {t.symbol}</span> · 原买点{t.signal_date}
             <p className="mt-1 text-muted">买点后{t.signal_age ?? '未知'}日 · 原防守线{t.floor_price == null ? '待计算' : fmtPrice(t.floor_price)}</p>
+            {t.floor_price != null && t.price != null && t.price < t.floor_price && <p className="mt-1 text-warning">参考价已低于防守线，不能视为正常的下方止损价</p>}
             <p className={t.reasons.length ? 'mt-1 text-warning' : 'mt-1 text-muted'}>{t.reasons.join('；') || t.message}</p>
             {t.ended && <p className="mt-1 text-muted">卖点已确认，本次观察结束；不代表已实际卖出。</p>}
           </div>)}

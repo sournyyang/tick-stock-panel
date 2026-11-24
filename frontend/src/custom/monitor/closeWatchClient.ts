@@ -14,7 +14,7 @@ export interface CloseWatchState {
   phase: 'preview' | 'confirmed' | null
   binding: { strategy_id: string; name: string; revision: string; start_time: string; max_hold_days: number | null } | null
   tracks: SignalTrack[]
-  candidates: Array<{ symbol: string; name: string; price: number; signal_date: string; note?: string }>
+  candidates: Array<{ symbol: string; name: string; price: number; signal_date: string; floor_price?: number | null; floor_signal_date?: string; note?: string }>
   watch_status: Array<SignalTrack & { price: number | null; floor_price: number | null; signal_age: number | null; reasons: string[]; message: string; ended: boolean }>
   checked_at?: string
   as_of?: string

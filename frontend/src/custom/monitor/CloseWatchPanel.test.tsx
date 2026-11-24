@@ -119,3 +119,16 @@ it('shows confirmed-buy watchlist behavior and persistent write failures', async
   expect(host.textContent).toContain('尾盘临时预警不自动加入')
   expect(host.querySelector('[role="alert"]')?.textContent).toContain('自动加入自选失败')
 })
+
+
+it('shows named buy and defense warning without pretending it is a guaranteed stop fill', async () => {
+  vi.mocked(closeWatchApi.state).mockResolvedValueOnce({ ...initial, candidates: [{
+    symbol: '300885.SZ', name: '海昌新材', price: 15.23, signal_date: '2026-11-23',
+    floor_price: 17.55, floor_signal_date: '2026-11-23',
+  }] })
+  await render()
+  expect(host.textContent).toContain('海昌新材 300885.SZ')
+  expect(host.textContent).toContain('17.55')
+  expect(host.textContent).toContain('参考价已低于防守线')
+  expect(host.textContent).toContain('非保证成交价')
+})

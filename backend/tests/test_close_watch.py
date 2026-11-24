@@ -442,3 +442,78 @@ def test_tail_watchlist_disk_failure_is_visible_retries_and_does_not_block_alert
     assert [r['symbol'] for r in watchlist.list_symbols()] == ['600000.SH']
     assert env.service.get()['watchlist']['warning'] is None
     assert len(env.quotes.pushed) == 1
+
+
+def test_tail_buy_has_canonical_name_and_signal_bound_defense(env):
+    state = env.service._load()
+    state.update(seeded=True, tracks=[])
+    env.service._save(state)
+    env.service.screener.repo.get_name_map = lambda: {'600000.SH': '示例名称'}
+    env.service.tick(NOW)
+    state = env.service.get()
+    candidate = state['candidates'][0]
+    assert candidate['name'] == '示例名称'
+    assert abs(candidate['floor_price']-10.4*.97) < 1e-5
+    alert = env.quotes.pushed[0]
+    assert alert['name'] == '示例名称'
+    assert '防守参考价10.09' in alert['message']
+    assert alert['floor_signal_date'] == str(DAY)
+
+
+
+def test_display_names_recover_old_events_without_replay_or_state_rewrite(env):
+    env.service.tick(confirmed(env))
+    before = env.service.path.read_text()
+    sent = len(env.quotes.pushed)
+    env.service.screener.repo.get_name_map = lambda: {'600000.SH': '示例名称'}
+    state = env.service.get()
+    for key in ['tracks', 'candidates', 'watch_status', 'events']:
+        assert all(row['name'] == '示例名称' for row in state[key] if row['symbol'] == '600000.SH')
+    assert '示例名称' in state['events'][0]['message']
+    assert env.service.path.read_text() == before and len(env.quotes.pushed) == sent
+
+
+def test_defense_is_unadjusted_for_display_and_existing_observation_keeps_its_signal_date(env):
+    track = tracked(env)
+    factor = 2
+    market = replace(env.market, fields={**env.market.fields, 'raw_close': env.market.field('raw_close')*factor})
+    env.service._market = lambda *a: market
+    env.quotes.get_enriched_today = lambda: (env.current.with_columns((pl.col('raw_close')*factor).alias('raw_close')), DAY)
+    env.service.tick(NOW)
+    candidate = env.service.get()['candidates'][0]
+    assert abs(candidate['floor_price']-10.4*.97*factor) < 1e-5
+    assert candidate['floor_signal_date'] == track['signal_date']
+    assert env.service.get()['tracks'][0]['signal_date'] == track['signal_date']
+
+
+def test_floor_above_quote_is_explicit_in_buy_message_not_silently_capped(env, monkeypatch):
+    from app.custom.close_watch.dingtalk import CloseWatchDingTalk
+    native = env.engine.get('demo').matrix_strategy
+    compute = native.compute_signals
+
+    def above(market, params):
+        signals = compute(market, params)
+        floors = (market.close*1.2).astype('float32')
+        floors.flags.writeable = False
+        return replace(signals, entry_close_floor=floors)
+
+    monkeypatch.setattr(native, 'compute_signals', above)
+    # Empty observations keep this a new buy, rather than an existing-bound-line sell.
+    state = env.service._load()
+    state.update(seeded=True, tracks=[])
+    env.service._save(state)
+    env.service.tick(NOW)
+    alert = env.quotes.pushed[0]
+    assert alert['floor_price'] > alert['price']
+    assert '参考价已低于防守线' in alert['message']
+    assert '非保证成交价' in CloseWatchDingTalk._message(alert)[1]
+
+
+def test_missing_names_do_not_stop_signal_calculation(env):
+    def unavailable():
+        raise OSError('dimension unavailable')
+
+    env.service.screener.repo.get_name_map = unavailable
+    env.service.tick(NOW)
+    assert env.service.get()['status'] == 'running'
+    assert env.quotes.pushed[0]['type'] == 'buy_signal'
