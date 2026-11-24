@@ -1014,6 +1014,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [start, setStart] = useState(saved?.start ?? THREE_MONTHS_AGO)
   const [end, setEnd] = useState(saved?.end ?? TODAY)
   // 成交口径: 建仓/清仓可独立配置。向后兼容老 matching (派生为 entry=exit=matching)。
+  const [requestedTailFill, setTailFill] = useState(saved?.tailFill ?? false)
+  const supportsTailFill = selectedStrategy === 'custom_triple_volume_two60_body25' && assetType === 'stock'
+  const tailFill = supportsTailFill && requestedTailFill
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
   const [requestedEntryFill, setEntryFill] = useState<'close_t' | 'open_t+1'>(saved?.entryFill ?? saved?.matching ?? 'open_t+1')
   const [requestedExitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
@@ -1076,6 +1079,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     }
     if (cfg.start) setStart(String(cfg.start).slice(0, 10))
     if (cfg.end) setEnd(String(cfg.end).slice(0, 10))
+    setTailFill(cfg.tail_fill === true)
     if (cfg.entry_fill === 'close_t' || cfg.entry_fill === 'open_t+1') setEntryFill(cfg.entry_fill)
     if (cfg.exit_fill === 'close_t' || cfg.exit_fill === 'open_t+1' || cfg.exit_fill === 'signal_next_minute') {
       setExitFill(cfg.exit_fill)
@@ -1305,6 +1309,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         matching,
         entryFill,
         exitFill,
+        tailFill,
         fees,
         stampTax,
         slippage,
@@ -1346,6 +1351,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
       matching,
       entry_fill: entryFill,
       exit_fill: exitFill,
+      tail_fill: tailFill,
       commission_pct: Number(fees) / 10000,
       stamp_tax_pct: Number(stampTax) / 1000,
       slippage_bps: Number(slippage),
@@ -1441,6 +1447,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     lines.push(`净值曲线天数,${result.equity_curve?.length ?? 0}`)
     lines.push(`完成交易数,${result.trades?.length ?? 0}`)
     lines.push(`总收益,${pct(strategyReturn)}`)
+    if (result.config?.tail_fill === true) lines.push('成交口径,信号当天尾盘（14:42 分钟 K 线开盘）')
     lines.push(`年化收益,${pct(s.annual_return)}`)
     lines.push(`同期基准,${pct(benchmarkReturn)}`)
     lines.push(`超额收益,${pct(excessReturn)}`)
@@ -1649,6 +1656,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         if (config.asset_type === 'stock' || config.asset_type === 'etf') setAssetType(config.asset_type)
         if (config.start) setStart(String(config.start).slice(0, 10))
         if (config.end) setEnd(String(config.end).slice(0, 10))
+        setTailFill(config.tail_fill === true)
         if (config.entry_fill === 'close_t' || config.entry_fill === 'open_t+1') setEntryFill(config.entry_fill)
         if (config.exit_fill === 'close_t' || config.exit_fill === 'open_t+1' || config.exit_fill === 'signal_next_minute') {
           setExitFill(config.exit_fill)
@@ -2148,13 +2156,27 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
           )}
         </div>
 
+        {supportsTailFill && (
+          <label className="flex items-start gap-2 rounded-btn border border-border px-3 py-2 text-xs">
+            <input type="checkbox" className="mt-0.5" checked={tailFill}
+              onChange={e => setTailFill(e.target.checked)} />
+            <span>
+              信号当天尾盘成交
+              <span className="mt-1 block text-[10px] leading-4 text-muted">
+                14:40 检查，按 14:42 分钟 K 线开盘价模拟。仅卖出此前买入的仓位，须有连续分钟数据。
+              </span>
+            </span>
+          </label>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <div>
             <div className="mb-1.5 flex items-center gap-1">
               <label className="text-xs font-medium text-secondary">建仓口径</label>
               <FillRuleHint />
             </div>
-            {isMinuteStrategy ? (
+            {tailFill ? (
+              <div className={INPUT_CLS}>信号日尾盘（14:42 K 线开盘）</div>
+            ) : isMinuteStrategy ? (
               <div className={`${INPUT_CLS} flex items-center gap-1.5`} title="信号在盘中触发分钟成交，无次日开盘口径">
                 <Clock className="h-3 w-3 text-sky-400 shrink-0" />
                 <span className="text-secondary">信号分钟收盘</span>
@@ -2169,7 +2191,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-secondary">清仓口径</label>
-            <select
+            {tailFill ? (
+              <div className={INPUT_CLS}>卖出信号日尾盘</div>
+            ) : <select
               aria-label="清仓口径"
               value={exitFill}
               disabled={!!executionRequirements?.exit_fill}
@@ -2181,9 +2205,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               {highGranularity && minuteExitTriggerSupported && !isMinuteStrategy && (
                 <option value="signal_next_minute">信号触发卖出 BETA</option>
               )}
-            </select>
+            </select>}
           </div>
-          {(executionRequirements?.entry_fill || executionRequirements?.exit_fill) && (
+          {!tailFill && (executionRequirements?.entry_fill || executionRequirements?.exit_fill) && (
             <div className="col-span-2 text-[10px] leading-4 text-muted">
               成交口径按策略要求固定，旧配置中的冲突设置会自动调整。
             </div>
@@ -2688,11 +2712,17 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
             transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
             className="space-y-4"
           >
+            {result.config?.tail_fill === true && resultTradeDays < 60 && (
+              <p className="text-[11px] text-muted">尾盘回放少于 60 个交易日，显示区间收益，省略年化和蒙卡回撤。</p>
+            )}
             {/* 策略信息 */}
             {result.strategy_info && (
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm font-medium text-foreground">{result.strategy_info.name}</span>
+                  {result.config?.tail_fill === true && (
+                    <span className="rounded border border-accent/30 bg-accent/10 px-1 py-px text-[9px] text-accent">当天尾盘成交</span>
+                  )}
                   {result.stats.full_kind === 'candidate_execution' && (
                     <span className="text-[9px] px-1 py-px rounded border border-accent/30 bg-accent/10 text-accent">全量独立执行</span>
                   )}

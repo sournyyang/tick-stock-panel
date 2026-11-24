@@ -330,3 +330,23 @@ it('已保存的归档策略仍能载入, 恢复后缓存刷新可重新选择',
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
   expect(host.textContent).not.toContain('归档策略（已归档）')
 })
+
+it('实体2.5%策略可提交信号当天尾盘成交，关闭后恢复次日开盘', async () => {
+  const { api } = await import('@/lib/api')
+  const { startBacktest } = await import('@/lib/backtestTask')
+  const detail = { ...portfolioDetail, id: 'custom_triple_volume_two60_body25' }
+  vi.mocked(api.dataStatus).mockResolvedValue(busy)
+  vi.mocked(api.screenerStrategies).mockResolvedValue({ presets: [detail], load_errors: [], legacy_migration: undefined })
+  vi.mocked(api.strategyGet).mockResolvedValue(detail)
+  storage.strategyBacktestLast.set({ selectedStrategy: detail.id, assetType: 'stock' } as Parameters<typeof storage.strategyBacktestLast.set>[0])
+  await renderPage()
+  const label = [...host.querySelectorAll('label')].find(item => item.textContent?.includes('信号当天尾盘成交'))!
+  const toggle = label.querySelector<HTMLInputElement>('input')!
+  await act(async () => toggle.click())
+  expect(host.textContent).toContain('信号日尾盘（14:42 K 线开盘）')
+  await act(async () => runButton()!.click())
+  expect(startBacktest).toHaveBeenLastCalledWith(expect.objectContaining({ tail_fill: true, minute_fill: false, mode: 'position' }))
+  await act(async () => toggle.click())
+  await act(async () => runButton()!.click())
+  expect(startBacktest).toHaveBeenLastCalledWith(expect.objectContaining({ tail_fill: false, entry_fill: 'open_t+1', exit_fill: 'open_t+1' }))
+})

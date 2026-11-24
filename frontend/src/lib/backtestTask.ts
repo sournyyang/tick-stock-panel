@@ -213,6 +213,7 @@ export function startBacktest(params: {
   holding_days?: number
   asset_type?: 'stock' | 'etf'
   minute_fill?: boolean
+  tail_fill?: boolean
   regime_filter?: { states?: string[]; min_score?: number } | null
   /** 忽略服务端同参数任务的结果缓存 (5 分钟), 必然重新计算; 重连/取消按 qs 对齐同一任务 */
   force?: boolean
@@ -248,6 +249,7 @@ export function startBacktest(params: {
     holding_days: params.holding_days,
     asset_type: params.asset_type,
     minute_fill: params.minute_fill,
+    tail_fill: params.tail_fill ? 1 : undefined,
     regime_filter: params.regime_filter ? JSON.stringify(params.regime_filter) : undefined,
     force: params.force ? 1 : undefined,
   })

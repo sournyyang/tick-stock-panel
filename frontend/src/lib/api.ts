@@ -4096,6 +4096,7 @@ export const api = {
     position_policy_params?: Record<string, number | boolean | string> | null
     asset_type?: 'stock' | 'etf' | 'index'
     minute_fill?: boolean
+    tail_fill?: boolean
   }) =>
     request<StrategyBacktestResult>('/api/backtest/strategy/run', {
       method: 'POST',

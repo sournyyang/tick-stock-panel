@@ -1884,6 +1884,8 @@ class KlineRepository:
         symbols: list[str],
         dates: list[date],
         asset_type: str = "stock",
+        *,
+        adjusted: bool = True,
     ) -> pl.DataFrame:
         """按日期列表精确读取分钟K分区文件 (分钟K精确回测用)。
 
@@ -1916,7 +1918,7 @@ class KlineRepository:
                 .sort(["symbol", "datetime"]),
                 streaming=True,
             )
-            return self._maybe_adjust_minute(df, asset_type)
+            return self._maybe_adjust_minute(df, asset_type) if adjusted else df
         except Exception as e:  # noqa: BLE001
             logger.warning("分钟K按日期查询失败: %s", e)
             return pl.DataFrame()

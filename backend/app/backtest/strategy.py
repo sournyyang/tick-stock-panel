@@ -667,6 +667,7 @@ class StrategyBacktestConfig:
     # 市场环境过滤: {"states": ["strong",...], "min_score": 60}。
     # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
     regime_filter: dict | None = None
+    tail_fill: bool = False
 
     def __post_init__(self) -> None:
         if self.entry_fill is None:
@@ -1362,6 +1363,23 @@ class StrategyBacktestService:
         except ValueError as e:
             return _err(str(e))
 
+        tail_execution = None
+        tail_coverage = None
+        if config.tail_fill:
+            from app.backtest.tail_session import STRATEGY_ID
+
+            if (config.strategy_id != STRATEGY_ID or s.execution_backend != "matrix_native"
+                    or config.mode != "position" or config.asset_type != "stock"):
+                return _err("信号当天尾盘成交仅支持实体2.5%策略的股票仓位回测")
+            if not s.matrix_strategy.required_fields() <= {
+                "open", "high", "low", "close", "volume", "raw_close", "price_limit_pct", "listing_date",
+            }:
+                return _err("当前版本的策略使用了尾盘回放无法重建的字段")
+            if config.minute_fill or config.position_sizing == "policy":
+                return _err("尾盘成交暂不支持分钟穿越成交或自定义仓位策略")
+            if config.end < config.start:
+                return _err("尾盘成交的结束日必须不早于开始日")
+
         # Reject incompatible execution before loading quotes or spawning a long
         # matrix calculation; a recommendation must not stand in for a contract.
         requirements = s.meta.get("backtest_requirements") or {}
@@ -1373,6 +1391,8 @@ class StrategyBacktestService:
         }
         conflicts = []
         for field_name, required in requirements.items():
+            if config.tail_fill and field_name in {"entry_fill", "exit_fill"}:
+                continue
             if getattr(config, field_name) != required:
                 label, choices = labels[field_name]
                 conflicts.append(f"{label}为「{choices[required]}」")
@@ -1431,6 +1451,19 @@ class StrategyBacktestService:
                 f"移动止盈回撤({trailing_take_profit_drawdown:.0%})不能大于"
                 f"激活涨幅({trailing_take_profit_activate:.0%}), 请调整后再试"
             )
+        if config.tail_fill:
+            if overlay_conditions or effective_scoring(s.meta.get("scoring"), overrides):
+                return _err("尾盘成交暂不支持叠加条件或自定义评分")
+            if any(basic_filter.get(k) is not None for k in (
+                "amount_min", "amount_max", "turnover_min", "turnover_max",
+                "market_cap_min", "market_cap_max", "float_cap_min", "float_cap_max",
+            )):
+                return _err("尾盘成交暂不支持需要盘中市值、成交额或换手率的基础过滤")
+            if any(rule is not None for rule in (
+                stop_loss, take_profit, trailing_stop, trailing_take_profit_activate,
+                trailing_take_profit_drawdown,
+            )):
+                return _err("尾盘成交仅回放策略本身的卖点、防守线和到期退出")
         max_hold_days = self._override_value(overrides, "max_hold_days", s.max_hold_days)
         score_min, score_max = self._normalize_score_range(
             overrides.get("score_min"),
@@ -1632,8 +1665,8 @@ class StrategyBacktestService:
         position_policy_compute, position_policy_params = _resolve_position_policy(config)
         matcher_config = MatcherConfig(
             matching=config.matching,
-            entry_fill=config.entry_fill,
-            exit_fill=config.exit_fill,
+            entry_fill="close_t" if config.tail_fill else config.entry_fill,
+            exit_fill="close_t" if config.tail_fill else config.exit_fill,
             fees_pct=config.fees_pct,
             commission_pct=config.commission_pct,
             stamp_tax_pct=config.stamp_tax_pct,
@@ -1830,16 +1863,16 @@ class StrategyBacktestService:
                     descending=bool(s.meta.get("descending", True)),
                     protect_strategy_cache=prepared is not None,
                 )
-                if prepared is None:
-                    signal_matrix = MatrixStrategyPipeline().run(
-                        s.matrix_strategy,
-                        market_data,
-                        params,
-                        pipeline_config,
-                        timing_ms,
+                if config.tail_fill:
+                    from app.backtest.tail_session import build_tail_execution
+
+                    market_matrix, tail_execution, tail_coverage = build_tail_execution(
+                        self.engine.repo, market_data, s.matrix_strategy, params, pipeline_config,
+                        start_id, stop_id, entry_allowed=entry_time_mask, evidence=evidence,
+                        cancel_event=cancel_event,
                     )
                 else:
-                    with prepared.compute_cache.activate(market_data):
+                    if prepared is None:
                         signal_matrix = MatrixStrategyPipeline().run(
                             s.matrix_strategy,
                             market_data,
@@ -1847,68 +1880,88 @@ class StrategyBacktestService:
                             pipeline_config,
                             timing_ms,
                         )
+                    else:
+                        with prepared.compute_cache.activate(market_data):
+                            signal_matrix = MatrixStrategyPipeline().run(
+                                s.matrix_strategy,
+                                market_data,
+                                params,
+                                pipeline_config,
+                                timing_ms,
+                            )
             except (TypeError, ValueError) as e:
-                return _err(f"矩阵策略信号计算失败: {e}")
+                return _err(str(e) if config.tail_fill else f"矩阵策略信号计算失败: {e}")
 
-            if evidence is not None:
-                evidence.check_matrix(
-                    market_data, signal_matrix,
-                    lambda data: MatrixStrategyPipeline().run(
-                        s.matrix_strategy, data, params, pipeline_config,
-                    ),
-                )
+            if config.tail_fill:
+                raw_candidates = int(market_matrix.entry.sum())
+                selection_stats = {
+                    "strategy_matches": raw_candidates,
+                    "entry_candidates": raw_candidates,
+                    "entry_trigger_filtered": 0,
+                    "entry_trigger_enabled": False,
+                }
+                timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
+                del market_data
+            else:
+                if evidence is not None:
+                    evidence.check_matrix(
+                        market_data, signal_matrix,
+                        lambda data: MatrixStrategyPipeline().run(
+                            s.matrix_strategy, data, params, pipeline_config,
+                        ),
+                    )
 
-            sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
-            sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
-            sim_signal_matrix = apply_time_masks(
-                sim_signal_matrix,
-                entry_time_mask[start_id:stop_id],
-                exit_time_mask[start_id:stop_id],
-            )
-            # 叠加条件: 在矩阵 fields (依赖已并入 feature_plan) 上按 (时间, 标的)
-            # 评估, AND 进 entry; exit 不动 — 已持仓卖出不受影响。
-            if overlay_conditions:
-                overlay_mask, overlay_err = self._overlay_matrix_mask(
-                    market_data, overlay_conditions
-                )
-                if overlay_err is not None:
-                    return _err(overlay_err)
-                # np.where 产物可写, 须恢复只读不变量 (SignalMatrix 校验会拒)。
-                # 该路径此前被"扩展字段不可用"挡在更早阶段, 普通列叠加同样会触发。
-                overlay_entry = np.where(
-                    overlay_mask[start_id:stop_id],
-                    sim_signal_matrix.entry,
-                    0,
-                ).astype(sim_signal_matrix.entry.dtype)
-                overlay_entry.flags.writeable = False
-                sim_signal_matrix = replace(
+                sim_market_data = slice_market_data_matrix(market_data, start_id, stop_id)
+                sim_signal_matrix = slice_signal_matrix(signal_matrix, start_id, stop_id)
+                sim_signal_matrix = apply_time_masks(
                     sim_signal_matrix,
-                    entry=overlay_entry,
+                    entry_time_mask[start_id:stop_id],
+                    exit_time_mask[start_id:stop_id],
                 )
-            timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
-            if not sim_signal_matrix.entry.any():
-                return _err("在指定区间内未产生买入信号")
+                # 叠加条件: 在矩阵 fields (依赖已并入 feature_plan) 上按 (时间, 标的)
+                # 评估, AND 进 entry; exit 不动 — 已持仓卖出不受影响。
+                if overlay_conditions:
+                    overlay_mask, overlay_err = self._overlay_matrix_mask(
+                        market_data, overlay_conditions
+                    )
+                    if overlay_err is not None:
+                        return _err(overlay_err)
+                    # np.where 产物可写, 须恢复只读不变量 (SignalMatrix 校验会拒)。
+                    # 该路径此前被"扩展字段不可用"挡在更早阶段, 普通列叠加同样会触发。
+                    overlay_entry = np.where(
+                        overlay_mask[start_id:stop_id],
+                        sim_signal_matrix.entry,
+                        0,
+                    ).astype(sim_signal_matrix.entry.dtype)
+                    overlay_entry.flags.writeable = False
+                    sim_signal_matrix = replace(
+                        sim_signal_matrix,
+                        entry=overlay_entry,
+                    )
+                timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
+                if not sim_signal_matrix.entry.any():
+                    return _err("在指定区间内未产生买入信号")
 
-            raw_candidates = int(sim_signal_matrix.entry.sum())
-            selection_stats = {
-                "strategy_matches": raw_candidates,
-                "entry_candidates": raw_candidates,
-                "entry_trigger_filtered": 0,
-                "entry_trigger_enabled": False,
-            }
-            del market_data, signal_matrix
+                raw_candidates = int(sim_signal_matrix.entry.sum())
+                selection_stats = {
+                    "strategy_matches": raw_candidates,
+                    "entry_candidates": raw_candidates,
+                    "entry_trigger_filtered": 0,
+                    "entry_trigger_enabled": False,
+                }
+                del market_data, signal_matrix
 
-            t_matrix = time.perf_counter()
-            market_matrix = build_market_matrix_from_signals(
-                sim_market_data,
-                sim_signal_matrix,
-                entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
-                reference_price=reference_price,
-                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
-            )
-            timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
-            del sim_market_data, sim_signal_matrix
+                t_matrix = time.perf_counter()
+                market_matrix = build_market_matrix_from_signals(
+                    sim_market_data,
+                    sim_signal_matrix,
+                    entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
+                    exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                    reference_price=reference_price,
+                    minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                )
+                timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
+                del sim_market_data, sim_signal_matrix
         else:
             if panel is None or formal_range is None:
                 return _err("非矩阵策略不能使用共享基础矩阵")
@@ -2042,6 +2095,7 @@ class StrategyBacktestService:
                 progress_cb,
                 cancel_event,
                 result_policy.simulation_options(),
+                **({"tail_fill": tail_execution} if tail_execution is not None else {}),
             )
         timing_ms["simulate"] = round((time.perf_counter() - t_sim) * 1000, 1)
         timing_ms["statistics"] = float(result.stats.pop("statistics_ms", 0.0))
@@ -2066,6 +2120,18 @@ class StrategyBacktestService:
         result.stats["full_feature_fallback"] = feature_plan.full_feature_fallback
         result.stats["execution_backend"] = s.execution_backend
         result.stats["selection"] = selection_stats
+        if tail_coverage is not None:
+            from app.backtest.tail_session import FILL_BAR, SIGNAL_TIME
+
+            result.stats["tail_execution"] = {
+                "signal_time": SIGNAL_TIME,
+                "fill_bar": FILL_BAR.strftime("%H:%M"),
+                "coverage": tail_coverage,
+            }
+            if len(tail_coverage) < 60:
+                for metric in ("annual_return", "calmar", "sharpe", "sortino",
+                               "mc_account_maxdd_p50", "mc_account_maxdd_p95", "mc_maxdd_p50", "mc_maxdd_p95"):
+                    result.stats[metric] = None
         result.stats["shared_market_data"] = prepared is not None
         result.stats["matrix_data_cache_hit"] = matrix_data_cache_hit
         result.stats["matrix_data_cache_status"] = matrix_data_cache_status
@@ -3057,8 +3123,9 @@ class StrategyBacktestService:
             "matching": c.matching,
             "entry_fill": c.entry_fill,
             "exit_fill": c.exit_fill,
+            "tail_fill": c.tail_fill,
             "timing_mode": (
-                "strict"
+                "tail_session" if c.tail_fill else "strict"
                 if c.entry_fill == "open_t+1" and c.exit_fill == "open_t+1"
                 else "custom"
             ),

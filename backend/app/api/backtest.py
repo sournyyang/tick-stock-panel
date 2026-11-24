@@ -390,6 +390,7 @@ class StrategyBacktestRequest(BaseModel):
     holding_days: int = 5
     asset_type: str = "stock"
     minute_fill: bool = False
+    tail_fill: bool = False
     regime_filter: dict | None = None
 
 
@@ -461,6 +462,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         holding_days=req.holding_days,
         asset_type=req.asset_type,
         minute_fill=req.minute_fill,
+        tail_fill=req.tail_fill,
         regime_filter=req.regime_filter,
     )
     task = make_worker_task("backtest", settings.data_dir, cfg)
@@ -687,8 +689,9 @@ def _make_job_key(
     position_policy: str | None = None,
     position_policy_params: str | None = None,
     force: bool = False,
+    tail_fill: bool = False,
 ) -> str:
-    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}|{position_policy}|{position_policy_params}|force={force}"
+    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}|{position_policy}|{position_policy_params}|force={force}|tail={tail_fill}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -720,6 +723,7 @@ async def strategy_stream(
     minute_fill: bool = False,
     regime_filter: str | None = None,
     force: bool = False,
+    tail_fill: bool = False,
 ):
     """SSE 流式策略回测: 实时推送进度, 完成后推送结果, 支持重连 (刷新/切页后恢复)。
 
@@ -769,6 +773,7 @@ async def strategy_stream(
         position_policy=position_policy,
         position_policy_params=position_policy_params,
         force=force,
+        tail_fill=tail_fill,
     )
 
     _cleanup_stale_jobs()
@@ -835,6 +840,7 @@ async def strategy_stream(
                 holding_days=int(holding_days),
                 asset_type=asset_type,
                 minute_fill=minute_fill,
+                tail_fill=tail_fill,
                 regime_filter=json.loads(regime_filter) if regime_filter else None,
             )
 
@@ -952,6 +958,7 @@ async def strategy_cancel(request: Request):
         position_policy=_get("position_policy") or None,
         position_policy_params=_get("position_policy_params") or None,
         force=_get_opt_bool("force"),
+        tail_fill=_get_opt_bool("tail_fill"),
     )
     # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
     with _jobs_lock:
