@@ -336,7 +336,7 @@ def load_evidence(data_dir: Path, run_id: str) -> dict:
 def audit_trade_timing(trades: list[dict], config: dict, backend: str) -> dict:
     """检查已记录的信号日与成交日，不把期末估值记录当成次日信号成交。"""
     differences, compared, examples = 0, 0, []
-    tail_fill = config.get("tail_fill") is True
+    same_session = config.get("tail_fill") is True or config.get("timing_mode") == "same_close_reference"
     for trade in trades:
         for side in ("entry", "exit"):
             signal = trade.get(f"{side}_signal_date")
@@ -344,18 +344,19 @@ def audit_trade_timing(trades: list[dict], config: dict, backend: str) -> dict:
             if not signal or not fill:
                 continue
             signal, fill = str(signal)[:10], str(fill)[:10]
-            next_open = not tail_fill and config.get(f"{side}_fill") == "open_t+1"
+            next_open = not same_session and config.get(f"{side}_fill") == "open_t+1"
             if side == "entry" and backend == "minute_filter":
                 next_open = False  # 分钟策略按触发分钟入场，忽略日线 entry_fill。
             if side == "exit" and trade.get("exit_reason") != "signal":
                 next_open = False
             compared += 1
-            wrong_tail_entry = tail_fill and side == "entry" and signal != fill
-            wrong_tail_exit = tail_fill and side == "exit" and (
+            wrong_same_session_entry = same_session and side == "entry" and signal != fill
+            wrong_same_session_exit = same_session and side == "exit" and (
                 (fill != signal and not trade.get("blocked_exit_days"))
                 or fill <= str(trade.get("entry_date") or "")[:10]
             )
-            if signal > fill or (next_open and signal == fill) or wrong_tail_entry or wrong_tail_exit:
+            if (signal > fill or (next_open and signal == fill)
+                    or wrong_same_session_entry or wrong_same_session_exit):
                 differences += 1
                 if len(examples) < _EXAMPLES:
                     examples.append({
@@ -544,6 +545,8 @@ class EvidenceRecorder:
             "limitations": [
                 "按交易时间抽样检查本次加载的输入、特征和信号，不是全时点无未来数据证明。",
                 "供应商历史修订、历史股票池及静态维表的时点正确性需另行核实。",
+                *(["同收盘价参考用最终日线确认信号，并假设能按同一收盘价成交。信号抽样通过不验证该时点的可成交性。"]
+                  if effective_config.get("timing_mode") == "same_close_reference" else []),
                 "记录内容指纹和有效参数，不归档全量行情；原始数据被覆盖后不能仅凭指纹还原。",
             ],
         }

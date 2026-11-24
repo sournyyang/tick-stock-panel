@@ -142,7 +142,7 @@ def _with_partial_bar(market, row, partial, raw_close):
 def build_tail_execution(repo, market, strategy, params, pipeline_config, start, stop,
                          *, entry_allowed=None, evidence=None, cancel_event=None):
     """Keep historical daily bars intact and use one partial row per decision."""
-    from app.backtest.engine import TailSessionFill
+    from app.backtest.engine import SameSessionFill
 
     if evidence is not None:
         from app.backtest.evidence import fingerprint_matrix
@@ -210,4 +210,4 @@ def build_tail_execution(repo, market, strategy, params, pipeline_config, start,
     matrix = build_market_matrix_from_signals(execution_daily, directions)
     matrix = replace(matrix, entry_close_floor=floors, limit_up_locked=buy_blocked,
                      limit_down_locked=sell_blocked)
-    return matrix, TailSessionFill(prices, signal_close), coverage
+    return matrix, SameSessionFill(prices, signal_close), coverage

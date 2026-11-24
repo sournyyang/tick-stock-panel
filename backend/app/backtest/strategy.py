@@ -22,6 +22,7 @@ import polars as pl
 from app.backtest.engine import (
     BacktestEngine,
     MatcherConfig,
+    SameSessionFill,
     SimResult,
     SimulationOptions,
     history_load_start,
@@ -54,6 +55,7 @@ from app.backtest.minute_trigger import (
     build_minute_entry_reference,
     unsupported_minute_exit_signals,
 )
+from app.backtest.tail_session import STRATEGY_ID as TRIPLE_VOLUME_BODY25_ID
 from app.config import settings
 from app.indicators.pipeline import (
     ENRICHED_STORAGE_COLS,
@@ -668,6 +670,13 @@ class StrategyBacktestConfig:
     # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
     regime_filter: dict | None = None
     tail_fill: bool = False
+
+    @property
+    def same_close_reference(self) -> bool:
+        return (
+            self.strategy_id == TRIPLE_VOLUME_BODY25_ID and not self.tail_fill
+            and self.entry_fill == self.exit_fill == "close_t"
+        )
 
     def __post_init__(self) -> None:
         if self.entry_fill is None:
@@ -1363,20 +1372,20 @@ class StrategyBacktestService:
         except ValueError as e:
             return _err(str(e))
 
-        tail_execution = None
+        same_session_execution = None
         tail_coverage = None
-        if config.tail_fill:
-            from app.backtest.tail_session import STRATEGY_ID
-
-            if (config.strategy_id != STRATEGY_ID or s.execution_backend != "matrix_native"
+        same_close_reference = config.same_close_reference
+        if config.tail_fill or same_close_reference:
+            if (config.strategy_id != TRIPLE_VOLUME_BODY25_ID or s.execution_backend != "matrix_native"
                     or config.mode != "position" or config.asset_type != "stock"):
-                return _err("信号当天尾盘成交仅支持实体2.5%策略的股票仓位回测")
+                return _err("当天成交仅支持实体2.5%策略的股票仓位回测")
+            if config.minute_fill or config.position_sizing == "policy":
+                return _err("当天成交暂不支持分钟穿越成交或自定义仓位策略")
+        if config.tail_fill:
             if not s.matrix_strategy.required_fields() <= {
                 "open", "high", "low", "close", "volume", "raw_close", "price_limit_pct", "listing_date",
             }:
                 return _err("当前版本的策略使用了尾盘回放无法重建的字段")
-            if config.minute_fill or config.position_sizing == "policy":
-                return _err("尾盘成交暂不支持分钟穿越成交或自定义仓位策略")
             if config.end < config.start:
                 return _err("尾盘成交的结束日必须不早于开始日")
 
@@ -1391,7 +1400,7 @@ class StrategyBacktestService:
         }
         conflicts = []
         for field_name, required in requirements.items():
-            if config.tail_fill and field_name in {"entry_fill", "exit_fill"}:
+            if (config.tail_fill or same_close_reference) and field_name in {"entry_fill", "exit_fill"}:
                 continue
             if getattr(config, field_name) != required:
                 label, choices = labels[field_name]
@@ -1459,11 +1468,11 @@ class StrategyBacktestService:
                 "market_cap_min", "market_cap_max", "float_cap_min", "float_cap_max",
             )):
                 return _err("尾盘成交暂不支持需要盘中市值、成交额或换手率的基础过滤")
-            if any(rule is not None for rule in (
-                stop_loss, take_profit, trailing_stop, trailing_take_profit_activate,
-                trailing_take_profit_drawdown,
-            )):
-                return _err("尾盘成交仅回放策略本身的卖点、防守线和到期退出")
+        if (config.tail_fill or same_close_reference) and any(rule is not None for rule in (
+            stop_loss, take_profit, trailing_stop, trailing_take_profit_activate,
+            trailing_take_profit_drawdown,
+        )):
+            return _err("当天成交仅回放策略本身的卖点、防守线和到期退出")
         max_hold_days = self._override_value(overrides, "max_hold_days", s.max_hold_days)
         score_min, score_max = self._normalize_score_range(
             overrides.get("score_min"),
@@ -1866,7 +1875,7 @@ class StrategyBacktestService:
                 if config.tail_fill:
                     from app.backtest.tail_session import build_tail_execution
 
-                    market_matrix, tail_execution, tail_coverage = build_tail_execution(
+                    market_matrix, same_session_execution, tail_coverage = build_tail_execution(
                         self.engine.repo, market_data, s.matrix_strategy, params, pipeline_config,
                         start_id, stop_id, entry_allowed=entry_time_mask, evidence=evidence,
                         cancel_event=cancel_event,
@@ -1952,14 +1961,26 @@ class StrategyBacktestService:
                 del market_data, signal_matrix
 
                 t_matrix = time.perf_counter()
-                market_matrix = build_market_matrix_from_signals(
-                    sim_market_data,
-                    sim_signal_matrix,
-                    entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                    exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
-                    reference_price=reference_price,
-                    minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
-                )
+                if same_close_reference:
+                    floors = sim_signal_matrix.entry_close_floor
+                    if floors is None:
+                        return _err("信号日收盘回测需要策略提供买点绑定防守线")
+                    # Zero delays preserve the dated signals. Bind the floor to
+                    # the filled position through the same-session matcher.
+                    market_matrix = build_market_matrix_from_signals(
+                        sim_market_data, replace(sim_signal_matrix, entry_close_floor=None),
+                    )
+                    market_matrix = replace(market_matrix, entry_close_floor=floors)
+                    same_session_execution = SameSessionFill(market_matrix.close, market_matrix.close)
+                else:
+                    market_matrix = build_market_matrix_from_signals(
+                        sim_market_data,
+                        sim_signal_matrix,
+                        entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
+                        exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                        reference_price=reference_price,
+                        minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                    )
                 timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
                 del sim_market_data, sim_signal_matrix
         else:
@@ -2095,7 +2116,7 @@ class StrategyBacktestService:
                 progress_cb,
                 cancel_event,
                 result_policy.simulation_options(),
-                **({"tail_fill": tail_execution} if tail_execution is not None else {}),
+                **({"same_session_fill": same_session_execution} if same_session_execution is not None else {}),
             )
         timing_ms["simulate"] = round((time.perf_counter() - t_sim) * 1000, 1)
         timing_ms["statistics"] = float(result.stats.pop("statistics_ms", 0.0))
@@ -3125,7 +3146,7 @@ class StrategyBacktestService:
             "exit_fill": c.exit_fill,
             "tail_fill": c.tail_fill,
             "timing_mode": (
-                "tail_session" if c.tail_fill else "strict"
+                "same_close_reference" if c.same_close_reference else "tail_session" if c.tail_fill else "strict"
                 if c.entry_fill == "open_t+1" and c.exit_fill == "open_t+1"
                 else "custom"
             ),

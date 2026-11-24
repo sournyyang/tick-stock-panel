@@ -1015,8 +1015,8 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [end, setEnd] = useState(saved?.end ?? TODAY)
   // 成交口径: 建仓/清仓可独立配置。向后兼容老 matching (派生为 entry=exit=matching)。
   const [requestedTailFill, setTailFill] = useState(saved?.tailFill ?? false)
-  const supportsTailFill = selectedStrategy === 'custom_triple_volume_two60_body25' && assetType === 'stock'
-  const tailFill = supportsTailFill && requestedTailFill
+  const supportsPairedFills = selectedStrategy === 'custom_triple_volume_two60_body25' && assetType === 'stock'
+  const tailFill = supportsPairedFills && requestedTailFill
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
   const [requestedEntryFill, setEntryFill] = useState<'close_t' | 'open_t+1'>(saved?.entryFill ?? saved?.matching ?? 'open_t+1')
   const [requestedExitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
@@ -1177,8 +1177,16 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const executionRequirements = detail?.backtest_requirements
   // Enforce at use time as well as in the selectors: saved state, history and
   // candidate restoration can all asynchronously carry incompatible old values.
-  const entryFill = executionRequirements?.entry_fill ?? requestedEntryFill
-  const exitFill = executionRequirements?.exit_fill ?? requestedExitFill
+  const sameClose = supportsPairedFills && !tailFill
+    && requestedEntryFill === 'close_t' && requestedExitFill === 'close_t'
+  const pairedFill = sameClose ? 'close_t' : 'open_t+1'
+  const entryFill = supportsPairedFills ? pairedFill : executionRequirements?.entry_fill ?? requestedEntryFill
+  const exitFill = supportsPairedFills ? pairedFill : executionRequirements?.exit_fill ?? requestedExitFill
+  const changePairedFill = (value: 'close_t' | 'open_t+1') => {
+    setTailFill(false)
+    setEntryFill(value)
+    setExitFill(value)
+  }
   const simMode = executionRequirements?.mode ?? requestedSimMode
   const highGranularity = executionRequirements?.minute_fill ?? requestedGranularity
 
@@ -1217,11 +1225,13 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const backtestDataUnavailable = dataStatus.isSuccess && !statsPending && !earliestDate
   const backtestDataLabel = assetType === 'etf' ? 'ETF 指标数据' : '股票指标数据'
 
-  const resetConfigFromDetail = (detail: StrategyDetail) => {
+  const resetConfigFromDetail = (detail: StrategyDetail, keepFill = false) => {
     setStrategyParams(strategyDefaultParams(detail))
     setOverrides(buildDefaultOverrides(detail))
-    if (detail.default_entry_fill) setEntryFill(detail.default_entry_fill)
-    if (detail.default_exit_fill) setExitFill(detail.default_exit_fill)
+    if (!keepFill) {
+      if (detail.default_entry_fill) setEntryFill(detail.default_entry_fill)
+      if (detail.default_exit_fill) setExitFill(detail.default_exit_fill)
+    }
   }
 
   // Recommendations apply on fresh selection only. Saved funds, asynchronous
@@ -1289,7 +1299,8 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
       setOverrides(normalizeStrategyOverrides(detail, saved.overrides ?? buildDefaultOverrides(detail)))
       return
     }
-    resetConfigFromDetail(detail)
+    resetConfigFromDetail(detail, supportsPairedFills && saved?.selectedStrategy === detail.id
+      && requestedPortfolioDefaultsRef.current == null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [assetType, strategyDetail.data])
 
@@ -1448,6 +1459,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     lines.push(`完成交易数,${result.trades?.length ?? 0}`)
     lines.push(`总收益,${pct(strategyReturn)}`)
     if (result.config?.tail_fill === true) lines.push('成交口径,信号当天尾盘（14:42 分钟 K 线开盘）')
+    if (result.config?.timing_mode === 'same_close_reference') lines.push('成交口径,信号日收盘（同收盘价参考）')
     lines.push(`年化收益,${pct(s.annual_return)}`)
     lines.push(`同期基准,${pct(benchmarkReturn)}`)
     lines.push(`超额收益,${pct(excessReturn)}`)
@@ -1976,7 +1988,14 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               <button
                 key={st.id}
                 onClick={() => {
-                  if (st.id !== selectedStrategy) requestedPortfolioDefaultsRef.current = `${assetType}:${st.id}`
+                  if (st.id !== selectedStrategy) {
+                    requestedPortfolioDefaultsRef.current = `${assetType}:${st.id}`
+                    setTailFill(false)
+                    if (st.id === 'custom_triple_volume_two60_body25') {
+                      setEntryFill('open_t+1')
+                      setExitFill('open_t+1')
+                    }
+                  }
                   setSelectedStrategy(st.id)
                 }}
                 className={`px-2 py-1 rounded-btn text-[11px] border transition-all duration-150 ease-smooth cursor-pointer
@@ -2156,7 +2175,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
           )}
         </div>
 
-        {supportsTailFill && (
+        {supportsPairedFills && (
           <label className="flex items-start gap-2 rounded-btn border border-border px-3 py-2 text-xs">
             <input type="checkbox" className="mt-0.5" checked={tailFill}
               onChange={e => setTailFill(e.target.checked)} />
@@ -2174,40 +2193,52 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               <label className="text-xs font-medium text-secondary">建仓口径</label>
               <FillRuleHint />
             </div>
-            {tailFill ? (
-              <div className={INPUT_CLS}>信号日尾盘（14:42 K 线开盘）</div>
-            ) : isMinuteStrategy ? (
+            {isMinuteStrategy ? (
               <div className={`${INPUT_CLS} flex items-center gap-1.5`} title="信号在盘中触发分钟成交，无次日开盘口径">
                 <Clock className="h-3 w-3 text-sky-400 shrink-0" />
                 <span className="text-secondary">信号分钟收盘</span>
                 <span className="text-[8px] px-1 py-px rounded border border-sky-500/30 bg-sky-500/10 text-sky-400">分钟</span>
               </div>
             ) : (
-              <select aria-label="建仓口径" value={entryFill} disabled={!!executionRequirements?.entry_fill} onChange={e => setEntryFill(e.target.value as 'close_t' | 'open_t+1')} className={INPUT_CLS}>
-                <option value="open_t+1">{executionRequirements?.entry_fill === 'open_t+1' ? '次日开盘（策略要求）' : '次日开盘（推荐）'}</option>
+              <select
+                aria-label="建仓口径"
+                value={tailFill ? 'tail' : entryFill}
+                disabled={!supportsPairedFills && !!executionRequirements?.entry_fill}
+                onChange={e => {
+                  const value = e.target.value as 'close_t' | 'open_t+1'
+                  if (supportsPairedFills) changePairedFill(value)
+                  else setEntryFill(value)
+                }}
+                className={INPUT_CLS}
+              >
+                {tailFill && <option value="tail" disabled>信号日尾盘（14:42 K 线开盘）</option>}
+                <option value="open_t+1">{!supportsPairedFills && executionRequirements?.entry_fill === 'open_t+1' ? '次日开盘（策略要求）' : '次日开盘（推荐）'}</option>
                 <option value="close_t">信号日收盘</option>
               </select>
             )}
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-secondary">清仓口径</label>
-            {tailFill ? (
-              <div className={INPUT_CLS}>卖出信号日尾盘</div>
-            ) : <select
+            <select
               aria-label="清仓口径"
-              value={exitFill}
-              disabled={!!executionRequirements?.exit_fill}
-              onChange={e => setExitFill(e.target.value as 'close_t' | 'open_t+1' | 'signal_next_minute')}
+              value={tailFill ? 'tail' : exitFill}
+              disabled={!supportsPairedFills && !!executionRequirements?.exit_fill}
+              onChange={e => {
+                const value = e.target.value as 'close_t' | 'open_t+1' | 'signal_next_minute'
+                if (supportsPairedFills && value !== 'signal_next_minute') changePairedFill(value)
+                else setExitFill(value)
+              }}
               className={INPUT_CLS}
             >
-              <option value="close_t">信号日收盘（推荐）</option>
-              <option value="open_t+1">{executionRequirements?.exit_fill === 'open_t+1' ? '次日开盘（策略要求）' : '次日开盘'}</option>
-              {highGranularity && minuteExitTriggerSupported && !isMinuteStrategy && (
+              {tailFill && <option value="tail" disabled>卖出信号日尾盘</option>}
+              <option value="close_t">{supportsPairedFills ? '信号日收盘' : '信号日收盘（推荐）'}</option>
+              <option value="open_t+1">{!supportsPairedFills && executionRequirements?.exit_fill === 'open_t+1' ? '次日开盘（策略要求）' : '次日开盘'}</option>
+              {!supportsPairedFills && highGranularity && minuteExitTriggerSupported && !isMinuteStrategy && (
                 <option value="signal_next_minute">信号触发卖出 BETA</option>
               )}
-            </select>}
+            </select>
           </div>
-          {!tailFill && (executionRequirements?.entry_fill || executionRequirements?.exit_fill) && (
+          {!supportsPairedFills && (executionRequirements?.entry_fill || executionRequirements?.exit_fill) && (
             <div className="col-span-2 text-[10px] leading-4 text-muted">
               成交口径按策略要求固定，旧配置中的冲突设置会自动调整。
             </div>
@@ -2215,7 +2246,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
           {!isMinuteStrategy && (entryFill === 'close_t' || exitFill === 'close_t') && (
             <div className="col-span-2 flex items-start gap-1 text-[10px] leading-4 text-warning">
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-              <span>信号日收盘仅适合收盘前已确认的信号</span>
+              <span>{sameClose
+                ? '以最终日线确认信号，并假设按同一收盘价成交，供历史比较。'
+                : '信号日收盘仅适合收盘前已确认的信号'}</span>
             </div>
           )}
           {exitFill === 'signal_next_minute' && (
@@ -2720,6 +2753,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm font-medium text-foreground">{result.strategy_info.name}</span>
+                  {result.config?.timing_mode === 'same_close_reference' && (
+                    <span className="rounded border border-warning/30 px-1 py-px text-[9px] text-warning">同收盘价参考</span>
+                  )}
                   {result.config?.tail_fill === true && (
                     <span className="rounded border border-accent/30 bg-accent/10 px-1 py-px text-[9px] text-accent">当天尾盘成交</span>
                   )}

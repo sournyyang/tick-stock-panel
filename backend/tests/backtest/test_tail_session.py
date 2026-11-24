@@ -5,7 +5,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, TailSessionFill
+from app.backtest.engine import BacktestEngine, MatcherConfig, SameSessionFill
 from app.backtest.matrix import (
     build_market_data_matrix,
     build_market_matrix_from_signals,
@@ -86,7 +86,7 @@ def _fixture(*, block=False):
     execution = build_market_matrix_from_signals(market, signals)
     execution = replace(execution, entry_close_floor=np.array([[9.0], [np.nan], [np.nan]]),
                         limit_down_locked=np.array([[False], [block], [False]]))
-    tape = TailSessionFill(np.array([[10.0], [8.6], [9.8]]), np.array([[9.8], [8.8], [10.0]]))
+    tape = SameSessionFill(np.array([[10.0], [8.6], [9.8]]), np.array([[9.8], [8.8], [10.0]]))
     return dates, execution, tape
 
 
@@ -96,7 +96,7 @@ def test_tail_floor_exit_uses_its_own_signal_day_and_retry_never_uses_next_open(
     result = BacktestEngine(repo=None).simulate_market_matrix(
         execution, MatcherConfig(initial_capital=100000, max_exposure_pct=.6, max_positions=2,
                                  commission_pct=.0002, stamp_tax_pct=.001, slippage_bps=12),
-        tail_fill=tape,
+        same_session_fill=tape,
     )
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -115,13 +115,13 @@ def test_tail_buy_at_limit_is_not_filled_and_window_values_unclosed_position():
     _, execution, tape = _fixture()
     result = BacktestEngine(repo=None).simulate_market_matrix(
         replace(execution, limit_up_locked=np.ones(execution.shape, dtype=bool)), MatcherConfig(),
-        tail_fill=tape,
+        same_session_fill=tape,
     )
     assert result.stats["execution"]["buy_limit_up"] == 1
     assert all(row["positions"] == 0 for row in result.equity_curve)
 
     result = BacktestEngine(repo=None).simulate_market_matrix(
-        execution, MatcherConfig(), tail_fill=replace(tape, signal_close=np.full(execution.shape, 10.0)),
+        execution, MatcherConfig(), same_session_fill=replace(tape, signal_close=np.full(execution.shape, 10.0)),
     )
     assert result.trades == []
     assert result.equity_curve[-1]["positions"] == 1
@@ -139,3 +139,20 @@ def test_timing_evidence_distinguishes_same_day_fills_from_next_open_setting():
     assert audit_trade_timing([{**delayed, "blocked_exit_days": 1}], config, "matrix_native")["status"] == "passed"
     same_as_entry = {**trade, "exit_date": "2026-11-05", "exit_signal_date": "2026-11-05"}
     assert audit_trade_timing([same_as_entry], config, "matrix_native")["status"] == "failed"
+
+
+def test_closing_reference_prices_and_t_plus_one_hold_through_limit_down():
+    dates, execution, _ = _fixture(block=True)
+    closes = np.array([[10.2], [8.8], [9.7]])
+    booked = replace(execution, close=closes)
+    result = BacktestEngine(repo=None).simulate_market_matrix(
+        booked, MatcherConfig(initial_capital=100000),
+        same_session_fill=SameSessionFill(closes, closes),
+    )
+    trade, = result.trades
+    assert str(trade.entry_date) == str(trade.entry_signal_date) == str(dates[0])
+    assert str(trade.exit_signal_date) == str(dates[1])
+    assert str(trade.exit_date) == str(dates[2])
+    assert trade.entry_price == 10.2 and trade.exit_price == 9.7
+    assert trade.exit_reason == "structure_break"
+    assert trade.blocked_exit_days == 1

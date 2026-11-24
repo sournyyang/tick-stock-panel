@@ -350,3 +350,29 @@ it('实体2.5%策略可提交信号当天尾盘成交，关闭后恢复次日开
   await act(async () => runButton()!.click())
   expect(startBacktest).toHaveBeenLastCalledWith(expect.objectContaining({ tail_fill: false, entry_fill: 'open_t+1', exit_fill: 'open_t+1' }))
 })
+
+it('实体2.5%可从已打开分钟模式切到建仓和清仓均按信号日收盘', async () => {
+  const { api } = await import('@/lib/api')
+  const { startBacktest } = await import('@/lib/backtestTask')
+  const detail = { ...portfolioDetail, id: 'custom_triple_volume_two60_body25' }
+  vi.mocked(api.dataStatus).mockResolvedValue(busy)
+  vi.mocked(api.screenerStrategies).mockResolvedValue({ presets: [detail], load_errors: [], legacy_migration: undefined })
+  vi.mocked(api.strategyGet).mockResolvedValue(detail)
+  storage.strategyBacktestLast.set({ selectedStrategy: detail.id, assetType: 'stock', tailFill: true } as Parameters<typeof storage.strategyBacktestLast.set>[0])
+  await renderPage()
+  const entry = host.querySelector<HTMLSelectElement>('select[aria-label="建仓口径"]')!
+  const exit = host.querySelector<HTMLSelectElement>('select[aria-label="清仓口径"]')!
+  expect(entry.value).toBe('tail')
+  expect(entry.disabled || exit.disabled).toBe(false)
+  await act(async () => {
+    entry.value = 'close_t'
+    entry.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  expect(entry.value).toBe('close_t')
+  expect(exit.value).toBe('close_t')
+  expect(host.textContent).toContain('假设按同一收盘价成交')
+  await act(async () => runButton()!.click())
+  expect(startBacktest).toHaveBeenLastCalledWith(expect.objectContaining({
+    entry_fill: 'close_t', exit_fill: 'close_t', tail_fill: false, minute_fill: false, mode: 'position',
+  }))
+})

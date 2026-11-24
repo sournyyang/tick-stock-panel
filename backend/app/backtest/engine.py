@@ -225,8 +225,8 @@ class SimulationOptions:
 
 
 @dataclass(frozen=True)
-class TailSessionFill:
-    """Signal snapshot and subsequent same-session execution prices, in matrix price units."""
+class SameSessionFill:
+    """Signal snapshot and same-session model execution prices, in matrix price units."""
 
     price: np.ndarray
     signal_close: np.ndarray
@@ -234,23 +234,24 @@ class TailSessionFill:
     def validate(self, matrix: MarketMatrix, config: MatcherConfig) -> None:
         if config.asset_type != "stock" or config.minute_fill or (
             config.entry_fill != "close_t" or config.exit_fill != "close_t"
+            or len({label[:10] for label in matrix.timestamp_labels}) != matrix.shape[0]
         ):
-            raise ValueError("尾盘成交要求股票日线仓位回测")
+            raise ValueError("当日成交要求股票日线仓位回测")
         if any(value is not None for value in (
             config.stop_loss_pct, config.take_profit_pct, config.trailing_stop_pct,
             config.trailing_take_profit_activate_pct, config.trailing_take_profit_drawdown_pct,
         )):
-            raise ValueError("尾盘成交不支持额外的盘中止盈或止损")
+            raise ValueError("当日成交不支持额外的盘中止盈或止损")
         if self.price.shape != matrix.shape or self.signal_close.shape != matrix.shape:
-            raise ValueError("尾盘成交矩阵尺寸不一致")
+            raise ValueError("当日成交矩阵尺寸不一致")
         if matrix.entry_close_floor is None or matrix.entry_close_floor.shape != matrix.shape:
-            raise ValueError("尾盘成交需要策略绑定防守线")
+            raise ValueError("当日成交需要策略绑定防守线")
         times, assets = np.nonzero(matrix.entry)
         if not np.array_equal(matrix.entry_signal_time[times, assets], times):
-            raise ValueError("尾盘入场必须来自当天的尾盘信号")
+            raise ValueError("当日入场必须来自当天的信号")
         floors = matrix.entry_close_floor[times, assets]
         if np.any(~np.isfinite(floors) | (floors <= 0)):
-            raise ValueError("尾盘入场缺少有效防守线")
+            raise ValueError("当日入场缺少有效防守线")
 
 
 @dataclass(frozen=True)
@@ -2057,13 +2058,13 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
         *,
         entry_close_floor: EntryCloseFloor | None = None,
-        tail_fill: TailSessionFill | None = None,
+        same_session_fill: SameSessionFill | None = None,
     ) -> SimResult:
         """Run the production Python matcher on a prebuilt MarketMatrix."""
-        if tail_fill is not None:
-            tail_fill.validate(matrix, config)
+        if same_session_fill is not None:
+            same_session_fill.validate(matrix, config)
             if entry_close_floor is not None:
-                raise ValueError("尾盘成交与次日防守线成交口径互斥")
+                raise ValueError("当日成交与次日防守线成交口径互斥")
         elif matrix.entry_close_floor is not None:
             if entry_close_floor is not None:
                 raise ValueError("Bound floor must have a single source")
@@ -2074,10 +2075,10 @@ class BacktestEngine:
             )
         if entry_close_floor is not None:
             entry_close_floor.validate(matrix, config)
-        if tail_fill is None and not matrix.entry.any():
+        if same_session_fill is None and not matrix.entry.any():
             return self._empty_result()
         return self._simulate_portfolio_matrix(
-            matrix, config, progress_cb, cancel_event, options, entry_close_floor, tail_fill,
+            matrix, config, progress_cb, cancel_event, options, entry_close_floor, same_session_fill,
         )
 
     def _simulate_portfolio_matrix(
@@ -2088,14 +2089,14 @@ class BacktestEngine:
         cancel_event: threading.Event | None,
         options: SimulationOptions | None = None,
         entry_close_floor: EntryCloseFloor | None = None,
-        tail_fill: TailSessionFill | None = None,
+        same_session_fill: SameSessionFill | None = None,
     ) -> SimResult:
         options = options or SimulationOptions()
         time_count, asset_count = matrix.shape
         entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
-        if tail_fill is not None:
-            entry_prices = exit_prices = tail_fill.price
+        if same_session_fill is not None:
+            entry_prices = exit_prices = same_session_fill.price
         buy_cost_pct = config.buy_cost_pct()
         sell_cost_pct = config.sell_cost_pct()
         cash = float(config.initial_capital)
@@ -2376,9 +2377,9 @@ class BacktestEngine:
                 if pos.get("pending_exit_reason"):
                     reason = str(pos["pending_exit_reason"])
                     signal_date = str(pos.get("pending_exit_signal_date") or date_text)
-                elif tail_fill is not None and (
-                    _valid_price(tail_fill.signal_close[time_id, asset_id])
-                    and tail_fill.signal_close[time_id, asset_id] < pos["close_floor"]
+                elif same_session_fill is not None and (
+                    _valid_price(same_session_fill.signal_close[time_id, asset_id])
+                    and same_session_fill.signal_close[time_id, asset_id] < pos["close_floor"]
                 ):
                     reason = "structure_break"
                 elif matrix.exit[time_id, asset_id]:
@@ -2489,15 +2490,15 @@ class BacktestEngine:
 
             _risk_exits(time_id, date_text, sold_today)
 
-            if tail_fill is not None:
-                visible = tail_fill.signal_close[time_id]
+            if same_session_fill is not None:
+                visible = same_session_fill.signal_close[time_id]
                 seen_price = np.isfinite(visible) & (visible > 0)
                 last_close[seen_price] = visible[seen_price]
 
             if config.exit_fill != "open_t+1":
                 _scheduled_exits(time_id, date_text, sold_today)
 
-            if (time_id < time_count - 1 or tail_fill is not None) and max_positions > 0:
+            if (time_id < time_count - 1 or same_session_fill is not None) and max_positions > 0:
                 candidates: list[tuple[int, float]] = []
                 for asset_id in np.flatnonzero(matrix.entry[time_id]):
                     asset = int(asset_id)
@@ -2621,7 +2622,7 @@ class BacktestEngine:
                                         int(matrix.entry_signal_time[time_id, asset_id]), asset_id,
                                     ]) if entry_close_floor is not None else (
                                         float(matrix.entry_close_floor[time_id, asset_id])
-                                        if tail_fill is not None else None
+                                        if same_session_fill is not None else None
                                     )
                                 ),
                             }
