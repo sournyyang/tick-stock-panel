@@ -12,7 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
-from app.backtest.matrix import MatrixPipelineConfig, MatrixStrategyPipeline
+from app.backtest.matrix import MatrixPipelineConfig, MatrixStrategyPipeline, bound_open_eligible
+from app.backtest.tail_session import STRATEGY_ID
 from app.market_time import CN_TZ, cn_now
 from app.services import alert_store
 from app.services.fs_utils import atomic_write_text
@@ -76,6 +77,8 @@ class CloseWatchService:
             raise ValueError('尾盘监控策略绑定内容不可用，请检查扩展数据')
         if state['enabled'] and binding is None:
             raise ValueError('尾盘监控缺少策略绑定，请重新配置')
+        if binding is not None and binding['strategy_id'] == STRATEGY_ID:
+            binding['execution_mode'] = 'next_open_close'
         if any(not isinstance(t, dict) or not {'id','symbol','signal_date'} <= t.keys()
                for t in state['tracks']):
             raise ValueError('自动信号观察内容不可用，请检查扩展数据')
@@ -246,9 +249,16 @@ class CloseWatchService:
             before = json.dumps(state, sort_keys=True)
             generation = state['generation']
             phase = watch_phase(now, state['binding']['start_time'])
+            opening_due = any(not x.get('entry_date') and x['signal_date'] < str(now.date())
+                              for x in state['tracks'])
+            if (phase is None and now.weekday() < 5 and time(9,30) <= now.time() < time(9,45)
+                    and state['binding'].get('execution_mode') == 'next_open_close'
+                    and (opening_due or any(e['day'] == str(now.date()) for e in state['outbox']))):
+                phase = 'opening'
             if phase is None:
                 self._wait(state, '等待交易日尾盘时段')
-            elif not (phase == 'confirmed' and state.get('phase') == 'confirmed'
+            elif not (phase == 'opening' and not opening_due) and not (
+                      phase == 'confirmed' and state.get('phase') == 'confirmed'
                       and state.get('as_of') == str(now.date()) and state.get('status') == 'running'):
                 try:
                     self._evaluate(state, now, phase)
@@ -272,6 +282,37 @@ class CloseWatchService:
     def _track(symbol, signal_date, name):
         return {'id':_digest([symbol,signal_date])[:16], 'symbol':symbol,
                 'signal_date':signal_date, 'name':name or symbol}
+
+    @staticmethod
+    def _resolve_open(track, market, t, dates, assets):
+        """Advance a confirmed buy to the next market session's opening reference."""
+        if track.get('entry_date'):
+            return None
+        source = dates.index(track['signal_date']) if track['signal_date'] in dates else -1
+        if source < 0:
+            return '原买点超出可核对历史，未建立开盘观察'
+        opening = source + 1
+        if opening > t:
+            return None
+        a = assets.get(track['symbol'])
+        if a is None or not market.tradable[opening,a]:
+            return '买点次日无可用开盘行情，取消本次观察'
+        previous_raw = _price(market.field('raw_close')[source,a])
+        previous_close = _price(market.close[source,a])
+        raw = _price(market.field('raw_close')[opening,a])
+        close = _price(market.close[opening,a])
+        price = _price(market.open[opening,a])
+        if None in (previous_raw, previous_close, raw, close, price):
+            return '开盘参考价或前收盘价缺失，取消本次观察'
+        factor = close / raw
+        raw_open = price / factor
+        if not bound_open_eligible(
+            np.asarray(raw_open), np.asarray(previous_raw), factor,
+            previous_close / previous_raw, market.field('price_limit_pct')[opening,a],
+        ):
+            return '开盘涨停或除权与涨跌停参考价不可核对，取消本次观察'
+        track.update(entry_date=dates[opening], entry_price=raw_open)
+        return None
 
     @staticmethod
     def _reasons(track, market, signals, t, dates, assets, hold):
@@ -309,7 +350,12 @@ class CloseWatchService:
                     result['message'] = '原买点防守线暂不可计算'
             else:
                 result['message'] = '原买点历史待核对，未猜测防守线'
-            if hold is not None and age >= hold:
+            entry_date = track.get('entry_date')
+            if entry_date in dates:
+                held = t - dates.index(entry_date)
+                if hold is not None and held >= hold:
+                    result['reasons'].append(f'开盘纳入后已过{hold}个市场交易日，达到观察期限')
+            elif hold is not None and age >= hold:
                 result['reasons'].append(f'买点后已过{hold}个市场交易日，达到观察期限')
         else:
             result['message'] = '原买点超出可用历史窗口，防守线待核对'
@@ -317,14 +363,32 @@ class CloseWatchService:
                 result['reasons'].append(f'买点后至少已过{hold}个市场交易日，达到观察期限')
         return result
 
-    def _seed_tracks(self, market, signals, t, dates, assets, hold):
-        # Replay indicators only, with no prices/fills/cash/portfolio simulation.
+    @staticmethod
+    def _close_deferred(track, market, t, dates, assets):
+        if track['entry_date'] == dates[t]:
+            return '买入日受 T+1 限制'
+        a = assets[track['symbol']]
+        if not market.tradable[t,a]:
+            return '停牌或无有效收盘行情'
+        if market.limit_down_locked[t,a]:
+            return '收盘封跌停'
+        return None
+
+    def _seed_tracks(self, market, signals, t, dates, assets, hold, mixed=False):
+        # Replay signal observations without simulating cash or position sizes.
         # Past exits end past observations; no historical notification is sent.
         active = {}
         for k in range(t):
             ended = set()
             for symbol, track in list(active.items()):
-                if self._reasons(track,market,signals,k,dates,assets,hold)['reasons']:
+                cancelled = self._resolve_open(track,market,k,dates,assets) if mixed else None
+                reasons = track.get('pending_exit_reasons') or self._reasons(
+                    track,market,signals,k,dates,assets,hold,
+                )['reasons']
+                if mixed and not cancelled and reasons and self._close_deferred(track,market,k,dates,assets):
+                    if not track.get('pending_exit_date'):
+                        track.update(pending_exit_date=dates[k], pending_exit_reasons=reasons)
+                elif cancelled or reasons:
                     active.pop(symbol)
                     ended.add(symbol)
             for a in np.flatnonzero(signals.entry[k]):
@@ -347,7 +411,7 @@ class CloseWatchService:
             self._wait(state,'等待当日收盘行情确认',phase=phase)
             return
         age = status.get('quote_age_ms')
-        if status.get('mode') != 'full_market' or age is None or age < 0 or (phase == 'preview' and age > 180000):
+        if status.get('mode') != 'full_market' or age is None or age < 0 or (phase != 'confirmed' and age > 180000):
             self._wait(state,'全市场实时行情未就绪或已过期',phase=phase)
             return
         frame, day = self.quotes.get_enriched_today()
@@ -359,7 +423,10 @@ class CloseWatchService:
         market = self._market(state,frame,day,params,overrides)
         if market is None:
             raise ValueError('策略历史矩阵尚未就绪')
-        signals = MatrixStrategyPipeline().run(strategy.matrix_strategy,market,params,cfg)
+        mixed = state['binding'].get('execution_mode') == 'next_open_close'
+        signals = None if phase == 'opening' else MatrixStrategyPipeline().run(strategy.matrix_strategy,market,params,cfg)
+        if mixed and signals is not None and signals.entry_close_floor is None:
+            raise ValueError('次日开盘买、收盘卖需要策略提供原买点绑定防守线')
         if self._definition(state['binding']['strategy_id'])[4] != revision:
             raise ValueError('策略在计算期间发生变化，尾盘结果已丢弃，请重新核对绑定')
         dates = [d[:10] for d in market.timestamp_labels]
@@ -369,7 +436,9 @@ class CloseWatchService:
         rows = {str(r['symbol']):r for r in frame.iter_rows(named=True)}
         assets = {s:a for a,s in enumerate(market.symbols)}
         boundary = datetime.combine(day,time(15),tzinfo=CN_TZ).timestamp()*1000
-        minimum = now.timestamp()*1000-180000 if phase=='preview' else boundary-5000
+        minimum = now.timestamp()*1000-180000 if phase != 'confirmed' else boundary-5000
+        if phase == 'opening':
+            minimum = max(minimum, datetime.combine(day,time(9,30),tzinfo=CN_TZ).timestamp()*1000)
 
         def fresh(symbol):
             row = rows.get(symbol,{})
@@ -380,8 +449,8 @@ class CloseWatchService:
         if not any(fresh(symbol) for symbol in rows):
             self._wait(state,'行情尚未到达本轮尾盘或收盘确认边界',phase=phase)
             return
-        if not state['seeded']:
-            state['tracks'] = self._seed_tracks(market,signals,t,dates,assets,hold)
+        if not state['seeded'] and phase != 'opening':
+            state['tracks'] = self._seed_tracks(market,signals,t,dates,assets,hold,mixed)
             state['seeded'] = True
             state['seeded_on'] = str(day)
         names = self._name_map()
@@ -393,17 +462,59 @@ class CloseWatchService:
             item = {**track,'price':None,'floor_price':None,'signal_age':None,
                     'reasons':[],'message':'该标的行情缺失或过期，未判断卖点','ended':False}
             checked.append(item)
+            if mixed and not track.get('entry_date') and track['signal_date'] < str(day):
+                if phase != 'confirmed' and not fresh(symbol):
+                    remaining.append(track)
+                    continue
+                cancelled = self._resolve_open(track,market,t,dates,assets)
+                item.update(track)
+                if cancelled:
+                    item.update(message=cancelled, ended=True)
+                    exiting.add(symbol)
+                    if phase == 'opening':
+                        events.append(self._event(state,now,phase,symbol,track['name'],'pool_exit',
+                            track['id']+':open_cancelled',cancelled,None))
+                    continue
+                if phase == 'opening' and track.get('entry_date') == str(day):
+                    events.append(self._event(state,now,phase,symbol,track['name'],'buy_signal',
+                        track['id']+':open','已记录开盘参考价，开始跟踪后续卖点',track['entry_price']))
+            if phase == 'opening':
+                item.update(price=track.get('entry_price'), message='已记录开盘参考价，等待尾盘检查'
+                            if track.get('entry_date') else '等待下一交易日有效开盘行情')
+                remaining.append(track)
+                continue
             if fresh(symbol):
                 item.update(self._reasons(track,market,signals,t,dates,assets,hold))
+                if mixed and track.get('pending_exit_date'):
+                    item['reasons'] = track['pending_exit_reasons']
                 if item['reasons']:
                     exiting.add(symbol)
+                    text = '；'.join(item['reasons'])
+                    deferred = self._close_deferred(track,market,t,dates,assets) if mixed else None
+                    if deferred:
+                        if phase == 'confirmed' and not track.get('pending_exit_date'):
+                            track.update(pending_exit_date=str(day), pending_exit_reasons=item['reasons'])
+                        item.update(track)
+                        if phase == 'preview' and deferred == '收盘封跌停':
+                            text += '；若收盘仍封跌停，将顺延至下一可执行收盘'
+                        else:
+                            text += f'；{deferred}，顺延至下一可执行收盘'
+                    elif mixed and track.get('pending_exit_date'):
+                        text += f'；原卖点{track["pending_exit_date"]}，本次按收盘跟踪'
+                    item['message'] = text
                     events.append(self._event(state,now,phase,symbol,track['name'],'sell_signal',
-                        track['id']+':exit','；'.join(item['reasons']),rows[symbol]['raw_close'],
-                        floor_price=item['floor_price'], floor_signal_date=track['signal_date']))
-                    item['ended'] = phase=='confirmed'
+                        track['id']+(':exit_deferred' if deferred else ':exit'),text,rows[symbol]['raw_close'],
+                        floor_price=item['floor_price'], floor_signal_date=track['signal_date'],
+                        deferred=bool(deferred)))
+                    item['ended'] = phase=='confirmed' and not deferred
             if not item['ended']:
                 remaining.append(track)
         state['tracks'] = remaining
+        if phase == 'opening':
+            state.update(watch_status=checked, checked_at=now.isoformat(), status='running', phase=phase,
+                         message='已检查次日开盘参考，卖点在尾盘检查')
+            self._record_events(state, events, str(day))
+            return
         active = {x['symbol'] for x in remaining}
         stale_candidates = set()
         for a in np.flatnonzero(signals.entry[t]):
@@ -418,7 +529,7 @@ class CloseWatchService:
                    'floor_price':defense['floor_price'], 'floor_signal_date':floor_track['signal_date'],
                    'signal_date':str(day),'score':float(signals.score[t,a]),'note':note}
             candidates.append(row)
-            if symbol in exiting:
+            if symbol in exiting or (mixed and symbol in active):
                 continue
             events.append(self._event(state,now,phase,symbol,row['name'],'buy_signal','entry',
                 '当日买入候选'+('；'+note if note else ''),row['price'],
@@ -428,7 +539,8 @@ class CloseWatchService:
                 state['tracks'].append(track)
                 active.add(symbol)
                 checked.append({**track,**self._reasons(track,market,signals,t,dates,assets,hold),
-                    'message':'新收盘买点，开始自动观察；不代表已买入','ended':False})
+                    'message':('新收盘买点，等待下一交易日开盘参考' if mixed else
+                               '新收盘买点，开始自动观察；不代表已买入'),'ended':False})
         if phase=='confirmed':
             final_symbols = {x['symbol'] for x in candidates}
             for previous in state['events']:
@@ -445,25 +557,37 @@ class CloseWatchService:
         state.update(candidates=candidates,watch_status=checked,as_of=str(day),phase=phase,
             checked_at=now.isoformat(),status='running',
             message='当天尾盘信号已检查；预警仍待收盘确认' if phase=='preview' else '当天收盘信号已确认；不代表实际成交')
-        missing = len(stale_candidates | {x['symbol'] for x in checked if x.get('price') is None})
+        missing = len(stale_candidates | {x['symbol'] for x in checked if x.get('price') is None and not x['ended']})
         if missing:
             state.update(status='waiting',message=state['message']+f'；{missing}个观察标的行情缺失，相关条件未确认')
         state['coverage'] = {'observed_symbols':len(rows),'reported_symbols':status.get('symbol_count')}
-        state['seen'] = {k:v for k,v in state['seen'].items() if v==str(day)}
+        self._record_events(state, events, str(day))
+
+    @staticmethod
+    def _record_events(state, events, day):
+        state['seen'] = {k:v for k,v in state['seen'].items() if v==day}
         for event in events:
             if event['id'] in state['seen']:
                 continue
-            state['seen'][event['id']] = str(day)
+            state['seen'][event['id']] = day
             state['outbox'].append(event)
             state['events'].insert(0,event)
         state['events'] = state['events'][:200]
 
     def _event(self, state, now, phase, symbol, name, event_type, reason, text, price,
-               *, floor_price=None, floor_signal_date=None):
-        tag = '尾盘预警' if phase=='preview' else '收盘确认'
+               *, floor_price=None, floor_signal_date=None, deferred=False):
+        tag = {'preview':'尾盘预警', 'confirmed':'收盘确认', 'opening':'开盘参考'}[phase]
         execution = '，当天信号提醒；不代表已买入或已卖出'
+        mixed = state['binding'].get('execution_mode') == 'next_open_close'
+        if mixed and event_type == 'buy_signal':
+            execution = ('；仅为策略参考，不代表实际买入' if phase == 'opening' else
+                         '；收盘确认后按下一交易日开盘跟踪，不代表实际买入')
+        if mixed and event_type == 'sell_signal':
+            execution = ('；本次仅记录待退出信号' if deferred else
+                         '；以卖点日收盘价为跟踪参考，不代表实际卖出')
         if event_type=='pool_exit':
-            execution = '，不作为已确认卖出条件' if '卖出' in text else '，不作为已确认买点'
+            execution = ('；本次未建立开盘参考' if phase == 'opening' else
+                         '，不作为已确认卖出条件' if '卖出' in text else '，不作为已确认买点')
         if floor_signal_date is not None:
             if floor_price is None:
                 text += '；防守参考价待核对'
@@ -476,7 +600,9 @@ class CloseWatchService:
             'ts':int(now.timestamp()*1000),'day':str(now.date()),'phase':phase,
             'source':'strategy','rule_id':'close_watch','strategy_id':state['binding']['strategy_id'],
             'strategy_revision':state['binding']['revision'],
-            'type':event_type,'symbol':symbol,'name':name,'price':float(price),'change_pct':0.,
+            **({'execution_mode':'next_open_close'} if mixed else {}),
+            'type':event_type,'symbol':symbol,'name':name,'price':float(price) if price is not None else None,
+            'change_pct':0.,
             'floor_price':floor_price, 'floor_signal_date':floor_signal_date,
             'severity':'warn' if event_type=='sell_signal' else 'info','signals':[text],
             'message':f'策略「{state["binding"]["name"]}」{tag}：{name} {text}{execution}'}

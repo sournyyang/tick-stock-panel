@@ -2389,6 +2389,16 @@ def validate_signal_matrix(signals: SignalMatrix, shape: tuple[int, int]) -> Non
             raise ValueError("SignalMatrix.entry_close_floor requires a positive signal-time floor")
 
 
+def bound_open_eligible(raw_open, previous_raw, factor, previous_factor, limit_pct):
+    """Conservative opening eligibility for a signal-bound entry, in raw price units."""
+    limit = numpy_limit_price(previous_raw, np.where(np.isfinite(limit_pct), limit_pct, 0), up=True)
+    changed = np.isfinite(previous_factor) & (np.abs(factor - previous_factor) > 1e-6)
+    return (
+        np.isfinite(raw_open) & np.isfinite(limit_pct)
+        & np.isfinite(limit) & (raw_open < limit - 0.0049) & ~changed
+    )
+
+
 def build_market_matrix_from_signals(
     market: MarketDataMatrix,
     signals: SignalMatrix,
@@ -2398,13 +2408,14 @@ def build_market_matrix_from_signals(
     reference_price: np.ndarray | None = None,
     minute_exit_trigger: bool = False,
     entry_price_override: np.ndarray | None = None,
+    bound_floor_at_close: bool = False,
 ) -> MarketMatrix:
     """Combine base data and strategy signals into the matcher input matrix."""
     if entry_delay_bars not in (0, 1) or exit_delay_bars not in (0, 1):
         raise ValueError("phase-two MarketMatrix supports only zero or one bar delay")
     validate_signal_matrix(signals, market.shape)
     if signals.entry_close_floor is not None:
-        if entry_delay_bars != 1 or exit_delay_bars != 1 or minute_exit_trigger:
+        if entry_delay_bars != 1 or exit_delay_bars != int(not bound_floor_at_close) or minute_exit_trigger:
             raise ValueError("Bound close-floor signals require daily next-open entry and exit fills")
         if not {"raw_close", "price_limit_pct"}.issubset(market.fields):
             raise ValueError("Bound close-floor signals require raw_close and price_limit_pct")
@@ -2479,13 +2490,9 @@ def build_market_matrix_from_signals(
         # Eligibility is checked at execution, never by looking ahead in the signal.
         prior_raw = valid_shift(raw_close.astype(np.float64), 1, bar_index=market.valid_bars)
         prior_factor = valid_shift(factor, 1, bar_index=market.valid_bars)
-        pct = market.fields["price_limit_pct"]
-        up = numpy_limit_price(prior_raw, np.where(np.isfinite(pct), pct, 0), up=True)
-        changed = np.isfinite(prior_factor) & (np.abs(factor - prior_factor) > 1e-6)
         next_session = np.arange(market.shape[0])[:, None] - entry_signal_time == 1
-        eligible = (
-            next_session & np.isfinite(raw_open) & np.isfinite(pct)
-            & np.isfinite(up) & (raw_open < up - 0.0049) & ~changed
+        eligible = next_session & bound_open_eligible(
+            raw_open, prior_raw, factor, prior_factor, market.fields["price_limit_pct"],
         )
         entry &= eligible.astype(np.uint8)
 

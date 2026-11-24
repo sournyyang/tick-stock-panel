@@ -37,6 +37,7 @@ export function BacktestEvidencePanel({ evidence }: { evidence?: BacktestEvidenc
   const failed = lookahead.status === 'failed'
   const datasets = Object.entries(evidence.data.datasets)
   const color = failed ? 'text-danger' : lookahead.status === 'passed' ? 'text-foreground' : 'text-warning'
+  const closeReference = ['same_close_reference', 'open_close_reference'].includes(String(evidence.config?.timing_mode))
 
   return (
     <section aria-label="回测检查与版本记录" className="min-w-0 rounded-card border border-border bg-surface px-4 py-3">
@@ -44,7 +45,7 @@ export function BacktestEvidencePanel({ evidence }: { evidence?: BacktestEvidenc
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-xs">
           <ScanSearch className="h-4 w-4 shrink-0 text-secondary" aria-hidden="true" />
           <span className="font-medium text-foreground">
-            {evidence.config?.timing_mode === 'same_close_reference' ? '策略信号数据检查' : '未来数据检查'}
+            {closeReference ? '策略信号数据检查' : '未来数据检查'}
           </span>
           <span className={color}>{STATUS_LABELS[lookahead.status]}</span>
         </div>
@@ -52,8 +53,10 @@ export function BacktestEvidencePanel({ evidence }: { evidence?: BacktestEvidenc
           <Download className="h-3 w-3" aria-hidden="true" />导出核查报告
         </button>
       </div>
-      {evidence.config?.timing_mode === 'same_close_reference' && (
-        <p className="mt-2 text-xs leading-5 text-warning">本次假设收盘确认的信号可以按同一收盘价成交。信号抽样检查只核对策略用到的数据。</p>
+      {closeReference && (
+        <p className="mt-2 text-xs leading-5 text-warning">{evidence.config?.timing_mode === 'open_close_reference'
+          ? '本次按卖出信号日的收盘价模拟退出。信号抽样检查只核对策略用到的数据。'
+          : '本次假设收盘确认的信号可以按同一收盘价成交。信号抽样检查只核对策略用到的数据。'}</p>
       )}
       {failed && <p className="mt-2 text-xs leading-5 text-danger">改变未来数据后，部分历史输出发生变化。请结合下方差异排查策略或指标。</p>}
       {evidence.execution_timing?.status === 'failed' && (

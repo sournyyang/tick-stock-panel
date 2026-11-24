@@ -199,3 +199,35 @@ def test_regular_next_open_exit_can_precede_close_floor_breach():
     trade = run(matrix, guard, exit_fill="open_t+1").trades[0]
     assert trade.exit_reason == "signal"
     assert str(trade.exit_date) == "2024-01-05"
+
+
+@pytest.mark.parametrize("breach_day,limit_down,signal_day,fill_day,fill_price", [
+    (2, False, "2024-01-04", "2024-01-04", 8.5),
+    (1, False, "2024-01-03", "2024-01-04", 10.0),
+    (1, True, "2024-01-03", "2024-01-05", 10.0),
+])
+def test_bound_floor_at_close_enforces_t_plus_one_and_opening_slots(
+    breach_day, limit_down, signal_day, fill_day, fill_price,
+):
+    matrix, guard = fixture(breach_day=breach_day, symbols=("A", "B"))
+    down = matrix.limit_down_locked.copy()
+    down[2, 0] = limit_down
+    # The second stock tries to enter on the morning that the first sells at the close.
+    entry = np.zeros_like(matrix.entry)
+    times = matrix.entry_signal_time.copy()
+    levels = guard.levels.copy()
+    entry[1, 0] = 1
+    sale_index = int(fill_day[-2:]) - 2
+    entry[sale_index, 1] = 1
+    times[sale_index, 1] = sale_index - 1
+    levels[sale_index - 1, 1] = 9.0
+    matrix = replace(matrix, entry=entry, entry_signal_time=times, limit_down_locked=down,
+                     entry_close_floor=levels, opening_sell_blocked=guard.open_sell_blocked)
+    config = MatcherConfig(entry_fill="open_t+1", exit_fill="close_t", max_positions=1)
+    result = BacktestEngine(repo=None).simulate_market_matrix(matrix, config, bound_floor_at_close=True)
+    trade, = result.trades
+    assert trade.exit_reason == "structure_break"
+    assert trade.exit_signal_date == signal_day
+    assert trade.exit_date == fill_day
+    assert trade.exit_price == fill_price
+    assert result.stats["execution"]["buy_no_slot"] == 1

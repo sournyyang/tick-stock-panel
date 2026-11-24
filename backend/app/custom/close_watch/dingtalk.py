@@ -130,13 +130,20 @@ class CloseWatchDingTalk:
         title = '尾盘买入预警' if event['type'] == 'buy_signal' else '尾盘卖出预警'
         if phase == 'confirmed':
             title = '尾盘预警未获确认' if event['type'] == 'pool_exit' else '尾盘信号收盘确认'
+        if phase == 'opening':
+            title = '开盘未纳入观察' if event['type'] == 'pool_exit' else '次日开盘参考'
         stamp = datetime.fromtimestamp(event['ts']/1000, CN_TZ).strftime('%Y-%m-%d %H:%M:%S')
         price = event.get('price')
         body = f"{event.get('symbol', '')} {event.get('name', '')}\n{event['message']}\n信号时间：{stamp}（北京时间）"
         if price is not None:
             body += f'\n信号参考价：{float(price):.2f}'
-        body += ('\n收盘后复核消息，当日已收盘，不是当日可执行的买入指令。'
-                 if phase == 'confirmed' else '\n尾盘预警可能变化，请留意后续确认或取消。')
+        if phase == 'preview':
+            body += '\n尾盘预警可能变化，请留意后续确认或取消。'
+        elif phase == 'confirmed':
+            if event.get('execution_mode') == 'next_open_close':
+                body += '\n已收盘。此消息用于核对策略信号与参考价。'
+            else:
+                body += '\n收盘后复核消息，当日已收盘，不是当日可执行的买入指令。'
         return 'TickFlow 股票'+title, body
 
     def tick(self, *, now=None):

@@ -678,6 +678,13 @@ class StrategyBacktestConfig:
             and self.entry_fill == self.exit_fill == "close_t"
         )
 
+    @property
+    def open_close_reference(self) -> bool:
+        return (
+            self.strategy_id == TRIPLE_VOLUME_BODY25_ID and not self.tail_fill
+            and self.entry_fill == "open_t+1" and self.exit_fill == "close_t"
+        )
+
     def __post_init__(self) -> None:
         if self.entry_fill is None:
             self.entry_fill = self.matching
@@ -1375,7 +1382,9 @@ class StrategyBacktestService:
         same_session_execution = None
         tail_coverage = None
         same_close_reference = config.same_close_reference
-        if config.tail_fill or same_close_reference:
+        open_close_reference = config.open_close_reference
+        close_reference = same_close_reference or open_close_reference
+        if config.tail_fill or close_reference:
             if (config.strategy_id != TRIPLE_VOLUME_BODY25_ID or s.execution_backend != "matrix_native"
                     or config.mode != "position" or config.asset_type != "stock"):
                 return _err("当天成交仅支持实体2.5%策略的股票仓位回测")
@@ -1400,7 +1409,7 @@ class StrategyBacktestService:
         }
         conflicts = []
         for field_name, required in requirements.items():
-            if (config.tail_fill or same_close_reference) and field_name in {"entry_fill", "exit_fill"}:
+            if (config.tail_fill or close_reference) and field_name in {"entry_fill", "exit_fill"}:
                 continue
             if getattr(config, field_name) != required:
                 label, choices = labels[field_name]
@@ -1468,7 +1477,7 @@ class StrategyBacktestService:
                 "market_cap_min", "market_cap_max", "float_cap_min", "float_cap_max",
             )):
                 return _err("尾盘成交暂不支持需要盘中市值、成交额或换手率的基础过滤")
-        if (config.tail_fill or same_close_reference) and any(rule is not None for rule in (
+        if (config.tail_fill or close_reference) and any(rule is not None for rule in (
             stop_loss, take_profit, trailing_stop, trailing_take_profit_activate,
             trailing_take_profit_drawdown,
         )):
@@ -1980,6 +1989,7 @@ class StrategyBacktestService:
                         exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
                         reference_price=reference_price,
                         minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                        bound_floor_at_close=open_close_reference,
                     )
                 timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
                 del sim_market_data, sim_signal_matrix
@@ -2117,6 +2127,7 @@ class StrategyBacktestService:
                 cancel_event,
                 result_policy.simulation_options(),
                 **({"same_session_fill": same_session_execution} if same_session_execution is not None else {}),
+                **({"bound_floor_at_close": True} if open_close_reference else {}),
             )
         timing_ms["simulate"] = round((time.perf_counter() - t_sim) * 1000, 1)
         timing_ms["statistics"] = float(result.stats.pop("statistics_ms", 0.0))
@@ -3146,7 +3157,8 @@ class StrategyBacktestService:
             "exit_fill": c.exit_fill,
             "tail_fill": c.tail_fill,
             "timing_mode": (
-                "same_close_reference" if c.same_close_reference else "tail_session" if c.tail_fill else "strict"
+                "same_close_reference" if c.same_close_reference else "open_close_reference"
+                if c.open_close_reference else "tail_session" if c.tail_fill else "strict"
                 if c.entry_fill == "open_t+1" and c.exit_fill == "open_t+1"
                 else "custom"
             ),

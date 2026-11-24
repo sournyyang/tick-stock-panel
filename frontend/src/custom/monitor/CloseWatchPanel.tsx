@@ -10,12 +10,14 @@ import { closeWatchApi, closeWatchKey, type CloseWatchState } from './closeWatch
 const input = 'rounded-btn border border-border bg-base px-2 py-1.5 text-xs text-foreground min-w-0'
 const deliveryLabels: Record<string, string> = { queued: '等待发送', sending: '正在发送', sent: '钉钉已接收', failed: '发送失败', expired: '已过时未发送', cancelled: '已取消发送', unknown: '发送结果未知' }
 const button = 'rounded-btn border border-border bg-elevated px-2 py-1.5 text-xs disabled:opacity-40'
+const phaseLabels: Record<string, string> = { preview: '尾盘预警', confirmed: '收盘复核', opening: '开盘参考', test: '连接测试' }
 
 export function CloseWatchPanel() {
   const qc = useQueryClient()
   const query = useQuery({ queryKey: closeWatchKey, queryFn: closeWatchApi.state, refetchInterval: 15_000, retry: false })
   const strategies = useQuery({ queryKey: QK.screenerStrategies('stock'), queryFn: () => api.screenerStrategies('stock') })
   const state = query.data
+  const mixed = state?.binding?.execution_mode === 'next_open_close'
   const [open, setOpen] = useState(false)
   const [strategy, setStrategy] = useState('')
   const [start, setStart] = useState('')
@@ -42,8 +44,13 @@ export function CloseWatchPanel() {
     </div>
     {error && <p role="alert" className="px-4 pb-3 text-xs text-danger">{error.message}</p>}
     {open && <div className="max-h-[65vh] space-y-4 overflow-y-auto border-t border-border/60 px-4 py-3">
-      <p className="text-[11px] leading-relaxed text-secondary">买入和卖出信号均在尾盘当天提示，不等第二天。自动跟踪本策略买点之后的卖点，不代表已经买入或卖出；无需模拟账户和持仓登记，不代下单。</p>
-      <p className="text-[11px] leading-relaxed text-muted">尾盘预警尚可能变化，收盘后另给确认或取消。历史回测按次日开盘成交，尾盘当天成交的效果尚未单独验证。可在下方启用钉钉，接收新预警、收盘确认和取消通知。</p>
+      {mixed ? <>
+        <p className="text-[11px] leading-relaxed text-secondary">次日开盘买，卖出信号日收盘卖。收盘确认买点后，以下一交易日开盘价建立信号观察。尾盘提示潜在卖点，收盘确认后记录参考价；遇到 T+1 或跌停受阻，顺延到下一可执行收盘。</p>
+        <p className="text-[11px] leading-relaxed text-muted">只观察策略信号和参考价格。尾盘预警可能变化，收盘确认用于复核。当日卖出的提示请看尾盘预警。</p>
+      </> : <>
+        <p className="text-[11px] leading-relaxed text-secondary">买入和卖出信号均在尾盘当天提示，不等第二天。自动跟踪本策略买点之后的卖点，不代表已经买入或卖出；无需模拟账户和持仓登记，不代下单。</p>
+        <p className="text-[11px] leading-relaxed text-muted">尾盘预警尚可能变化，收盘后另给确认或取消。可在下方启用钉钉，接收新预警、收盘确认和取消通知。</p>
+      </>}
       <p className="text-[11px] text-muted">原有普通监控规则的通知独立运行；自动加入分组自选需保持同策略普通规则启用，并开启“自动加入自选”。</p>
       {state?.watchlist && <p className="text-[11px] text-muted">分组自选：{state.watchlist.message}。跟随同策略普通规则的“自动加入自选”开关；尾盘临时预警不自动加入。</p>}
       {state?.watchlist?.warning && <p role="alert" className="text-xs text-danger">{state.watchlist.warning}</p>}
@@ -55,7 +62,7 @@ export function CloseWatchPanel() {
         <button type="button" className={`${button} text-accent`} disabled={busy || query.isPending || query.isError} onClick={() => config.mutate(true)}>{config.isPending ? '保存中…' : '保存并启用'}</button>
         <button type="button" className={button} disabled={busy || !state?.enabled} onClick={() => pause.mutate()}>暂停</button>
       </div>
-      {state?.binding && <p className="text-[11px] text-muted">当前绑定：{state.binding.name} · {state.binding.max_hold_days == null ? '无固定观察期限' : `买点后${state.binding.max_hold_days}个市场交易日到期观察`}。更换策略会重建信号观察，不影响实际账户。{state.checked_at && ` 最近检查：${state.checked_at.slice(0,19).replace('T',' ')}`}</p>}
+      {state?.binding && <p className="text-[11px] text-muted">当前绑定：{state.binding.name} · {state.binding.max_hold_days == null ? '无固定观察期限' : `${mixed ? '开盘纳入' : '买点'}后${state.binding.max_hold_days}个市场交易日到期观察`}。更换策略会重建信号观察。{state.checked_at && ` 最近检查：${state.checked_at.slice(0,19).replace('T',' ')}`}</p>}
       {state?.dingtalk && <div className="space-y-2 rounded-btn border border-border p-3" aria-label="尾盘钉钉推送">
         <div className="flex flex-wrap items-center gap-3">
           <label className="flex items-center gap-2 text-xs font-medium"><input type="checkbox" aria-label="启用尾盘钉钉推送" checked={state.dingtalk.enabled}
@@ -68,7 +75,7 @@ export function CloseWatchPanel() {
         <details><summary className="cursor-pointer text-[11px] text-muted">最近钉钉发送记录 ({state.dingtalk.records.length})</summary>
           <p className="my-2 text-[11px] text-muted">网络失败或中断后不自动重复发送，避免重复提醒；发送结果未知时请核对群消息。</p>
           {state.dingtalk.records.slice(0, 12).map(r => <p key={r.id} className="mt-2 text-[11px] leading-relaxed">
-            {new Date(r.queued_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })} · {r.phase === 'test' ? '连接测试' : `${r.symbol} ${r.phase === 'preview' ? '尾盘预警' : '收盘复核'}`} · <span className={['failed', 'unknown'].includes(r.status) ? 'text-danger' : 'text-muted'}>{deliveryLabels[r.status] || r.status}</span> · {r.detail}{r.elapsed_ms != null && ` · ${r.elapsed_ms}毫秒`}
+            {new Date(r.queued_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })} · {r.phase === 'test' ? phaseLabels.test : `${r.symbol} ${phaseLabels[r.phase] ?? r.phase}`} · <span className={['failed', 'unknown'].includes(r.status) ? 'text-danger' : 'text-muted'}>{deliveryLabels[r.status] || r.status}</span> · {r.detail}{r.elapsed_ms != null && ` · ${r.elapsed_ms}毫秒`}
           </p>)}
         </details>
       </div>}
@@ -82,16 +89,17 @@ export function CloseWatchPanel() {
           {!state?.tracks.length && !state?.watch_status.length && <p className="text-[11px] text-muted">暂无活动观察，出现收盘确认买点后自动加入。</p>}
           {state?.watch_status.map(t => <div key={t.id} className="rounded-btn border border-border p-2 text-[11px]">
             <span className="font-medium">{t.name} {t.symbol}</span> · 原买点{t.signal_date}
+            {t.entry_date && <p className="mt-1 text-muted">{t.entry_date} 开盘参考 {fmtPrice(t.entry_price)}</p>}
             <p className="mt-1 text-muted">买点后{t.signal_age ?? '未知'}日 · 原防守线{t.floor_price == null ? '待计算' : fmtPrice(t.floor_price)}</p>
             {t.floor_price != null && t.price != null && t.price < t.floor_price && <p className="mt-1 text-warning">参考价已低于防守线，不能视为正常的下方止损价</p>}
-            <p className={t.reasons.length ? 'mt-1 text-warning' : 'mt-1 text-muted'}>{t.reasons.join('；') || t.message}</p>
-            {t.ended && <p className="mt-1 text-muted">卖点已确认，本次观察结束；不代表已实际卖出。</p>}
+            <p className={t.reasons.length ? 'mt-1 text-warning' : 'mt-1 text-muted'}>{mixed ? t.message : t.reasons.join('；') || t.message}</p>
+            {t.ended && t.reasons.length > 0 && <p className="mt-1 text-muted">卖点已确认，本次观察结束；不代表已实际卖出。</p>}
           </div>)}
         </div>
       </div>
       <details><summary className="cursor-pointer text-xs text-muted">最近尾盘记录 ({state?.events.length ?? 0})</summary><div className="mt-2 space-y-2">
         {!state?.events.length && <p className="text-[11px] text-muted">暂无记录。预警与确认分别去重，重启后继续去重。</p>}
-        {state?.events.slice(0,12).map(e => <p key={e.id} className="rounded-btn border border-border p-2 text-[11px] leading-relaxed text-secondary">{e.day} {new Date(e.ts).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })} · {e.phase === 'preview' ? '当天预警' : '收盘确认'} · {e.message}</p>)}
+        {state?.events.slice(0,12).map(e => <p key={e.id} className="rounded-btn border border-border p-2 text-[11px] leading-relaxed text-secondary">{e.day} {new Date(e.ts).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })} · {phaseLabels[e.phase] ?? e.phase} · {e.message}</p>)}
       </div></details>
     </div>}
   </section>

@@ -2059,6 +2059,7 @@ class BacktestEngine:
         *,
         entry_close_floor: EntryCloseFloor | None = None,
         same_session_fill: SameSessionFill | None = None,
+        bound_floor_at_close: bool = False,
     ) -> SimResult:
         """Run the production Python matcher on a prebuilt MarketMatrix."""
         if same_session_fill is not None:
@@ -2075,10 +2076,19 @@ class BacktestEngine:
             )
         if entry_close_floor is not None:
             entry_close_floor.validate(matrix, config)
+        if bound_floor_at_close and (
+            entry_close_floor is None or config.exit_fill != "close_t" or same_session_fill is not None
+            or any(value is not None for value in (
+                config.stop_loss_pct, config.take_profit_pct, config.trailing_stop_pct,
+                config.trailing_take_profit_activate_pct, config.trailing_take_profit_drawdown_pct,
+            ))
+        ):
+            raise ValueError("开盘买入、收盘退出要求日线绑定防守线且无额外盘中风控")
         if same_session_fill is None and not matrix.entry.any():
             return self._empty_result()
         return self._simulate_portfolio_matrix(
             matrix, config, progress_cb, cancel_event, options, entry_close_floor, same_session_fill,
+            bound_floor_at_close,
         )
 
     def _simulate_portfolio_matrix(
@@ -2090,6 +2100,7 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
         entry_close_floor: EntryCloseFloor | None = None,
         same_session_fill: SameSessionFill | None = None,
+        bound_floor_at_close: bool = False,
     ) -> SimResult:
         options = options or SimulationOptions()
         time_count, asset_count = matrix.shape
@@ -2370,7 +2381,8 @@ class BacktestEngine:
                 pos = positions.get(asset_id)
                 if pos is None:
                     continue
-                if entry_close_floor is not None and pos.get("pending_exit_reason") == "structure_break":
+                if (entry_close_floor is not None and not bound_floor_at_close
+                        and pos.get("pending_exit_reason") == "structure_break"):
                     continue
                 reason = ""
                 signal_date = date_text
@@ -2382,6 +2394,13 @@ class BacktestEngine:
                     and same_session_fill.signal_close[time_id, asset_id] < pos["close_floor"]
                 ):
                     reason = "structure_break"
+                elif bound_floor_at_close and (
+                    matrix.tradable[time_id, asset_id]
+                    and _valid_price(matrix.close[time_id, asset_id])
+                    and matrix.close[time_id, asset_id] < pos["close_floor"]
+                ):
+                    reason = "structure_break"
+                    _count("close_floor_triggers")
                 elif matrix.exit[time_id, asset_id]:
                     reason = "signal"
                     signal_date = _signal_date(int(matrix.exit_signal_time[time_id, asset_id]), date_text)
@@ -2390,6 +2409,12 @@ class BacktestEngine:
                 elif time_id == time_count - 1 and matrix.entry_close_floor is None:
                     reason = "end"
                 if reason:
+                    if bound_floor_at_close and pos["entry_date"] == date_text:
+                        code = int(matrix.exit_signal_code[time_id, asset_id])
+                        signal_id = _signal_id(code, matrix.exit_signal_ids) if reason == "signal" else None
+                        _mark_pending(asset_id, reason, signal_date, signal_id)
+                        _count("sell_t_plus_one")
+                        continue
                     _try_sell(time_id, asset_id, reason, signal_date, sold_today)
 
         def _risk_exits(
@@ -2465,7 +2490,7 @@ class BacktestEngine:
                 pos["hold_days"] += 1
 
             # 昨日收盘已确认失效的委托先尝试开盘退出, 不得先享受今日盘中止盈。
-            if entry_close_floor is not None:
+            if entry_close_floor is not None and not bound_floor_at_close:
                 for asset_id in list(positions):
                     pos = positions[asset_id]
                     if pos.get("pending_exit_reason") != "structure_break":
@@ -2495,7 +2520,7 @@ class BacktestEngine:
                 seen_price = np.isfinite(visible) & (visible > 0)
                 last_close[seen_price] = visible[seen_price]
 
-            if config.exit_fill != "open_t+1":
+            if config.exit_fill != "open_t+1" and not bound_floor_at_close:
                 _scheduled_exits(time_id, date_text, sold_today)
 
             if (time_id < time_count - 1 or same_session_fill is not None) and max_positions > 0:
@@ -2627,7 +2652,9 @@ class BacktestEngine:
                                 ),
                             }
 
-            if entry_close_floor is not None:
+            if bound_floor_at_close:
+                _scheduled_exits(time_id, date_text, sold_today)
+            elif entry_close_floor is not None:
                 for asset_id, pos in positions.items():
                     closing = float(matrix.close[time_id, asset_id])
                     if (

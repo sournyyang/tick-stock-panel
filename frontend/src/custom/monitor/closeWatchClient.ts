@@ -1,6 +1,9 @@
 import { ApiError } from '@/lib/api'
 
-export interface SignalTrack { id: string; symbol: string; name: string; signal_date: string }
+export interface SignalTrack {
+  id: string; symbol: string; name: string; signal_date: string
+  entry_date?: string; entry_price?: number; pending_exit_date?: string
+}
 export interface DingTalkStatus {
   enabled: boolean; configured: boolean; status: string; message: string; pending: number
   records: Array<{ id: string; status: string; detail: string; queued_at: number; symbol: string; phase: string; type: string; elapsed_ms?: number }>
@@ -11,8 +14,8 @@ export interface CloseWatchState {
   enabled: boolean
   status: string
   message: string
-  phase: 'preview' | 'confirmed' | null
-  binding: { strategy_id: string; name: string; revision: string; start_time: string; max_hold_days: number | null } | null
+  phase: 'preview' | 'confirmed' | 'opening' | null
+  binding: { strategy_id: string; name: string; revision: string; start_time: string; max_hold_days: number | null; execution_mode?: 'next_open_close' } | null
   tracks: SignalTrack[]
   candidates: Array<{ symbol: string; name: string; price: number; signal_date: string; floor_price?: number | null; floor_signal_date?: string; note?: string }>
   watch_status: Array<SignalTrack & { price: number | null; floor_price: number | null; signal_age: number | null; reasons: string[]; message: string; ended: boolean }>

@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 
 from app.backtest.matrix import build_market_data_matrix
+from app.backtest.tail_session import STRATEGY_ID
 from app.custom.close_watch.service import CloseWatchService, watch_phase
 from app.market_time import CN_TZ
 from app.services import alert_store
@@ -92,6 +93,80 @@ def confirmed(env,price=10.4):
         pl.lit(int(later.timestamp()*1000)).alias('quote_ts'),
         pl.when(pl.col('symbol')=='600000.SH').then(price).otherwise(pl.col('raw_close')).alias('raw_close')),DAY)
     return later
+
+
+@pytest.fixture
+def mixed_env(env):
+    path = env.path.with_name(f'{STRATEGY_ID}.py')
+    path.write_text(env.path.read_text().replace("'id':'demo'", f"'id':'{STRATEGY_ID}'"))
+    env.service.engine = StrategyEngine([path.parent])
+    env.service.configure(STRATEGY_ID, True, '14:40')
+    env.history = env.history.with_columns([
+        pl.when(pl.col('symbol') == '000001.SZ').then(10.0).otherwise(pl.col(c)).alias(c)
+        for c in ('raw_close','close')
+    ])
+    env.service._market = lambda *a: build_market_data_matrix(
+        env.history, field_columns={'raw_close','price_limit_pct'},
+    )
+    tracked(env, index=-2)
+    return env
+
+
+def test_mixed_open_reference_and_pending_exit_survive_restart(mixed_env):
+    env = mixed_env
+    opening = NOW.replace(hour=9, minute=31)
+    env.quotes.get_enriched_today = lambda: (env.current.with_columns(
+        pl.lit(int(opening.timestamp()*1000)).alias('quote_ts')), DAY)
+    env.service.tick(opening)
+    state = env.service.get()
+    assert state['binding']['execution_mode'] == 'next_open_close'
+    track, = state['tracks']
+    assert track['entry_date'] == str(DAY)
+    assert track['entry_price'] == 10
+    assert state['events'][0]['phase'] == 'opening'
+    assert '开盘参考价' in state['events'][0]['message']
+
+    env.history = env.history.with_columns([
+        pl.when((pl.col('date') == DAY) & (pl.col('symbol') == '600000.SH'))
+        .then(9.6).otherwise(pl.col(c)).alias(c) for c in ('raw_close','close')
+    ])
+    env.service.tick(confirmed(env, price=9.6))
+    state = env.service.get()
+    assert state['tracks'][0]['pending_exit_date'] == str(DAY)
+    sell = next(e for e in state['events'] if e['type'] == 'sell_signal' and e['phase'] == 'confirmed')
+    assert 'T+1' in sell['message']
+    assert not state['watch_status'][0]['ended']
+
+    monday = DAY + timedelta(days=3)
+    later = datetime.combine(monday, NOW.timetz()).replace(hour=15, minute=1)
+    monday_frame = env.current.with_columns(
+        pl.lit(monday).alias('date'), pl.lit(10.2).alias('close'), pl.lit(10.2).alias('raw_close'),
+        pl.lit(int(later.timestamp()*1000)).alias('quote_ts'),
+    )
+    env.history = pl.concat([env.history, monday_frame])
+    env.quotes.get_enriched_today = lambda: (monday_frame, monday)
+    restarted = CloseWatchService(env.root, env.service.engine, env.service.screener, env.quotes)
+    restarted._market = env.service._market
+    restarted.tick(later)
+    state = restarted.get()
+    assert state['tracks'] == []
+    assert state['events'][0]['price'] == 10.2
+    assert f'原卖点{DAY}' in state['events'][0]['message']
+    assert state['watch_status'][0]['ended']
+
+
+def test_mixed_limit_up_open_cancels_buy_without_creating_sell_track(mixed_env):
+    env = mixed_env
+    env.history = env.history.with_columns(pl.when(pl.col('date') == DAY)
+        .then(11.44).otherwise(pl.col('open')).alias('open'))
+    opening = NOW.replace(hour=9, minute=31)
+    env.quotes.get_enriched_today = lambda: (env.current.with_columns(
+        pl.lit(int(opening.timestamp()*1000)).alias('quote_ts')), DAY)
+    env.service.tick(opening)
+    state = env.service.get()
+    assert state['tracks'] == []
+    assert state['events'][0]['type'] == 'pool_exit'
+    assert '开盘涨停' in state['events'][0]['message']
 
 
 def test_preview_today_then_confirmation_and_restart_dedupe(env):

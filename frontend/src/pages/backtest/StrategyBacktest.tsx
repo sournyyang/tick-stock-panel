@@ -1020,7 +1020,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
   const [requestedEntryFill, setEntryFill] = useState<'close_t' | 'open_t+1'>(saved?.entryFill ?? saved?.matching ?? 'open_t+1')
   const [requestedExitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
-    saved ? (saved.exitFill ?? saved.matching ?? 'close_t') : 'open_t+1',
+    saved ? (saved.exitFill ?? saved.matching ?? (supportsPairedFills ? 'open_t+1' : 'close_t')) : 'open_t+1',
   )
   const [fees, setFees] = useState(saved?.fees ?? '2')
   const [stampTax, setStampTax] = useState(saved?.stampTax ?? '1')
@@ -1179,14 +1179,10 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   // candidate restoration can all asynchronously carry incompatible old values.
   const sameClose = supportsPairedFills && !tailFill
     && requestedEntryFill === 'close_t' && requestedExitFill === 'close_t'
-  const pairedFill = sameClose ? 'close_t' : 'open_t+1'
-  const entryFill = supportsPairedFills ? pairedFill : executionRequirements?.entry_fill ?? requestedEntryFill
-  const exitFill = supportsPairedFills ? pairedFill : executionRequirements?.exit_fill ?? requestedExitFill
-  const changePairedFill = (value: 'close_t' | 'open_t+1') => {
-    setTailFill(false)
-    setEntryFill(value)
-    setExitFill(value)
-  }
+  const openClose = supportsPairedFills && !tailFill
+    && requestedEntryFill === 'open_t+1' && requestedExitFill === 'close_t'
+  const entryFill = supportsPairedFills ? (sameClose ? 'close_t' : 'open_t+1') : executionRequirements?.entry_fill ?? requestedEntryFill
+  const exitFill = supportsPairedFills ? (sameClose || openClose ? 'close_t' : 'open_t+1') : executionRequirements?.exit_fill ?? requestedExitFill
   const simMode = executionRequirements?.mode ?? requestedSimMode
   const highGranularity = executionRequirements?.minute_fill ?? requestedGranularity
 
@@ -1460,6 +1456,7 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     lines.push(`总收益,${pct(strategyReturn)}`)
     if (result.config?.tail_fill === true) lines.push('成交口径,信号当天尾盘（14:42 分钟 K 线开盘）')
     if (result.config?.timing_mode === 'same_close_reference') lines.push('成交口径,信号日收盘（同收盘价参考）')
+    if (result.config?.timing_mode === 'open_close_reference') lines.push('成交口径,次日开盘买／信号日收盘卖（收盘价参考）')
     lines.push(`年化收益,${pct(s.annual_return)}`)
     lines.push(`同期基准,${pct(benchmarkReturn)}`)
     lines.push(`超额收益,${pct(excessReturn)}`)
@@ -2206,8 +2203,11 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                 disabled={!supportsPairedFills && !!executionRequirements?.entry_fill}
                 onChange={e => {
                   const value = e.target.value as 'close_t' | 'open_t+1'
-                  if (supportsPairedFills) changePairedFill(value)
-                  else setEntryFill(value)
+                  if (supportsPairedFills) {
+                    setTailFill(false)
+                    if (value === 'close_t') setExitFill('close_t')
+                  }
+                  setEntryFill(value)
                 }}
                 className={INPUT_CLS}
               >
@@ -2225,8 +2225,11 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               disabled={!supportsPairedFills && !!executionRequirements?.exit_fill}
               onChange={e => {
                 const value = e.target.value as 'close_t' | 'open_t+1' | 'signal_next_minute'
-                if (supportsPairedFills && value !== 'signal_next_minute') changePairedFill(value)
-                else setExitFill(value)
+                if (supportsPairedFills) {
+                  setTailFill(false)
+                  if (value === 'open_t+1' || tailFill) setEntryFill('open_t+1')
+                }
+                setExitFill(value)
               }}
               className={INPUT_CLS}
             >
@@ -2248,7 +2251,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
               <span>{sameClose
                 ? '以最终日线确认信号，并假设按同一收盘价成交，供历史比较。'
-                : '信号日收盘仅适合收盘前已确认的信号'}</span>
+                : openClose
+                  ? '买点次日开盘入场，卖点按当日收盘价模拟；T+1 或跌停受阻时顺延。'
+                  : '信号日收盘仅适合收盘前已确认的信号'}</span>
             </div>
           )}
           {exitFill === 'signal_next_minute' && (
@@ -2755,6 +2760,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
                   <span className="text-sm font-medium text-foreground">{result.strategy_info.name}</span>
                   {result.config?.timing_mode === 'same_close_reference' && (
                     <span className="rounded border border-warning/30 px-1 py-px text-[9px] text-warning">同收盘价参考</span>
+                  )}
+                  {result.config?.timing_mode === 'open_close_reference' && (
+                    <span className="rounded border border-warning/30 px-1 py-px text-[9px] text-warning">次日开盘买／信号日收盘卖</span>
                   )}
                   {result.config?.tail_fill === true && (
                     <span className="rounded border border-accent/30 bg-accent/10 px-1 py-px text-[9px] text-accent">当天尾盘成交</span>
